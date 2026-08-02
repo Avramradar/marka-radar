@@ -35,6 +35,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: |
           python - <<EOF
           import asyncio
