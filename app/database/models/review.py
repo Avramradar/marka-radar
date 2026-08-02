@@ -1,16 +1,24 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    String,
     Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import relationship
 
 from app.database.base import Base
+
+
+if TYPE_CHECKING:
+    from app.database.models.product import Product
+    from app.database.models.user import User
 
 
 class Review(Base):
@@ -31,13 +39,19 @@ class Review(Base):
 
     user_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        ForeignKey(
+            "users.telegram_id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
     product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"),
+        ForeignKey(
+            "products.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -48,6 +62,7 @@ class Review(Base):
     )
 
     moderation_status: Mapped[str] = mapped_column(
+        String(20),
         default="published",
         nullable=False,
         index=True,
@@ -64,4 +79,13 @@ class Review(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
         nullable=False,
+        index=True,
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="reviews",
+    )
+
+    product: Mapped["Product"] = relationship(
+        back_populates="reviews",
     )
