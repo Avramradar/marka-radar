@@ -36,21 +36,23 @@ class OpenFoodFactsClient:
 
     def __init__(
         self,
-        timeout_seconds: int = 30,
-        retries: int = 3,
+        timeout_seconds: int = 60,
+        retries: int = 6,
     ) -> None:
         self.timeout = aiohttp.ClientTimeout(
             total=timeout_seconds,
+            connect=20,
+            sock_read=40,
         )
         self.retries = retries
 
-        # Open Food Facts требует собственный User-Agent.
         self.headers = {
             "User-Agent": (
                 "MarkaRadar/0.1 "
                 "(https://github.com/Avramradar/marka-radar)"
             ),
             "Accept": "application/json",
+            "Accept-Language": "ru,en;q=0.8",
         }
 
     async def _request(
@@ -59,84 +61,117 @@ class OpenFoodFactsClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.BASE_URL}{path}"
-
         last_error: Exception | None = None
 
-        for attempt in range(1, self.retries + 1):
-            try:
-                async with aiohttp.ClientSession(
-                    timeout=self.timeout,
-                    headers=self.headers,
-                ) as session:
+        async with aiohttp.ClientSession(
+            timeout=self.timeout,
+            headers=self.headers,
+        ) as session:
+            for attempt in range(1, self.retries + 1):
+                try:
+                    logger.info(
+                        "Open Food Facts: попытка %s из %s",
+                        attempt,
+                        self.retries,
+                    )
+
                     async with session.get(
                         url,
                         params=params,
+                        allow_redirects=True,
                     ) as response:
-                        if response.status == 429:
-                            retry_after = int(
-                                response.headers.get(
-                                    "Retry-After",
-                                    "60",
+                        response_text = await response.text()
+
+                        if response.status == 200:
+                            try:
+                                data = await response.json(
+                                    content_type=None,
                                 )
+                            except Exception as error:
+                                raise OpenFoodFactsError(
+                                    "Ответ невозможно разобрать как JSON. "
+                                    f"Начало ответа: {response_text[:300]}"
+                                ) from error
+
+                            if not isinstance(data, dict):
+                                raise OpenFoodFactsError(
+                                    "Open Food Facts вернул "
+                                    "не объект JSON"
+                                )
+
+                            return data
+
+                        if response.status in {
+                            429,
+                            500,
+                            502,
+                            503,
+                            504,
+                        }:
+                            retry_after_header = (
+                                response.headers.get("Retry-After")
                             )
+
+                            if retry_after_header:
+                                try:
+                                    delay = int(
+                                        retry_after_header
+                                    )
+                                except ValueError:
+                                    delay = attempt * 10
+                            else:
+                                delay = attempt * 10
+
+                            delay = min(delay, 60)
+
+                            error = OpenFoodFactsError(
+                                f"HTTP {response.status}. "
+                                f"Ответ: {response_text[:300]}"
+                            )
+                            last_error = error
 
                             logger.warning(
-                                "Open Food Facts ограничил запросы. "
-                                "Повтор через %s секунд.",
-                                retry_after,
+                                "Open Food Facts временно недоступен: "
+                                "HTTP %s. Повтор через %s секунд. "
+                                "Ответ: %s",
+                                response.status,
+                                delay,
+                                response_text[:200],
                             )
 
-                            await asyncio.sleep(retry_after)
-                            continue
+                            if attempt < self.retries:
+                                await asyncio.sleep(delay)
+                                continue
 
-                        if response.status >= 500:
-                            raise OpenFoodFactsError(
-                                "Сервер Open Food Facts вернул "
-                                f"ошибку {response.status}"
-                            )
+                            break
 
-                        if response.status != 200:
-                            response_text = await response.text()
-
-                            raise OpenFoodFactsError(
-                                "Open Food Facts вернул "
-                                f"HTTP {response.status}: "
-                                f"{response_text[:300]}"
-                            )
-
-                        data = await response.json(
-                            content_type=None,
+                        raise OpenFoodFactsError(
+                            f"HTTP {response.status}. "
+                            f"Ответ: {response_text[:500]}"
                         )
 
-                        if not isinstance(data, dict):
-                            raise OpenFoodFactsError(
-                                "Open Food Facts вернул "
-                                "некорректный формат данных"
-                            )
+                except (
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError,
+                    OpenFoodFactsError,
+                ) as error:
+                    last_error = error
 
-                        return data
+                    logger.warning(
+                        "Ошибка запроса Open Food Facts, "
+                        "попытка %s из %s: %r",
+                        attempt,
+                        self.retries,
+                        error,
+                    )
 
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                OpenFoodFactsError,
-            ) as error:
-                last_error = error
-
-                logger.warning(
-                    "Ошибка Open Food Facts. "
-                    "Попытка %s из %s: %s",
-                    attempt,
-                    self.retries,
-                    error,
-                )
-
-                if attempt < self.retries:
-                    await asyncio.sleep(attempt * 2)
+                    if attempt < self.retries:
+                        delay = min(attempt * 10, 60)
+                        await asyncio.sleep(delay)
 
         raise OpenFoodFactsError(
-            "Не удалось получить данные "
-            "из Open Food Facts"
+            "Не удалось получить данные из Open Food Facts. "
+            f"Последняя ошибка: {last_error!r}"
         ) from last_error
 
     async def search_products(
@@ -146,12 +181,6 @@ class OpenFoodFactsClient:
         page_size: int = 100,
         country: str = "russia",
     ) -> list[dict[str, Any]]:
-        """
-        Загружает одну страницу товаров.
-
-        Для первого теста используем максимум 100 товаров.
-        """
-
         if page < 1:
             raise ValueError(
                 "Номер страницы должен быть больше нуля"
@@ -192,10 +221,6 @@ class OpenFoodFactsClient:
         self,
         barcode: str,
     ) -> dict[str, Any] | None:
-        """
-        Загружает конкретный товар по штрихкоду.
-        """
-
         cleaned_barcode = barcode.strip()
 
         if not cleaned_barcode.isdigit():
@@ -203,13 +228,11 @@ class OpenFoodFactsClient:
                 "Штрихкод должен состоять из цифр"
             )
 
-        params = {
-            "fields": self.SEARCH_FIELDS,
-        }
-
         data = await self._request(
             f"/api/v2/product/{cleaned_barcode}",
-            params=params,
+            params={
+                "fields": self.SEARCH_FIELDS,
+            },
         )
 
         if data.get("status") != 1:
