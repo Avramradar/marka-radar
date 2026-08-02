@@ -1,35 +1,70 @@
-import os
-from dataclasses import dataclass
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic import field_validator
+from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 
 
-@dataclass(frozen=True)
-class Config:
-    bot_token: str
-    database_url: str
-    admin_id: int
+class Config(BaseSettings):
+    bot_token: str = Field(alias="BOT_TOKEN")
+    database_url: str = Field(alias="DATABASE_URL")
+    admin_id: int = Field(alias="ADMIN_ID")
 
-
-def load_config() -> Config:
-    bot_token = os.getenv("BOT_TOKEN", "").strip()
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    admin_id_raw = os.getenv("ADMIN_ID", "0").strip()
-
-    if not bot_token:
-        raise RuntimeError("Переменная BOT_TOKEN не задана")
-
-    if not database_url:
-        raise RuntimeError("Переменная DATABASE_URL не задана")
-
-    try:
-        admin_id = int(admin_id_raw)
-    except ValueError as error:
-        raise RuntimeError("ADMIN_ID должен быть числом") from error
-
-    return Config(
-        bot_token=bot_token,
-        database_url=database_url,
-        admin_id=admin_id,
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
     )
+
+    @field_validator("bot_token")
+    @classmethod
+    def validate_bot_token(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Переменная BOT_TOKEN не задана")
+
+        if ":" not in value:
+            raise ValueError(
+                "BOT_TOKEN имеет неправильный формат"
+            )
+
+        return value
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Переменная DATABASE_URL не задана")
+
+        required_prefix = "postgresql+asyncpg://"
+
+        if not value.startswith(required_prefix):
+            raise ValueError(
+                "DATABASE_URL должен начинаться с "
+                "postgresql+asyncpg://"
+            )
+
+        return value
+
+    @field_validator("admin_id")
+    @classmethod
+    def validate_admin_id(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError(
+                "ADMIN_ID должен быть положительным числом"
+            )
+
+        return value
+
+
+@lru_cache
+def load_config() -> Config:
+    return Config()
 
 
 config = load_config()
