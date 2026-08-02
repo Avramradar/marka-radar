@@ -1,6 +1,9 @@
-from sqlalchemy import and_, case, or_, select
+from sqlalchemy import and_
+from sqlalchemy import case
+from sqlalchemy import exists
+from sqlalchemy import or_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 
 from app.database.models.brand import Brand
 from app.database.models.category import Category
@@ -9,15 +12,27 @@ from app.database.models.product_alias import ProductAlias
 from app.utils.text import normalize_text
 
 
-def build_token_condition(
-    token: str,
-    alias: type[ProductAlias],
-):
+def build_alias_condition(pattern: str):
+    """
+    Проверяет наличие подходящего синонима товара
+    без JOIN и без появления дубликатов товаров.
+    """
+
+    return exists(
+        select(ProductAlias.id).where(
+            ProductAlias.product_id == Product.id,
+            ProductAlias.normalized_alias.ilike(pattern),
+        )
+    )
+
+
+def build_token_condition(token: str):
     """
     Создаёт условие поиска для одного слова.
 
-    Слово может совпасть с названием товара, брендом,
-    категорией, ключевыми словами или синонимом.
+    Слово может находиться в названии товара,
+    бренде, категории, ключевых словах,
+    подтипе или синонимах.
     """
 
     pattern = f"%{token}%"
@@ -29,7 +44,7 @@ def build_token_condition(
         Category.normalized_name.ilike(pattern),
         Product.keywords.ilike(pattern),
         Product.subtype.ilike(pattern),
-        alias.normalized_alias.ilike(pattern),
+        build_alias_condition(pattern),
     )
 
 
@@ -44,12 +59,15 @@ async def search_products(
     if not normalized_query:
         return []
 
-    alias = aliased(ProductAlias)
-
-    # Штрихкод ищем отдельно и точно.
+    # Если пользователь отправил штрихкод,
+    # сначала выполняем точный поиск по нему.
     if raw_query.isdigit():
         barcode_statement = (
-            select(Product, Brand, Category)
+            select(
+                Product,
+                Brand,
+                Category,
+            )
             .join(
                 Brand,
                 Product.brand_id == Brand.id,
@@ -68,7 +86,10 @@ async def search_products(
         barcode_result = await session.execute(
             barcode_statement
         )
-        barcode_products = list(barcode_result.all())
+
+        barcode_products = list(
+            barcode_result.all()
+        )
 
         if barcode_products:
             return barcode_products
@@ -80,41 +101,45 @@ async def search_products(
     ]
 
     token_conditions = [
-        build_token_condition(
-            token=token,
-            alias=alias,
-        )
+        build_token_condition(token)
         for token in tokens
     ]
 
     full_pattern = f"%{normalized_query}%"
 
-    # Более точные совпадения получают меньший номер
-    # и показываются выше остальных результатов.
+    exact_alias_match = exists(
+        select(ProductAlias.id).where(
+            ProductAlias.product_id == Product.id,
+            ProductAlias.normalized_alias
+            == normalized_query,
+        )
+    )
+
     relevance_order = case(
         (
-            Product.normalized_name == normalized_query,
+            Product.normalized_name
+            == normalized_query,
             0,
         ),
         (
-            Brand.normalized_name == normalized_query,
+            Brand.normalized_name
+            == normalized_query,
             1,
+        ),
+        (
+            exact_alias_match,
+            2,
         ),
         (
             Product.normalized_name.ilike(
                 full_pattern
             ),
-            2,
+            3,
         ),
         (
             Brand.normalized_name.ilike(
                 full_pattern
             ),
-            3,
-        ),
-        (
-            alias.normalized_alias
-            == normalized_query,
             4,
         ),
         else_=5,
@@ -134,15 +159,10 @@ async def search_products(
             Category,
             Product.category_id == Category.id,
         )
-        .outerjoin(
-            alias,
-            alias.product_id == Product.id,
-        )
         .where(
             Product.is_active.is_(True),
             and_(*token_conditions),
         )
-        .distinct()
         .order_by(
             relevance_order,
             Brand.name,
