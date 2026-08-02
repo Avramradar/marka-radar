@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -11,8 +12,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import relationship
 
 from app.database.base import Base
+
+
+if TYPE_CHECKING:
+    from app.database.models.category import Category
 
 
 class ProductRelation(Base):
@@ -26,8 +32,9 @@ class ProductRelation(Base):
             name="uq_product_relation",
         ),
         CheckConstraint(
-            "compatibility_score >= 0 AND compatibility_score <= 1",
-            name="ck_compatibility_score_0_1",
+            "compatibility_score >= 0 "
+            "AND compatibility_score <= 1",
+            name="compatibility_score_0_1",
         ),
     )
 
@@ -37,13 +44,19 @@ class ProductRelation(Base):
     )
 
     source_category_id: Mapped[int] = mapped_column(
-        ForeignKey("categories.id", ondelete="CASCADE"),
+        ForeignKey(
+            "categories.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
     target_category_id: Mapped[int] = mapped_column(
-        ForeignKey("categories.id", ondelete="CASCADE"),
+        ForeignKey(
+            "categories.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -69,4 +82,14 @@ class ProductRelation(Base):
         DateTime,
         default=datetime.utcnow,
         nullable=False,
+    )
+
+    source_category: Mapped["Category"] = relationship(
+        foreign_keys=[source_category_id],
+        back_populates="source_relations",
+    )
+
+    target_category: Mapped["Category"] = relationship(
+        foreign_keys=[target_category_id],
+        back_populates="target_relations",
     )
