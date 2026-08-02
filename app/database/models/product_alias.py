@@ -1,14 +1,21 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    DateTime,
     ForeignKey,
     String,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import relationship
 
 from app.database.base import Base
+
+
+if TYPE_CHECKING:
+    from app.database.models.product import Product
 
 
 class ProductAlias(Base):
@@ -28,7 +35,10 @@ class ProductAlias(Base):
     )
 
     product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"),
+        ForeignKey(
+            "products.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -46,6 +56,11 @@ class ProductAlias(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
+        DateTime,
         default=datetime.utcnow,
         nullable=False,
+    )
+
+    product: Mapped["Product"] = relationship(
+        back_populates="aliases",
     )
