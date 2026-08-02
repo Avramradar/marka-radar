@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
@@ -10,8 +11,14 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import relationship
 
 from app.database.base import Base
+
+
+if TYPE_CHECKING:
+    from app.database.models.product import Product
+    from app.database.models.user import User
 
 
 class Rating(Base):
@@ -25,7 +32,7 @@ class Rating(Base):
         ),
         CheckConstraint(
             "score >= 1 AND score <= 10",
-            name="ck_rating_score_1_10",
+            name="score_1_10",
         ),
     )
 
@@ -36,13 +43,19 @@ class Rating(Base):
 
     user_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        ForeignKey(
+            "users.telegram_id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
     product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"),
+        ForeignKey(
+            "products.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -63,4 +76,13 @@ class Rating(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
         nullable=False,
+        index=True,
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="ratings",
+    )
+
+    product: Mapped["Product"] = relationship(
+        back_populates="ratings",
     )
