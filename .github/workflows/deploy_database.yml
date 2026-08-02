@@ -1,0 +1,98 @@
+name: Deploy MarkaRadar Database
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-database:
+    runs-on: ubuntu-latest
+
+    env:
+      BOT_TOKEN: "123456789:TEST_TOKEN"
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ADMIN_ID: "1"
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check database secret
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL secret is missing"
+            exit 1
+          fi
+
+      - name: Apply Alembic migrations
+        run: |
+          alembic upgrade head
+
+      - name: Show current database revision
+        run: |
+          alembic current
+
+      - name: Add test products
+        run: |
+          python -m app.database.seed
+
+      - name: Verify test data
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from sqlalchemy import func, select
+
+          from app.database.models.brand import Brand
+          from app.database.models.category import Category
+          from app.database.models.product import Product
+          from app.database.session import async_session_maker
+          from app.database.session import close_database
+
+
+          async def verify() -> None:
+              async with async_session_maker() as session:
+                  brands = await session.scalar(
+                      select(func.count(Brand.id))
+                  )
+                  categories = await session.scalar(
+                      select(func.count(Category.id))
+                  )
+                  products = await session.scalar(
+                      select(func.count(Product.id))
+                  )
+
+              print(f"Brands: {brands}")
+              print(f"Categories: {categories}")
+              print(f"Products: {products}")
+
+              if not brands or brands < 3:
+                  raise RuntimeError(
+                      "Недостаточно тестовых брендов"
+                  )
+
+              if not categories or categories < 4:
+                  raise RuntimeError(
+                      "Недостаточно тестовых категорий"
+                  )
+
+              if not products or products < 3:
+                  raise RuntimeError(
+                      "Недостаточно тестовых товаров"
+                  )
+
+              await close_database()
+
+
+          asyncio.run(verify())
+          PY
