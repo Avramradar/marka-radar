@@ -35,7 +35,7 @@ jobs:
 
       - name: Check Python syntax
         run: |
-          python -m compileall bot.py app
+          python -m compileall bot.py app alembic
 
       - name: Check SQLAlchemy models
         run: |
@@ -48,3 +48,8 @@ jobs:
 
           print("Все модели SQLAlchemy успешно проверены")
           PY
+
+      - name: Check Alembic configuration
+        run: |
+          alembic history
+          alembic heads
