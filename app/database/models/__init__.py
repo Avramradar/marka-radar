@@ -9,7 +9,7 @@ from app.database.models.review import Review
 from app.database.models.search_history import SearchHistory
 from app.database.models.user import User
 
-__all__ = [
+__all__ = (
     "Brand",
     "Category",
     "PriceObservation",
@@ -20,4 +20,4 @@ __all__ = [
     "Review",
     "SearchHistory",
     "User",
-]
+)
