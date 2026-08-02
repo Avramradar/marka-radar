@@ -1,0 +1,62 @@
+name: Import Open Food Facts
+
+on:
+  workflow_dispatch:
+    inputs:
+      page:
+        description: "Page"
+        required: false
+        default: "1"
+
+      page_size:
+        description: "Products count"
+        required: false
+        default: "100"
+
+jobs:
+  import-products:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run importer
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<EOF
+          import asyncio
+
+          from app.importers.open_food_facts_importer import import_open_food_facts_products
+
+          async def main():
+              stats = await import_open_food_facts_products(
+                  page=int("${{ github.event.inputs.page }}"),
+                  page_size=int("${{ github.event.inputs.page_size }}"),
+              )
+
+              print("=" * 60)
+              print("IMPORT FINISHED")
+              print(f"Received   : {stats.received}")
+              print(f"Created    : {stats.created}")
+              print(f"Updated    : {stats.updated}")
+              print(f"Skipped    : {stats.skipped}")
+              print(f"Errors     : {stats.errors}")
+              print(f"Brands     : {stats.brands_created}")
+              print(f"Categories : {stats.categories_created}")
+              print("=" * 60)
+
+          asyncio.run(main())
+          EOF
