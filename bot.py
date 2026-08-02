@@ -1,24 +1,28 @@
+import asyncio
+
 from aiogram import Bot
 from aiogram import Dispatcher
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-import asyncio
-import os
+from aiogram.enums import ParseMode
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+from app.config import config
 
 
 async def main():
     bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        token=config.bot_token,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        ),
     )
 
-    dp = Dispatcher()
+    dispatcher = Dispatcher()
 
-    print("MarkaRadar запущен")
+    print("===================================")
+    print("     MarkaRadar запускается")
+    print("===================================")
 
-    await dp.start_polling(bot)
+    await dispatcher.start_polling(bot)
 
 
 if __name__ == "__main__":
