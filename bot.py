@@ -7,6 +7,7 @@ from aiogram.enums import ParseMode
 
 from app.config import config
 from app.database.init_db import init_database
+from app.handlers.start import router as start_router
 
 
 async def main() -> None:
@@ -21,9 +22,12 @@ async def main() -> None:
 
     dispatcher = Dispatcher()
 
+    dispatcher.include_router(start_router)
+
     print("===================================")
     print("     MarkaRadar запускается")
     print("     База данных подключена")
+    print("     Обработчик /start подключён")
     print("===================================")
 
     await dispatcher.start_polling(bot)
