@@ -11,7 +11,7 @@ on:
       pages_count:
         description: "Количество страниц"
         required: true
-        default: "10"
+        default: "5"
 
       page_size:
         description: "Товаров на странице"
@@ -21,16 +21,21 @@ on:
 jobs:
   import-products:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run bulk importer
@@ -38,32 +43,109 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          INPUT_START_PAGE: ${{ inputs.start_page }}
+          INPUT_PAGES_COUNT: ${{ inputs.pages_count }}
+          INPUT_PAGE_SIZE: ${{ inputs.page_size }}
+
         run: |
-          python - <<EOF
+          python - <<'PY'
           import asyncio
+          import os
 
           from app.importers.open_food_facts_bulk_importer import (
               import_open_food_facts_pages,
           )
 
-          async def main():
+
+          async def main() -> None:
+              start_page = int(
+                  os.environ["INPUT_START_PAGE"]
+              )
+
+              pages_count = int(
+                  os.environ["INPUT_PAGES_COUNT"]
+              )
+
+              page_size = int(
+                  os.environ["INPUT_PAGE_SIZE"]
+              )
+
               stats = await import_open_food_facts_pages(
-                  start_page=${{ github.event.inputs.start_page }},
-                  pages_count=${{ github.event.inputs.pages_count }},
-                  page_size=${{ github.event.inputs.page_size }},
+                  start_page=start_page,
+                  pages_count=pages_count,
+                  page_size=page_size,
+                  country="russia",
+                  delay_seconds=15,
+                  stop_on_page_error=False,
               )
 
               print()
               print("=" * 60)
-              print("ИМПОРТ ЗАВЕРШЕН")
-              print("=" * 60)
-              print(f"Получено: {stats.received}")
-              print(f"Создано: {stats.created}")
-              print(f"Обновлено: {stats.updated}")
-              print(f"Пропущено: {stats.skipped}")
-              print(f"Ошибок: {stats.errors}")
-              print(f"Последняя страница: {stats.last_completed_page}")
+              print("ИМПОРТ ЗАВЕРШЁН")
               print("=" * 60)
 
+              print(
+                  f"Запрошено страниц: "
+                  f"{stats.requested_pages}"
+              )
+
+              print(
+                  f"Успешных страниц: "
+                  f"{stats.completed_pages}"
+              )
+
+              print(
+                  f"Страниц с ошибкой: "
+                  f"{stats.failed_pages}"
+              )
+
+              print(
+                  f"Получено товаров: "
+                  f"{stats.received}"
+              )
+
+              print(
+                  f"Создано товаров: "
+                  f"{stats.created}"
+              )
+
+              print(
+                  f"Обновлено товаров: "
+                  f"{stats.updated}"
+              )
+
+              print(
+                  f"Пропущено товаров: "
+                  f"{stats.skipped}"
+              )
+
+              print(
+                  f"Ошибок товаров: "
+                  f"{stats.errors}"
+              )
+
+              print(
+                  f"Создано брендов: "
+                  f"{stats.brands_created}"
+              )
+
+              print(
+                  f"Создано категорий: "
+                  f"{stats.categories_created}"
+              )
+
+              print(
+                  f"Последняя успешная страница: "
+                  f"{stats.last_completed_page}"
+              )
+
+              print("=" * 60)
+
+              if stats.completed_pages == 0:
+                  raise RuntimeError(
+                      "Не удалось загрузить ни одной страницы"
+                  )
+
+
           asyncio.run(main())
-          EOF
+          PY
