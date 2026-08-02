@@ -7,14 +7,56 @@ from aiogram.types import Message
 from app.database.repositories.product_repository import search_products
 from app.database.session import async_session_maker
 from app.keyboards.rating import get_rating_keyboard
+from app.services.price_service import get_price_statistics
 from app.services.rating_service import get_full_product_rating
 
 
 router = Router()
 
 
+def format_price_text(price_stats: dict | None) -> str:
+    if price_stats is None:
+        return (
+            "💰 Цена пока не собрана\n"
+            "Данные появятся после подключения источников цен."
+        )
+
+    price_text = (
+        "💰 Средняя цена по рынку: "
+        f"<b>около {price_stats['median']:.0f} ₽</b>\n"
+        "📊 Встречается от "
+        f"<b>{price_stats['minimum']:.0f} ₽</b> "
+        "до "
+        f"<b>{price_stats['maximum']:.0f} ₽</b>\n"
+        "🏪 Найдено цен: "
+        f"<b>{price_stats['prices_count']}</b>"
+    )
+
+    if price_stats["spread"] >= 500:
+        price_text += (
+            "\n⚠️ Разница между ценами: "
+            f"<b>{price_stats['spread']:.0f} ₽</b>\n"
+            "Перед покупкой лучше сравнить стоимость."
+        )
+    elif price_stats["spread_percent"] >= 25:
+        price_text += (
+            "\n⚠️ Большой разброс цен: "
+            f"<b>{price_stats['spread_percent']:.0f}%</b>"
+        )
+    elif price_stats["spread"] > 0:
+        price_text += (
+            "\n↕️ Разброс цен: "
+            f"<b>{price_stats['spread']:.0f} ₽</b>"
+        )
+
+    return price_text
+
+
 @router.message(F.text)
 async def search_handler(message: Message) -> None:
+    if message.text is None:
+        return
+
     query = message.text.strip()
 
     if not query:
@@ -51,6 +93,11 @@ async def search_handler(message: Message) -> None:
 
         for product, brand, category in products[:10]:
             rating = await get_full_product_rating(
+                session=session,
+                product_id=product.id,
+            )
+
+            price_stats = await get_price_statistics(
                 session=session,
                 product_id=product.id,
             )
@@ -109,6 +156,8 @@ async def search_handler(message: Message) -> None:
                     "Будьте первым, кто оценит этот товар."
                 )
 
+            price_text = format_price_text(price_stats)
+
             await message.answer(
                 f"<b>{escape(brand.name)} — "
                 f"{escape(product.name)}</b>\n\n"
@@ -117,6 +166,7 @@ async def search_handler(message: Message) -> None:
                 f"{package_text}"
                 f"{barcode_text}\n\n"
                 f"{rating_text}\n\n"
+                f"{price_text}\n\n"
                 "Поставьте свою оценку:",
                 reply_markup=get_rating_keyboard(product.id),
             )
