@@ -1,19 +1,22 @@
-from app.database.base import Base
-from app.database.models import (
-    Brand,
-    Category,
-    PriceObservation,
-    Product,
-    ProductAlias,
-    ProductRelation,
-    Rating,
-    Review,
-    SearchHistory,
-    User,
-)
+import logging
+
+from sqlalchemy import text
+
 from app.database.session import engine
 
 
-async def init_database() -> None:
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+logger = logging.getLogger(__name__)
+
+
+async def check_database_connection() -> None:
+    """
+    Проверяет доступность базы данных перед запуском бота.
+
+    Структура таблиц создаётся и обновляется только
+    через Alembic-миграции.
+    """
+
+    async with engine.connect() as connection:
+        await connection.execute(text("SELECT 1"))
+
+    logger.info("Подключение к базе данных успешно проверено")
