@@ -13,9 +13,24 @@ jobs:
   check:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: markaradar
+          POSTGRES_PASSWORD: markaradar_test
+          POSTGRES_DB: markaradar_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U markaradar -d markaradar_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
     env:
       BOT_TOKEN: "123456789:TEST_TOKEN"
-      DATABASE_URL: "postgresql+asyncpg://user:password@localhost:5432/markaradar"
+      DATABASE_URL: "postgresql+asyncpg://markaradar:markaradar_test@localhost:5432/markaradar_test"
       ADMIN_ID: "1"
 
     steps:
@@ -49,7 +64,72 @@ jobs:
           print("Все модели SQLAlchemy успешно проверены")
           PY
 
-      - name: Check Alembic configuration
+      - name: Show Alembic migration history
         run: |
           alembic history
           alembic heads
+
+      - name: Apply database migrations
+        run: |
+          alembic upgrade head
+
+      - name: Check current database revision
+        run: |
+          alembic current
+
+      - name: Test migration rollback
+        run: |
+          alembic downgrade base
+
+      - name: Apply migrations again
+        run: |
+          alembic upgrade head
+
+      - name: Verify created tables
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from sqlalchemy import inspect
+          from app.database.session import engine
+
+
+          async def check_tables() -> None:
+              async with engine.connect() as connection:
+                  tables = await connection.run_sync(
+                      lambda sync_connection: inspect(
+                          sync_connection
+                      ).get_table_names()
+                  )
+
+              required_tables = {
+                  "alembic_version",
+                  "users",
+                  "brands",
+                  "categories",
+                  "products",
+                  "ratings",
+                  "reviews",
+                  "price_observations",
+                  "product_aliases",
+                  "product_relations",
+                  "search_history",
+              }
+
+              missing_tables = required_tables - set(tables)
+
+              if missing_tables:
+                  raise RuntimeError(
+                      "Не созданы таблицы: "
+                      + ", ".join(sorted(missing_tables))
+                  )
+
+              print("Созданные таблицы:")
+              for table in sorted(tables):
+                  print(f"- {table}")
+
+              await engine.dispose()
+
+
+          asyncio.run(check_tables())
+          PY
