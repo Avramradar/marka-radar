@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Numeric,
@@ -9,12 +11,24 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import relationship
 
 from app.database.base import Base
 
 
+if TYPE_CHECKING:
+    from app.database.models.product import Product
+
+
 class PriceObservation(Base):
     __tablename__ = "price_observations"
+
+    __table_args__ = (
+        CheckConstraint(
+            "price > 0",
+            name="price_positive",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         primary_key=True,
@@ -22,7 +36,10 @@ class PriceObservation(Base):
     )
 
     product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"),
+        ForeignKey(
+            "products.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -54,4 +71,8 @@ class PriceObservation(Base):
         default=datetime.utcnow,
         nullable=False,
         index=True,
+    )
+
+    product: Mapped["Product"] = relationship(
+        back_populates="prices",
     )
