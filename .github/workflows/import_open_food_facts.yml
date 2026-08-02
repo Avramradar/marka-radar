@@ -75,7 +75,7 @@ jobs:
                   pages_count=pages_count,
                   page_size=page_size,
                   country="russia",
-                  delay_seconds=15,
+                  delay_seconds=30,
                   stop_on_page_error=False,
               )
 
