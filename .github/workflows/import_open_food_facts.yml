@@ -3,14 +3,19 @@ name: Import Open Food Facts
 on:
   workflow_dispatch:
     inputs:
-      page:
-        description: "Page"
-        required: false
+      start_page:
+        description: "Начальная страница"
+        required: true
         default: "1"
 
+      pages_count:
+        description: "Количество страниц"
+        required: true
+        default: "10"
+
       page_size:
-        description: "Products count"
-        required: false
+        description: "Товаров на странице"
+        required: true
         default: "100"
 
 jobs:
@@ -18,45 +23,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run importer
+      - name: Run bulk importer
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python - <<EOF
           import asyncio
 
-          from app.importers.open_food_facts_importer import import_open_food_facts_products
+          from app.importers.open_food_facts_bulk_importer import (
+              import_open_food_facts_pages,
+          )
 
           async def main():
-              stats = await import_open_food_facts_products(
-                  page=int("${{ github.event.inputs.page }}"),
-                  page_size=int("${{ github.event.inputs.page_size }}"),
+              stats = await import_open_food_facts_pages(
+                  start_page=${{ github.event.inputs.start_page }},
+                  pages_count=${{ github.event.inputs.pages_count }},
+                  page_size=${{ github.event.inputs.page_size }},
               )
 
+              print()
               print("=" * 60)
-              print("IMPORT FINISHED")
-              print(f"Received   : {stats.received}")
-              print(f"Created    : {stats.created}")
-              print(f"Updated    : {stats.updated}")
-              print(f"Skipped    : {stats.skipped}")
-              print(f"Errors     : {stats.errors}")
-              print(f"Brands     : {stats.brands_created}")
-              print(f"Categories : {stats.categories_created}")
+              print("ИМПОРТ ЗАВЕРШЕН")
+              print("=" * 60)
+              print(f"Получено: {stats.received}")
+              print(f"Создано: {stats.created}")
+              print(f"Обновлено: {stats.updated}")
+              print(f"Пропущено: {stats.skipped}")
+              print(f"Ошибок: {stats.errors}")
+              print(f"Последняя страница: {stats.last_completed_page}")
               print("=" * 60)
 
           asyncio.run(main())
