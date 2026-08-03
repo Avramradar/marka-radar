@@ -1,24 +1,181 @@
-name: Download Open Food Facts Dump
+name: Import Open Food Facts Dump
 
 on:
   workflow_dispatch:
+    inputs:
+      max_products:
+        description: "Сколько российских товаров обработать"
+        required: true
+        default: "500"
+
+      commit_every:
+        description: "Сохранять в БД каждые N товаров"
+        required: true
+        default: "100"
 
 jobs:
-  download:
+  import-dump:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_ID: ${{ secrets.ADMIN_ID }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      INPUT_MAX_PRODUCTS: ${{ inputs.max_products }}
+      INPUT_COMMIT_EVERY: ${{ inputs.commit_every }}
 
-      - name: Download dump
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check required secrets
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL secret is missing"
+            exit 1
+          fi
+
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "BOT_TOKEN secret is missing"
+            exit 1
+          fi
+
+          if [ -z "$ADMIN_ID" ]; then
+            echo "ADMIN_ID secret is missing"
+            exit 1
+          fi
+
+      - name: Show free disk space
+        run: |
+          df -h
+
+      - name: Download Open Food Facts dump
         run: |
           mkdir -p data
 
           wget \
+            --progress=dot:giga \
+            --tries=5 \
+            --timeout=60 \
+            --continue \
             -O data/openfoodfacts-products.jsonl.gz \
             https://static.openfoodfacts.org/data/openfoodfacts-products.jsonl.gz
 
-      - name: Show file
+      - name: Verify downloaded dump
         run: |
-          ls -lh data
+          ls -lh data/openfoodfacts-products.jsonl.gz
+
+          gzip -t data/openfoodfacts-products.jsonl.gz
+
+          echo "Архив успешно проверен"
+
+      - name: Import Russian products
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+
+          from app.importers.off_dump_importer import import_dump
+
+
+          async def main() -> None:
+              max_products = int(
+                  os.environ["INPUT_MAX_PRODUCTS"]
+              )
+
+              commit_every = int(
+                  os.environ["INPUT_COMMIT_EVERY"]
+              )
+
+              statistics = await import_dump(
+                  path=(
+                      "data/"
+                      "openfoodfacts-products.jsonl.gz"
+                  ),
+                  max_products=max_products,
+                  commit_every=commit_every,
+              )
+
+              print()
+              print("=" * 60)
+              print("ИМПОРТ ДАМПА ЗАВЕРШЁН")
+              print("=" * 60)
+
+              print(
+                  f"Просмотрено строк: "
+                  f"{statistics.scanned_lines}"
+              )
+
+              print(
+                  f"Найдено российских товаров: "
+                  f"{statistics.russian_products}"
+              )
+
+              print(
+                  f"Создано товаров: "
+                  f"{statistics.created}"
+              )
+
+              print(
+                  f"Обновлено товаров: "
+                  f"{statistics.updated}"
+              )
+
+              print(
+                  f"Пропущено товаров: "
+                  f"{statistics.skipped}"
+              )
+
+              print(
+                  f"Ошибок JSON: "
+                  f"{statistics.invalid_json}"
+              )
+
+              print(
+                  f"Ошибок импорта: "
+                  f"{statistics.errors}"
+              )
+
+              print(
+                  f"Создано брендов: "
+                  f"{statistics.brands_created}"
+              )
+
+              print(
+                  f"Создано категорий: "
+                  f"{statistics.categories_created}"
+              )
+
+              print("=" * 60)
+
+              processed = (
+                  statistics.created
+                  + statistics.updated
+              )
+
+              if processed == 0:
+                  raise RuntimeError(
+                      "Не импортирован ни один товар"
+                  )
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Show final disk usage
+        if: always()
+        run: |
+          df -h
+          du -sh data || true
