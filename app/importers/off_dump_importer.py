@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DumpImportStatistics:
+    start_line: int = 0
     scanned_lines: int = 0
+    last_scanned_line: int = 0
     russian_products: int = 0
     invalid_json: int = 0
     skipped: int = 0
@@ -74,18 +76,21 @@ def add_import_statistics(
 async def import_dump(
     path: str,
     *,
+    start_line: int = 0,
     max_products: int | None = None,
     commit_every: int = 100,
 ) -> DumpImportStatistics:
     """
     Потоково читает архив Open Food Facts.
 
-    В память загружается только одна строка JSON.
-    Импортируются только товары, связанные с Россией.
+    start_line:
+        Количество начальных строк, которые нужно пропустить.
+        Например, start_line=617155 продолжит чтение
+        со строки 617156.
 
     max_products:
-        Ограничивает число обработанных российских товаров.
-        Для первого теста используем 500.
+        Максимальное количество успешно созданных
+        или обновлённых товаров за один запуск.
 
     commit_every:
         Через сколько сохранённых товаров выполнять commit.
@@ -98,6 +103,11 @@ async def import_dump(
             f"Файл дампа не найден: {dump_path}"
         )
 
+    if start_line < 0:
+        raise ValueError(
+            "start_line не может быть отрицательным"
+        )
+
     if commit_every < 1:
         raise ValueError(
             "commit_every должен быть больше нуля"
@@ -108,7 +118,11 @@ async def import_dump(
             "max_products должен быть больше нуля"
         )
 
-    statistics = DumpImportStatistics()
+    statistics = DumpImportStatistics(
+        start_line=start_line,
+        last_scanned_line=start_line,
+    )
+
     pending_since_commit = 0
 
     try:
@@ -119,8 +133,15 @@ async def import_dump(
                 encoding="utf-8",
                 errors="replace",
             ) as dump_file:
-                for line in dump_file:
+                for line_number, line in enumerate(
+                    dump_file,
+                    start=1,
+                ):
+                    if line_number <= start_line:
+                        continue
+
                     statistics.scanned_lines += 1
+                    statistics.last_scanned_line = line_number
 
                     try:
                         raw_product = json.loads(line)
@@ -156,8 +177,10 @@ async def import_dump(
                         statistics.errors += 1
 
                         logger.exception(
-                            "Ошибка импорта товара %s",
+                            "Ошибка импорта товара %s "
+                            "на строке %s",
                             prepared.barcode,
+                            line_number,
                         )
                         continue
 
@@ -173,9 +196,11 @@ async def import_dump(
                         pending_since_commit = 0
 
                         logger.info(
-                            "Дамп: строк %s; российских %s; "
-                            "создано %s; обновлено %s; "
-                            "ошибок %s",
+                            "Дамп: текущая строка %s; "
+                            "просмотрено после старта %s; "
+                            "российских %s; создано %s; "
+                            "обновлено %s; ошибок %s",
+                            statistics.last_scanned_line,
                             statistics.scanned_lines,
                             statistics.russian_products,
                             statistics.created,
@@ -194,8 +219,10 @@ async def import_dump(
                         >= max_products
                     ):
                         logger.info(
-                            "Достигнут лимит max_products=%s",
+                            "Достигнут лимит "
+                            "max_products=%s на строке %s",
                             max_products,
+                            statistics.last_scanned_line,
                         )
                         break
 
@@ -206,12 +233,16 @@ async def import_dump(
 
     logger.info(
         "Импорт дампа завершён. "
-        "Просмотрено строк: %s; "
+        "Начальная строка: %s; "
+        "последняя строка: %s; "
+        "просмотрено новых строк: %s; "
         "российских товаров: %s; "
         "создано: %s; обновлено: %s; "
         "пропущено: %s; ошибки JSON: %s; "
         "ошибки импорта: %s; брендов: %s; "
         "категорий: %s.",
+        statistics.start_line,
+        statistics.last_scanned_line,
         statistics.scanned_lines,
         statistics.russian_products,
         statistics.created,
