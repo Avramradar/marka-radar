@@ -1,0 +1,24 @@
+name: Download Open Food Facts Dump
+
+on:
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dump
+        run: |
+          mkdir -p data
+
+          wget \
+            -O data/openfoodfacts-products.jsonl.gz \
+            https://static.openfoodfacts.org/data/openfoodfacts-products.jsonl.gz
+
+      - name: Show file
+        run: |
+          ls -lh data
