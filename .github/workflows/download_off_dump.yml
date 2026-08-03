@@ -3,6 +3,11 @@ name: Import Open Food Facts Dump
 on:
   workflow_dispatch:
     inputs:
+      start_line:
+        description: "С какой строки продолжить импорт"
+        required: true
+        default: "617155"
+
       max_products:
         description: "Сколько российских товаров обработать"
         required: true
@@ -22,6 +27,8 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       ADMIN_ID: ${{ secrets.ADMIN_ID }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      INPUT_START_LINE: ${{ inputs.start_line }}
       INPUT_MAX_PRODUCTS: ${{ inputs.max_products }}
       INPUT_COMMIT_EVERY: ${{ inputs.commit_every }}
 
@@ -91,6 +98,10 @@ jobs:
 
 
           async def main() -> None:
+              start_line = int(
+                  os.environ["INPUT_START_LINE"]
+              )
+
               max_products = int(
                   os.environ["INPUT_MAX_PRODUCTS"]
               )
@@ -104,6 +115,7 @@ jobs:
                       "data/"
                       "openfoodfacts-products.jsonl.gz"
                   ),
+                  start_line=start_line,
                   max_products=max_products,
                   commit_every=commit_every,
               )
@@ -114,7 +126,17 @@ jobs:
               print("=" * 60)
 
               print(
-                  f"Просмотрено строк: "
+                  f"Начальная строка: "
+                  f"{statistics.start_line}"
+              )
+
+              print(
+                  f"Последняя обработанная строка: "
+                  f"{statistics.last_scanned_line}"
+              )
+
+              print(
+                  f"Просмотрено новых строк: "
                   f"{statistics.scanned_lines}"
               )
 
@@ -156,6 +178,12 @@ jobs:
               print(
                   f"Создано категорий: "
                   f"{statistics.categories_created}"
+              )
+
+              print()
+              print(
+                  "Для следующего запуска укажи "
+                  f"start_line={statistics.last_scanned_line}"
               )
 
               print("=" * 60)
