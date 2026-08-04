@@ -13,6 +13,7 @@ from app.database.base import Base
 
 if TYPE_CHECKING:
     from app.database.models.product import Product
+    from app.database.models.product_family import ProductFamily
     from app.database.models.product_relation import ProductRelation
     from app.database.models.search_history import SearchHistory
 
@@ -68,21 +69,38 @@ class Category(Base):
         passive_deletes=True,
     )
 
-    source_relations: Mapped[list["ProductRelation"]] = relationship(
-        foreign_keys="ProductRelation.source_category_id",
+    product_families: Mapped[
+        list["ProductFamily"]
+    ] = relationship(
+        back_populates="category",
+        passive_deletes=True,
+    )
+
+    source_relations: Mapped[
+        list["ProductRelation"]
+    ] = relationship(
+        foreign_keys=(
+            "ProductRelation.source_category_id"
+        ),
         back_populates="source_category",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
 
-    target_relations: Mapped[list["ProductRelation"]] = relationship(
-        foreign_keys="ProductRelation.target_category_id",
+    target_relations: Mapped[
+        list["ProductRelation"]
+    ] = relationship(
+        foreign_keys=(
+            "ProductRelation.target_category_id"
+        ),
         back_populates="target_category",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
 
-    search_selections: Mapped[list["SearchHistory"]] = relationship(
+    search_selections: Mapped[
+        list["SearchHistory"]
+    ] = relationship(
         back_populates="selected_category",
         passive_deletes=True,
     )
