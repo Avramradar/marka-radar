@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,7 +9,6 @@ from app.search.intent_groups import (
     get_intent_groups,
 )
 from app.search.suggestions import (
-    SearchSuggestion,
     get_search_suggestions,
 )
 
@@ -24,7 +24,7 @@ class SearchEngineResult:
     mode: SearchMode
     query: str
     intent_groups: list[IntentGroup]
-    product_suggestions: list[SearchSuggestion]
+    product_suggestions: list[dict[str, Any]]
 
 
 async def run_search_engine(
@@ -37,10 +37,9 @@ async def run_search_engine(
     """
     Главная точка входа для поиска MarkaRadar.
 
-    Логика:
-    1. Сначала пытается построить полезные уточняющие группы.
-    2. Если групп недостаточно, возвращает конкретные товары.
-    3. Если ничего нет, возвращает пустой результат.
+    Сначала пытается построить уточняющие группы.
+    Если групп недостаточно, возвращает товары.
+    Если ничего нет, возвращает пустой результат.
     """
 
     cleaned_query = query.strip()
