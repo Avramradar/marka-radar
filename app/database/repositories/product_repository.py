@@ -26,7 +26,8 @@ def build_alias_ilike_condition(pattern: str):
     """
     Проверяет наличие синонима, содержащего искомый текст.
 
-    EXISTS не создаёт повторяющиеся строки товаров.
+    Используется EXISTS, поэтому товары не дублируются
+    из-за нескольких подходящих синонимов.
     """
 
     return exists(
@@ -57,7 +58,7 @@ def build_alias_trigram_condition(
     """
     Проверяет похожий синоним через pg_trgm.
 
-    Оператор % использует порог похожести PostgreSQL.
+    Оператор % использует similarity_threshold PostgreSQL.
     """
 
     return exists(
@@ -70,21 +71,49 @@ def build_alias_trigram_condition(
     )
 
 
+def build_alias_word_similarity_condition(
+    normalized_query: str,
+):
+    """
+    Проверяет похожесть запроса на отдельное слово
+    или часть фразы в синониме.
+    """
+
+    return exists(
+        select(ProductAlias.id).where(
+            ProductAlias.product_id == Product.id,
+            func.word_similarity(
+                normalized_query,
+                ProductAlias.normalized_alias,
+            )
+            >= 0.40,
+        )
+    )
+
+
 def build_alias_similarity_score(
     normalized_query: str,
 ):
     """
-    Возвращает максимальную степень похожести
-    среди синонимов конкретного товара.
+    Возвращает максимальную похожесть среди синонимов.
+
+    Учитывает как similarity всей строки, так и
+    word_similarity для неполных слов.
     """
 
     return (
         select(
             func.coalesce(
                 func.max(
-                    func.similarity(
-                        ProductAlias.normalized_alias,
-                        normalized_query,
+                    func.greatest(
+                        func.similarity(
+                            ProductAlias.normalized_alias,
+                            normalized_query,
+                        ),
+                        func.word_similarity(
+                            normalized_query,
+                            ProductAlias.normalized_alias,
+                        ),
                     )
                 ),
                 0.0,
@@ -100,11 +129,11 @@ def build_alias_similarity_score(
 
 def build_token_condition(token: str):
     """
-    Строит условие поиска для одного слова.
+    Строит строгое условие поиска для одного слова.
 
-    Слово может находиться:
+    Слово может встречаться:
     - в названии товара;
-    - в бренде;
+    - в названии бренда;
     - в альтернативных названиях бренда;
     - в категории;
     - в ключевых словах;
@@ -132,7 +161,7 @@ def deduplicate_results(
 ) -> list[SearchResult]:
     """
     Удаляет повторяющиеся товары,
-    сохраняя исходный порядок результатов.
+    сохраняя порядок результатов.
     """
 
     unique_rows: list[SearchResult] = []
@@ -197,8 +226,8 @@ async def search_strict_variant(
     """
     Выполняет строгий поиск одного варианта запроса.
 
-    Например, для пользовательского запроса «Барилла»
-    эта функция отдельно может получить вариант «barilla».
+    Все слова варианта должны встретиться хотя бы
+    в одном из доступных поисковых полей.
     """
 
     tokens = [
@@ -302,9 +331,7 @@ async def search_strict_variant(
 
     if excluded_product_ids:
         conditions.append(
-            Product.id.notin_(
-                excluded_product_ids
-            )
+            Product.id.notin_(excluded_product_ids)
         )
 
     statement = (
@@ -346,13 +373,15 @@ async def search_fuzzy_variant(
     excluded_product_ids: set[int] | None = None,
 ) -> list[SearchResult]:
     """
-    Выполняет поиск с опечатками через pg_trgm.
+    Выполняет умный поиск через pg_trgm.
 
-    Примеры:
-    - барила -> Barilla;
-    - скумбря -> скумбрия;
-    - доброфлотт -> Доброфлот;
-    - простаквашино -> Простоквашино.
+    Поддерживает:
+    - опечатки;
+    - неполные слова;
+    - русскую транскрипцию;
+    - латинские названия;
+    - неправильную раскладку;
+    - совпадение с частью длинного названия.
     """
 
     if len(normalized_query) < 3:
@@ -406,55 +435,119 @@ async def search_fuzzy_variant(
         normalized_query
     )
 
-    product_similarity = func.similarity(
-        product_name_text,
-        normalized_query,
+    product_similarity = func.greatest(
+        func.similarity(
+            product_name_text,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            product_name_text,
+        ),
     )
 
-    brand_similarity = func.similarity(
-        brand_name_text,
-        normalized_query,
+    brand_similarity = func.greatest(
+        func.similarity(
+            brand_name_text,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            brand_name_text,
+        ),
     )
 
-    brand_alias_similarity = func.similarity(
-        brand_aliases_text,
-        normalized_query,
+    brand_alias_similarity = func.greatest(
+        func.similarity(
+            brand_aliases_text,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            brand_aliases_text,
+        ),
     )
 
-    category_similarity = func.similarity(
-        category_name_text,
-        normalized_query,
+    category_similarity = func.greatest(
+        func.similarity(
+            category_name_text,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            category_name_text,
+        ),
     )
 
-    keywords_similarity = func.similarity(
-        keywords_text,
-        normalized_query,
+    keywords_similarity = func.greatest(
+        func.similarity(
+            keywords_text,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            keywords_text,
+        ),
     )
 
-    subtype_similarity = func.similarity(
-        subtype_text,
-        normalized_query,
+    subtype_similarity = func.greatest(
+        func.similarity(
+            subtype_text,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            subtype_text,
+        ),
     )
 
-    combined_similarity = func.similarity(
-        combined_name,
-        normalized_query,
+    combined_similarity = func.greatest(
+        func.similarity(
+            combined_name,
+            normalized_query,
+        ),
+        func.word_similarity(
+            normalized_query,
+            combined_name,
+        ),
     )
 
-    # Название и бренд имеют больший вес,
-    # чем категория и вспомогательные поля.
-    fuzzy_score = func.greatest(
-        product_similarity * 1.35,
-        combined_similarity * 1.30,
-        brand_similarity * 1.25,
-        alias_similarity * 1.20,
-        brand_alias_similarity * 1.15,
-        category_similarity * 0.70,
-        keywords_similarity * 0.65,
-        subtype_similarity * 0.60,
+    # Точное начало строки получает дополнительный бонус.
+    prefix_bonus = case(
+        (
+            Product.normalized_name.startswith(
+                normalized_query
+            ),
+            0.40,
+        ),
+        (
+            Brand.normalized_name.startswith(
+                normalized_query
+            ),
+            0.35,
+        ),
+        else_=0.0,
     )
 
-    trigram_condition = or_(
+    # Название товара, связка "бренд + товар"
+    # и бренд имеют наибольший вес.
+    fuzzy_score = (
+        func.greatest(
+            product_similarity * 1.40,
+            combined_similarity * 1.35,
+            brand_similarity * 1.30,
+            alias_similarity * 1.20,
+            brand_alias_similarity * 1.15,
+            category_similarity * 0.65,
+            keywords_similarity * 0.60,
+            subtype_similarity * 0.55,
+        )
+        + prefix_bonus
+    )
+
+    # Не полагаемся только на оператор %:
+    # он может не пропускать короткие и неполные слова.
+    fuzzy_condition = or_(
         Product.normalized_name.op("%")(
             normalized_query
         ),
@@ -476,18 +569,44 @@ async def search_fuzzy_variant(
         build_alias_trigram_condition(
             normalized_query
         ),
+        func.word_similarity(
+            normalized_query,
+            product_name_text,
+        )
+        >= 0.45,
+        func.word_similarity(
+            normalized_query,
+            brand_name_text,
+        )
+        >= 0.45,
+        func.word_similarity(
+            normalized_query,
+            combined_name,
+        )
+        >= 0.45,
+        func.word_similarity(
+            normalized_query,
+            brand_aliases_text,
+        )
+        >= 0.50,
+        func.word_similarity(
+            normalized_query,
+            keywords_text,
+        )
+        >= 0.55,
+        build_alias_word_similarity_condition(
+            normalized_query
+        ),
     )
 
     conditions = [
         Product.is_active.is_(True),
-        trigram_condition,
+        fuzzy_condition,
     ]
 
     if excluded_product_ids:
         conditions.append(
-            Product.id.notin_(
-                excluded_product_ids
-            )
+            Product.id.notin_(excluded_product_ids)
         )
 
     statement = (
@@ -530,22 +649,26 @@ async def search_products(
     limit: int = 20,
 ) -> list[SearchResult]:
     """
-    Ищет товары по:
+    Главная функция умного поиска.
+
+    Ищет по:
     - штрихкоду;
-    - названию;
+    - полному и неполному названию;
     - бренду;
     - категории;
     - ключевым словам;
     - синонимам;
     - русской транскрипции;
     - латинскому написанию;
+    - неправильной раскладке;
     - опечаткам.
 
-    Последовательность поиска:
+    Порядок:
     1. точный штрихкод;
-    2. строгий поиск исходного написания;
-    3. строгий поиск транслитерированных вариантов;
-    4. поиск с опечатками по всем вариантам.
+    2. строгий поиск исходного варианта;
+    3. строгий поиск дополнительных вариантов;
+    4. нечёткий поиск исходного варианта;
+    5. нечёткий поиск транслитерации и раскладки.
     """
 
     raw_query = query.strip()
@@ -559,7 +682,7 @@ async def search_products(
 
     safe_limit = min(limit, 100)
 
-    # Штрихкод всегда имеет абсолютный приоритет.
+    # Штрихкод имеет абсолютный приоритет.
     if raw_query.isdigit():
         barcode_products = await search_by_barcode(
             session=session,
@@ -578,9 +701,7 @@ async def search_products(
     collected_results: list[SearchResult] = []
     found_product_ids: set[int] = set()
 
-    # Сначала строгий поиск.
-    # Исходный вариант идёт первым,
-    # транслитерация — после него.
+    # Сначала выполняем строгий поиск.
     for search_variant in search_variants:
         remaining_limit = (
             safe_limit - len(collected_results)
@@ -614,8 +735,7 @@ async def search_products(
             limit=safe_limit,
         )
 
-    # Если строгих совпадений недостаточно,
-    # подключаем поиск с опечатками.
+    # Затем подключаем нечёткий поиск.
     for search_variant in search_variants:
         remaining_limit = (
             safe_limit - len(collected_results)
