@@ -1,11 +1,14 @@
 import logging
+from contextlib import suppress
 from decimal import Decimal
 from html import escape
+from pathlib import Path
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from app.database.repositories.product_repository import (
     search_products,
@@ -24,6 +27,13 @@ from app.services.rating_service import (
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+SEARCH_LOADER_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "assets"
+    / "markaradar_runner_shops.gif"
+)
 
 
 def format_number(
@@ -252,6 +262,74 @@ def build_product_card(
     return "\n".join(product_lines)
 
 
+async def send_search_loader(
+    message: Message,
+) -> Message | None:
+    """
+    Сразу показывает пользователю, что поиск начался.
+
+    Если GIF отсутствует, отправляет обычное
+    текстовое сообщение.
+    """
+
+    with suppress(Exception):
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id,
+            action=ChatAction.TYPING,
+        )
+
+    if not SEARCH_LOADER_PATH.is_file():
+        logger.warning(
+            "GIF загрузки не найден: %s",
+            SEARCH_LOADER_PATH,
+        )
+
+        return await message.answer(
+            "🔎 <b>Ищу товары…</b>\n"
+            "Проверяю названия, бренды "
+            "и похожие варианты."
+        )
+
+    try:
+        animation = FSInputFile(
+            SEARCH_LOADER_PATH
+        )
+
+        return await message.answer_animation(
+            animation=animation,
+            caption=(
+                "🏃 <b>Бегу вдоль витрин…</b>\n"
+                "Ищу подходящие товары и бренды."
+            ),
+        )
+
+    except Exception:
+        logger.exception(
+            "Не удалось отправить GIF поиска"
+        )
+
+        return await message.answer(
+            "🔎 <b>Ищу товары…</b>\n"
+            "Проверяю названия, бренды "
+            "и похожие варианты."
+        )
+
+
+async def remove_search_loader(
+    loading_message: Message | None,
+) -> None:
+    """
+    Удаляет GIF или текст загрузки,
+    когда поиск завершён.
+    """
+
+    if loading_message is None:
+        return
+
+    with suppress(Exception):
+        await loading_message.delete()
+
+
 async def send_product_card(
     *,
     message: Message,
@@ -313,7 +391,7 @@ async def show_single_product(
 ) -> None:
     """
     Загружает рейтинг и цены,
-    затем отправляет карточку одного товара.
+    затем отправляет карточку товара.
     """
 
     rating = await get_full_product_rating(
@@ -355,19 +433,77 @@ async def search_handler(
     if query.startswith("/"):
         return
 
-    async with async_session_maker() as session:
-        # Для штрихкода сразу используем основной поиск.
-        if query.isdigit():
-            barcode_products = await search_products(
+    loading_message = await send_search_loader(
+        message
+    )
+
+    try:
+        async with async_session_maker() as session:
+            # Для штрихкода сразу используем основной поиск.
+            if query.isdigit():
+                barcode_products = await search_products(
+                    session=session,
+                    query=query,
+                    limit=1,
+                )
+
+                if barcode_products:
+                    product, brand, category = (
+                        barcode_products[0]
+                    )
+
+                    await show_single_product(
+                        message=message,
+                        session=session,
+                        product=product,
+                        brand=brand,
+                        category=category,
+                    )
+                    return
+
+            # Сначала получаем компактные подсказки.
+            suggestions = await get_search_suggestions(
                 session=session,
                 query=query,
-                limit=1,
+                limit=8,
             )
 
-            if barcode_products:
-                product, brand, category = (
-                    barcode_products[0]
+            if suggestions:
+                await message.answer(
+                    "🔍 <b>Лучшие совпадения</b>\n\n"
+                    f"Запрос: «{escape(query)}»\n"
+                    "Выберите подходящий товар:",
+                    reply_markup=(
+                        get_search_suggestions_keyboard(
+                            suggestions
+                        )
+                    ),
                 )
+                return
+
+            # Если индекс не дал результата,
+            # используем расширенный поиск.
+            products = await search_products(
+                session=session,
+                query=query,
+                limit=20,
+            )
+
+            if not products:
+                await message.answer(
+                    "🔍 По вашему запросу "
+                    "ничего не найдено.\n\n"
+                    "Попробуйте:\n"
+                    "• написать название короче;\n"
+                    "• указать бренд;\n"
+                    "• проверить написание;\n"
+                    "• отправить штрихкод."
+                )
+                return
+
+            # Единственный результат открываем сразу.
+            if len(products) == 1:
+                product, brand, category = products[0]
 
                 await show_single_product(
                     message=message,
@@ -378,79 +514,43 @@ async def search_handler(
                 )
                 return
 
-        # Сначала пробуем получить компактные подсказки.
-        suggestions = await get_search_suggestions(
-            session=session,
-            query=query,
-            limit=8,
-        )
+            # Создаём кнопки из результатов
+            # резервного поиска.
+            fallback_suggestions = [
+                {
+                    "product_id": product.id,
+                    "name": product.name,
+                    "brand": brand.name,
+                    "score": 0.0,
+                }
+                for product, brand, _category
+                in products[:8]
+            ]
 
-        if suggestions:
             await message.answer(
-                "🔍 <b>Лучшие совпадения</b>\n\n"
+                "🔍 <b>Найдено несколько вариантов</b>\n\n"
                 f"Запрос: «{escape(query)}»\n"
-                "Выберите подходящий товар:",
+                "Нажмите на товар, "
+                "чтобы открыть карточку:",
                 reply_markup=(
                     get_search_suggestions_keyboard(
-                        suggestions
+                        fallback_suggestions
                     )
                 ),
             )
-            return
 
-        # Если поисковый индекс пока не дал результата,
-        # используем основной расширенный поиск.
-        products = await search_products(
-            session=session,
-            query=query,
-            limit=20,
+    except Exception:
+        logger.exception(
+            "Ошибка поиска по запросу: %s",
+            query,
         )
 
-        if not products:
-            await message.answer(
-                "🔍 По вашему запросу "
-                "ничего не найдено.\n\n"
-                "Попробуйте:\n"
-                "• написать название короче;\n"
-                "• указать бренд;\n"
-                "• проверить написание;\n"
-                "• отправить штрихкод."
-            )
-            return
-
-        # Один точный результат открываем сразу.
-        if len(products) == 1:
-            product, brand, category = products[0]
-
-            await show_single_product(
-                message=message,
-                session=session,
-                product=product,
-                brand=brand,
-                category=category,
-            )
-            return
-
-        # Создаём компактные кнопки из результатов
-        # резервного поиска.
-        fallback_suggestions = [
-            {
-                "product_id": product.id,
-                "name": product.name,
-                "brand": brand.name,
-                "score": 0.0,
-            }
-            for product, brand, _category
-            in products[:8]
-        ]
-
         await message.answer(
-            "🔍 <b>Найдено несколько вариантов</b>\n\n"
-            f"Запрос: «{escape(query)}»\n"
-            "Нажмите на товар, чтобы открыть карточку:",
-            reply_markup=(
-                get_search_suggestions_keyboard(
-                    fallback_suggestions
-                )
-            ),
+            "⚠️ Во время поиска произошла ошибка.\n"
+            "Попробуйте повторить запрос немного позже."
+        )
+
+    finally:
+        await remove_search_loader(
+            loading_message
         )
