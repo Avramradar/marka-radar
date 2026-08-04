@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from app.database.models.category import Category
     from app.database.models.price import PriceObservation
     from app.database.models.product_alias import ProductAlias
+    from app.database.models.product_family import ProductFamily
     from app.database.models.rating import Rating
     from app.database.models.review import Review
     from app.database.models.search_history import SearchHistory
@@ -45,6 +46,10 @@ class Product(Base):
         Index(
             "ix_products_search_text",
             "search_text",
+        ),
+        Index(
+            "ix_products_family_id",
+            "family_id",
         ),
     )
 
@@ -80,6 +85,15 @@ class Product(Base):
             ondelete="RESTRICT",
         ),
         nullable=False,
+        index=True,
+    )
+
+    family_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "product_families.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
         index=True,
     )
 
@@ -152,6 +166,10 @@ class Product(Base):
     )
 
     category: Mapped["Category"] = relationship(
+        back_populates="products",
+    )
+
+    family: Mapped["ProductFamily | None"] = relationship(
         back_populates="products",
     )
 
