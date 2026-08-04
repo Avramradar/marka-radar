@@ -42,6 +42,10 @@ class Product(Base):
             "is_active",
             "normalized_name",
         ),
+        Index(
+            "ix_products_search_text",
+            "search_text",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -113,6 +117,11 @@ class Product(Base):
     )
 
     keywords: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    search_text: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
     )
