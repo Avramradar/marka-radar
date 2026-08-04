@@ -6,12 +6,12 @@ on:
       start_line:
         description: "С какой строки продолжить импорт"
         required: true
-        default: "617155"
+        default: "4664375"
 
       max_products:
         description: "Сколько российских товаров обработать"
         required: true
-        default: "500"
+        default: "10000"
 
       commit_every:
         description: "Сохранять в БД каждые N товаров"
@@ -186,17 +186,19 @@ jobs:
                   f"start_line={statistics.last_scanned_line}"
               )
 
-              print("=" * 60)
-
               processed = (
                   statistics.created
                   + statistics.updated
               )
 
               if processed == 0:
-                  raise RuntimeError(
-                      "Не импортирован ни один товар"
+                  print()
+                  print(
+                      "Новых товаров не найдено. "
+                      "Возможно, достигнут конец дампа."
                   )
+
+              print("=" * 60)
 
 
           asyncio.run(main())
