@@ -5,6 +5,40 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 PRODUCTS_PER_PAGE = 10
 
 
+def format_product_button_text(
+    *,
+    brand: str,
+    name: str,
+) -> str:
+    """
+    Формирует текст кнопки товара.
+
+    Если бренд отсутствует или содержит служебное
+    значение, показывается только название товара.
+    """
+
+    hidden_brands = {
+        "",
+        "бренд не указан",
+        "не указан",
+        "unknown",
+        "no brand",
+        "без бренда",
+    }
+
+    clean_brand = str(brand or "").strip()
+    clean_name = str(name or "").strip()
+
+    normalized_brand = clean_brand.lower()
+
+    if normalized_brand in hidden_brands:
+        return clean_name[:64]
+
+    return (
+        f"{clean_brand} — {clean_name}"
+    )[:64]
+
+
 def get_search_suggestions_keyboard(
     suggestions: list[dict],
 ):
@@ -17,12 +51,19 @@ def get_search_suggestions_keyboard(
     for suggestion in suggestions:
         builder.row(
             InlineKeyboardButton(
-                text=(
-                    f"{suggestion['brand']} — "
-                    f"{suggestion['name']}"
-                )[:64],
+                text=format_product_button_text(
+                    brand=suggestion.get(
+                        "brand",
+                        "",
+                    ),
+                    name=suggestion.get(
+                        "name",
+                        "",
+                    ),
+                ),
                 callback_data=(
-                    f"product:{suggestion['product_id']}"
+                    f"product:"
+                    f"{suggestion['product_id']}"
                 ),
             )
         )
@@ -48,8 +89,11 @@ def get_intent_groups_keyboard(
         )
 
         button_text = str(
-            group["title"]
-        )
+            group.get(
+                "title",
+                "",
+            )
+        ).strip()
 
         if count > 0:
             button_text = (
@@ -80,7 +124,7 @@ def get_paginated_products_keyboard(
     Callback:
     product:<id> — открыть карточку
     products_page:<page> — открыть страницу
-    products_page_info — неактивная кнопка номера страницы
+    products_page_info — кнопка номера страницы
     """
 
     builder = InlineKeyboardBuilder()
@@ -121,12 +165,19 @@ def get_paginated_products_keyboard(
     for product in page_products:
         builder.row(
             InlineKeyboardButton(
-                text=(
-                    f"{product['brand']} — "
-                    f"{product['name']}"
-                )[:64],
+                text=format_product_button_text(
+                    brand=product.get(
+                        "brand",
+                        "",
+                    ),
+                    name=product.get(
+                        "name",
+                        "",
+                    ),
+                ),
                 callback_data=(
-                    f"product:{product['product_id']}"
+                    f"product:"
+                    f"{product['product_id']}"
                 ),
             )
         )
@@ -140,7 +191,8 @@ def get_paginated_products_keyboard(
             InlineKeyboardButton(
                 text="⬅️ Назад",
                 callback_data=(
-                    f"products_page:{safe_page - 1}"
+                    f"products_page:"
+                    f"{safe_page - 1}"
                 ),
             )
         )
@@ -160,7 +212,8 @@ def get_paginated_products_keyboard(
             InlineKeyboardButton(
                 text="Далее ➡️",
                 callback_data=(
-                    f"products_page:{safe_page + 1}"
+                    f"products_page:"
+                    f"{safe_page + 1}"
                 ),
             )
         )
