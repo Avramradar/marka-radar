@@ -83,6 +83,49 @@ LATIN_TO_CYRILLIC = {
 }
 
 
+ENGLISH_TO_RUSSIAN_KEYBOARD = {
+    "`": "ё",
+    "q": "й",
+    "w": "ц",
+    "e": "у",
+    "r": "к",
+    "t": "е",
+    "y": "н",
+    "u": "г",
+    "i": "ш",
+    "o": "щ",
+    "p": "з",
+    "[": "х",
+    "]": "ъ",
+    "a": "ф",
+    "s": "ы",
+    "d": "в",
+    "f": "а",
+    "g": "п",
+    "h": "р",
+    "j": "о",
+    "k": "л",
+    "l": "д",
+    ";": "ж",
+    "'": "э",
+    "z": "я",
+    "x": "ч",
+    "c": "с",
+    "v": "м",
+    "b": "и",
+    "n": "т",
+    "m": "ь",
+    ",": "б",
+    ".": "ю",
+}
+
+
+RUSSIAN_TO_ENGLISH_KEYBOARD = {
+    russian: english
+    for english, russian in ENGLISH_TO_RUSSIAN_KEYBOARD.items()
+}
+
+
 def normalize_text(value: str) -> str:
     """
     Приводит строку к единому виду для поиска.
@@ -121,6 +164,58 @@ def contains_latin(value: str) -> bool:
             r"[a-z]",
             value.lower(),
         )
+    )
+
+
+def convert_english_layout_to_russian(
+    value: str,
+) -> str:
+    """
+    Исправляет текст, набранный в английской раскладке.
+
+    Примеры:
+    ",fhbkkf" -> "барилла"
+    "ghjcnjrfibyj" -> "простоквашино"
+    "vfraf" -> "макфа"
+    """
+
+    result: list[str] = []
+
+    for character in value.lower():
+        result.append(
+            ENGLISH_TO_RUSSIAN_KEYBOARD.get(
+                character,
+                character,
+            )
+        )
+
+    return normalize_text(
+        "".join(result)
+    )
+
+
+def convert_russian_layout_to_english(
+    value: str,
+) -> str:
+    """
+    Исправляет текст, набранный в русской раскладке.
+
+    Пример:
+    "сщсф сщдф" -> "coca cola"
+    """
+
+    result: list[str] = []
+
+    for character in value.lower():
+        result.append(
+            RUSSIAN_TO_ENGLISH_KEYBOARD.get(
+                character,
+                character,
+            )
+        )
+
+    return normalize_text(
+        "".join(result)
     )
 
 
@@ -200,7 +295,13 @@ def build_search_variants(
     - barilla
     - барилла
 
-    Опечатки в каждом варианте затем обрабатывает pg_trgm.
+    Для ",fhbkkf":
+    - fhbkkf
+    - барилла
+    - фхбккф
+    - barilla
+
+    Каждый вариант затем дополнительно обрабатывается pg_trgm.
     """
 
     normalized = normalize_text(value)
@@ -208,43 +309,71 @@ def build_search_variants(
     if not normalized:
         return []
 
-    variants: list[str] = [
+    candidates: list[str] = [
         normalized,
     ]
 
-    if contains_cyrillic(normalized):
-        variants.append(
-            transliterate_cyrillic_to_latin(
-                normalized
-            )
+    if contains_latin(value):
+        corrected_russian_layout = (
+            convert_english_layout_to_russian(value)
         )
 
-    if contains_latin(normalized):
-        variants.append(
+        candidates.append(
+            corrected_russian_layout
+        )
+
+        candidates.append(
             transliterate_latin_to_cyrillic(
                 normalized
             )
         )
 
-    # Удаляем пустые и повторяющиеся варианты,
-    # сохраняя исходный порядок.
+        if corrected_russian_layout:
+            candidates.append(
+                transliterate_cyrillic_to_latin(
+                    corrected_russian_layout
+                )
+            )
+
+    if contains_cyrillic(value):
+        corrected_english_layout = (
+            convert_russian_layout_to_english(value)
+        )
+
+        candidates.append(
+            corrected_english_layout
+        )
+
+        candidates.append(
+            transliterate_cyrillic_to_latin(
+                normalized
+            )
+        )
+
+        if corrected_english_layout:
+            candidates.append(
+                transliterate_latin_to_cyrillic(
+                    corrected_english_layout
+                )
+            )
+
     unique_variants: list[str] = []
     seen: set[str] = set()
 
-    for variant in variants:
-        normalized_variant = normalize_text(
-            variant
+    for candidate in candidates:
+        normalized_candidate = normalize_text(
+            candidate
         )
 
-        if not normalized_variant:
+        if not normalized_candidate:
             continue
 
-        if normalized_variant in seen:
+        if normalized_candidate in seen:
             continue
 
-        seen.add(normalized_variant)
+        seen.add(normalized_candidate)
         unique_variants.append(
-            normalized_variant
+            normalized_candidate
         )
 
     return unique_variants
