@@ -8,6 +8,9 @@ from aiogram.enums import ParseMode
 from app.config import config
 from app.database.init_db import check_database_connection
 from app.database.session import close_database
+from app.handlers.intent_callback import (
+    router as intent_callback_router,
+)
 from app.handlers.product_callback import (
     router as product_callback_router,
 )
@@ -51,12 +54,18 @@ async def main() -> None:
 
     dispatcher = Dispatcher()
 
-    # Порядок имеет значение.
-    # Сначала команды,
-    # затем callback,
-    # затем сообщения поиска.
+    # Порядок подключения важен:
+    # 1. команды;
+    # 2. уточняющие группы;
+    # 3. выбор конкретного товара;
+    # 4. рейтинг;
+    # 5. обычный текстовый поиск.
     dispatcher.include_router(
         start_router
+    )
+
+    dispatcher.include_router(
+        intent_callback_router
     )
 
     dispatcher.include_router(
