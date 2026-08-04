@@ -11,6 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models.brand import Brand
 from app.database.models.category import Category
 from app.database.models.product import Product
+from app.database.repositories.product_family_repository import (
+    assign_product_family,
+)
 from app.database.session import async_session_maker
 from app.importers.open_food_facts_client import (
     OpenFoodFactsClient,
@@ -161,10 +164,12 @@ def category_from_tag(
         "-",
         " ",
     )
+
     cleaned = cleaned.replace(
         "_",
         " ",
     )
+
     cleaned = re.sub(
         r"\s+",
         " ",
@@ -270,6 +275,7 @@ def parse_quantity_text(
         return None, None
 
     normalized = quantity.strip().lower()
+
     normalized = normalized.replace(
         ",",
         ".",
@@ -339,12 +345,14 @@ def parse_package(
             value = Decimal(
                 str(raw_value)
             )
+
             unit = normalize_package_unit(
                 raw_unit
             )
 
             if value > 0 and unit:
                 return value, unit
+
         except InvalidOperation:
             pass
 
@@ -597,6 +605,9 @@ async def save_product(
     """
     Создаёт новый товар или обновляет существующий
     по уникальному штрихкоду.
+
+    После создания или обновления автоматически
+    определяет семейство товара.
     """
 
     brand = await get_or_create_brand(
@@ -638,6 +649,14 @@ async def save_product(
         )
 
         session.add(product)
+
+        await assign_product_family(
+            session=session,
+            product=product,
+            brand_name=brand.name,
+            category=category,
+        )
+
         statistics.created += 1
         return
 
@@ -666,6 +685,13 @@ async def save_product(
     product.keywords = prepared.keywords
     product.search_text = prepared.search_text
     product.is_active = True
+
+    await assign_product_family(
+        session=session,
+        product=product,
+        brand_name=brand.name,
+        category=category,
+    )
 
     statistics.updated += 1
 
@@ -710,6 +736,7 @@ async def import_open_food_facts_products(
                         prepared=prepared,
                         statistics=statistics,
                     )
+
             except Exception:
                 statistics.errors += 1
 
