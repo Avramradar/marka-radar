@@ -14,6 +14,7 @@ from app.database.models.product import Product
 from app.database.session import async_session_maker
 from app.importers.open_food_facts_client import OpenFoodFactsClient
 from app.utils.text import normalize_text
+from app.search.index_builder import build_search_index
 
 
 logger = logging.getLogger(__name__)
