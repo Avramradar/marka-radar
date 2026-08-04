@@ -13,20 +13,20 @@ from app.database.models.brand import Brand
 from app.database.models.category import Category
 from app.database.models.product import Product
 from app.database.models.product_alias import ProductAlias
-from app.utils.text import normalize_text
+from app.utils.text import (
+    build_search_variants,
+    normalize_text,
+)
 
 
 SearchResult = tuple[Product, Brand, Category]
 
 
-def build_alias_ilike_condition(
-    pattern: str,
-):
+def build_alias_ilike_condition(pattern: str):
     """
     Проверяет наличие синонима, содержащего искомый текст.
 
-    Используется EXISTS, поэтому JOIN с product_aliases
-    не создаёт дубликаты товаров.
+    EXISTS не создаёт повторяющиеся строки товаров.
     """
 
     return exists(
@@ -40,7 +40,7 @@ def build_alias_ilike_condition(
 def build_alias_exact_condition(
     normalized_query: str,
 ):
-    """Проверяет точное совпадение с синонимом."""
+    """Проверяет точное совпадение с синонимом товара."""
 
     return exists(
         select(ProductAlias.id).where(
@@ -55,10 +55,9 @@ def build_alias_trigram_condition(
     normalized_query: str,
 ):
     """
-    Проверяет похожий синоним через оператор pg_trgm `%`.
+    Проверяет похожий синоним через pg_trgm.
 
-    Оператор `%` использует порог похожести PostgreSQL
-    и может работать через созданный GIN-индекс.
+    Оператор % использует порог похожести PostgreSQL.
     """
 
     return exists(
@@ -75,9 +74,8 @@ def build_alias_similarity_score(
     normalized_query: str,
 ):
     """
-    Возвращает максимальную похожесть среди синонимов товара.
-
-    Если синонимов нет, возвращается 0.
+    Возвращает максимальную степень похожести
+    среди синонимов конкретного товара.
     """
 
     return (
@@ -100,15 +98,18 @@ def build_alias_similarity_score(
     )
 
 
-def build_token_condition(
-    token: str,
-):
+def build_token_condition(token: str):
     """
-    Строгий поиск одного слова.
+    Строит условие поиска для одного слова.
 
-    Каждое слово запроса должно встретиться хотя бы
-    в одном из полей товара, бренда, категории
-    или синонимов.
+    Слово может находиться:
+    - в названии товара;
+    - в бренде;
+    - в альтернативных названиях бренда;
+    - в категории;
+    - в ключевых словах;
+    - в подтипе;
+    - в синонимах товара.
     """
 
     pattern = f"%{token}%"
@@ -130,10 +131,8 @@ def deduplicate_results(
     limit: int,
 ) -> list[SearchResult]:
     """
-    Удаляет повторяющиеся товары, сохраняя порядок.
-
-    Повторения теоретически могут появиться при дальнейшем
-    развитии запроса или нестандартных данных.
+    Удаляет повторяющиеся товары,
+    сохраняя исходный порядок результатов.
     """
 
     unique_rows: list[SearchResult] = []
@@ -188,17 +187,18 @@ async def search_by_barcode(
     return list(result.all())
 
 
-async def search_strict(
+async def search_strict_variant(
     session: AsyncSession,
     normalized_query: str,
     *,
     limit: int,
+    excluded_product_ids: set[int] | None = None,
 ) -> list[SearchResult]:
     """
-    Основной точный поиск.
+    Выполняет строгий поиск одного варианта запроса.
 
-    Сначала ищет все слова запроса через ILIKE.
-    Этот этап даёт наиболее предсказуемые результаты.
+    Например, для пользовательского запроса «Барилла»
+    эта функция отдельно может получить вариант «barilla».
     """
 
     tokens = [
@@ -209,6 +209,12 @@ async def search_strict(
 
     if not tokens:
         return []
+
+    excluded_product_ids = (
+        excluded_product_ids
+        if excluded_product_ids is not None
+        else set()
+    )
 
     token_conditions = [
         build_token_condition(token)
@@ -241,36 +247,37 @@ async def search_strict(
             2,
         ),
         (
-            Product.barcode
-            == normalized_query,
-            3,
-        ),
-        (
             Product.normalized_name.startswith(
                 normalized_query
             ),
-            4,
+            3,
         ),
         (
             Brand.normalized_name.startswith(
                 normalized_query
             ),
-            5,
+            4,
         ),
         (
             Product.normalized_name.ilike(
                 full_pattern
             ),
-            6,
+            5,
         ),
         (
             Brand.normalized_name.ilike(
                 full_pattern
             ),
-            7,
+            6,
         ),
         (
             full_alias_match,
+            7,
+        ),
+        (
+            Brand.aliases.ilike(
+                full_pattern
+            ),
             8,
         ),
         (
@@ -279,8 +286,26 @@ async def search_strict(
             ),
             9,
         ),
-        else_=10,
+        (
+            Category.normalized_name.ilike(
+                full_pattern
+            ),
+            10,
+        ),
+        else_=11,
     )
+
+    conditions = [
+        Product.is_active.is_(True),
+        and_(*token_conditions),
+    ]
+
+    if excluded_product_ids:
+        conditions.append(
+            Product.id.notin_(
+                excluded_product_ids
+            )
+        )
 
     statement = (
         select(
@@ -297,8 +322,7 @@ async def search_strict(
             Product.category_id == Category.id,
         )
         .where(
-            Product.is_active.is_(True),
-            and_(*token_conditions),
+            *conditions,
         )
         .order_by(
             relevance_order.asc(),
@@ -314,7 +338,7 @@ async def search_strict(
     return list(result.all())
 
 
-async def search_fuzzy(
+async def search_fuzzy_variant(
     session: AsyncSession,
     normalized_query: str,
     *,
@@ -322,12 +346,13 @@ async def search_fuzzy(
     excluded_product_ids: set[int] | None = None,
 ) -> list[SearchResult]:
     """
-    Поиск с опечатками через pg_trgm.
+    Выполняет поиск с опечатками через pg_trgm.
 
     Примеры:
-    - скумбря -> скумбрия
-    - доброфлотт -> Доброфлот
-    - простаквашино -> Простоквашино
+    - барила -> Barilla;
+    - скумбря -> скумбрия;
+    - доброфлотт -> Доброфлот;
+    - простаквашино -> Простоквашино.
     """
 
     if len(normalized_query) < 3:
@@ -416,17 +441,17 @@ async def search_fuzzy(
         normalized_query,
     )
 
-    # У названия товара и комбинации
-    # "бренд + товар" самый высокий приоритет.
+    # Название и бренд имеют больший вес,
+    # чем категория и вспомогательные поля.
     fuzzy_score = func.greatest(
-        product_similarity * 1.30,
-        combined_similarity * 1.25,
-        brand_similarity * 1.15,
-        alias_similarity * 1.15,
-        brand_alias_similarity,
-        category_similarity * 0.75,
+        product_similarity * 1.35,
+        combined_similarity * 1.30,
+        brand_similarity * 1.25,
+        alias_similarity * 1.20,
+        brand_alias_similarity * 1.15,
+        category_similarity * 0.70,
         keywords_similarity * 0.65,
-        subtype_similarity * 0.65,
+        subtype_similarity * 0.60,
     )
 
     trigram_condition = or_(
@@ -505,17 +530,26 @@ async def search_products(
     limit: int = 20,
 ) -> list[SearchResult]:
     """
-    Ищет товары по штрихкоду, названию, бренду,
-    категории, ключевым словам и синонимам.
+    Ищет товары по:
+    - штрихкоду;
+    - названию;
+    - бренду;
+    - категории;
+    - ключевым словам;
+    - синонимам;
+    - русской транскрипции;
+    - латинскому написанию;
+    - опечаткам.
 
-    Последовательность:
+    Последовательность поиска:
     1. точный штрихкод;
-    2. строгий поиск всех слов;
-    3. поиск с опечатками через pg_trgm.
+    2. строгий поиск исходного написания;
+    3. строгий поиск транслитерированных вариантов;
+    4. поиск с опечатками по всем вариантам.
     """
 
-    normalized_query = normalize_text(query)
     raw_query = query.strip()
+    normalized_query = normalize_text(query)
 
     if not normalized_query:
         return []
@@ -525,7 +559,7 @@ async def search_products(
 
     safe_limit = min(limit, 100)
 
-    # Штрихкод должен иметь абсолютный приоритет.
+    # Штрихкод всегда имеет абсолютный приоритет.
     if raw_query.isdigit():
         barcode_products = await search_by_barcode(
             session=session,
@@ -536,40 +570,80 @@ async def search_products(
         if barcode_products:
             return barcode_products
 
-    strict_products = await search_strict(
-        session=session,
-        normalized_query=normalized_query,
-        limit=safe_limit,
-    )
+    search_variants = build_search_variants(query)
 
-    if len(strict_products) >= safe_limit:
+    if not search_variants:
+        return []
+
+    collected_results: list[SearchResult] = []
+    found_product_ids: set[int] = set()
+
+    # Сначала строгий поиск.
+    # Исходный вариант идёт первым,
+    # транслитерация — после него.
+    for search_variant in search_variants:
+        remaining_limit = (
+            safe_limit - len(collected_results)
+        )
+
+        if remaining_limit <= 0:
+            break
+
+        strict_results = await search_strict_variant(
+            session=session,
+            normalized_query=search_variant,
+            limit=remaining_limit,
+            excluded_product_ids=found_product_ids,
+        )
+
+        for row in strict_results:
+            product = row[0]
+
+            if product.id in found_product_ids:
+                continue
+
+            found_product_ids.add(product.id)
+            collected_results.append(row)
+
+            if len(collected_results) >= safe_limit:
+                break
+
+    if len(collected_results) >= safe_limit:
         return deduplicate_results(
-            strict_products,
+            collected_results,
             limit=safe_limit,
         )
 
-    found_product_ids = {
-        row[0].id
-        for row in strict_products
-    }
+    # Если строгих совпадений недостаточно,
+    # подключаем поиск с опечатками.
+    for search_variant in search_variants:
+        remaining_limit = (
+            safe_limit - len(collected_results)
+        )
 
-    remaining_limit = (
-        safe_limit - len(strict_products)
-    )
+        if remaining_limit <= 0:
+            break
 
-    fuzzy_products = await search_fuzzy(
-        session=session,
-        normalized_query=normalized_query,
-        limit=remaining_limit,
-        excluded_product_ids=found_product_ids,
-    )
+        fuzzy_results = await search_fuzzy_variant(
+            session=session,
+            normalized_query=search_variant,
+            limit=remaining_limit,
+            excluded_product_ids=found_product_ids,
+        )
 
-    combined_results = (
-        strict_products
-        + fuzzy_products
-    )
+        for row in fuzzy_results:
+            product = row[0]
+
+            if product.id in found_product_ids:
+                continue
+
+            found_product_ids.add(product.id)
+            collected_results.append(row)
+
+            if len(collected_results) >= safe_limit:
+                break
 
     return deduplicate_results(
-        combined_results,
+        collected_results,
         limit=safe_limit,
     )
