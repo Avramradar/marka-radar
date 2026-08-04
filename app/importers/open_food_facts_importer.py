@@ -12,9 +12,11 @@ from app.database.models.brand import Brand
 from app.database.models.category import Category
 from app.database.models.product import Product
 from app.database.session import async_session_maker
-from app.importers.open_food_facts_client import OpenFoodFactsClient
-from app.utils.text import normalize_text
+from app.importers.open_food_facts_client import (
+    OpenFoodFactsClient,
+)
 from app.search.index_builder import build_search_index
+from app.utils.text import normalize_text
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ class PreparedProduct:
     package_unit: str | None
     image_url: str | None
     keywords: str | None
+    search_text: str
 
 
 def clean_text(
@@ -52,6 +55,13 @@ def clean_text(
     *,
     max_length: int | None = None,
 ) -> str | None:
+    """
+    Очищает внешнее текстовое значение.
+
+    Удаляет лишние пробелы и при необходимости
+    ограничивает максимальную длину строки.
+    """
+
     if value is None:
         return None
 
@@ -60,7 +70,11 @@ def clean_text(
     if not text:
         return None
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
 
     if max_length is not None:
         text = text[:max_length].strip()
@@ -71,6 +85,15 @@ def clean_text(
 def choose_product_name(
     raw_product: dict[str, Any],
 ) -> str | None:
+    """
+    Выбирает наиболее подходящее название товара.
+
+    Приоритет:
+    1. русское название;
+    2. основное название;
+    3. общее название.
+    """
+
     candidates = (
         raw_product.get("product_name_ru"),
         raw_product.get("product_name"),
@@ -92,6 +115,13 @@ def choose_product_name(
 def choose_brand_name(
     raw_product: dict[str, Any],
 ) -> str:
+    """
+    Выбирает основной бренд товара.
+
+    Open Food Facts может передавать несколько брендов
+    через запятую. В основное поле сохраняется первый.
+    """
+
     brands = clean_text(
         raw_product.get("brands"),
         max_length=500,
@@ -100,30 +130,46 @@ def choose_brand_name(
     if not brands:
         return DEFAULT_BRAND_NAME
 
-    # Open Food Facts иногда присылает несколько брендов
-    # одной строкой через запятую. Для основной карточки
-    # используем первый бренд.
     first_brand = brands.split(",")[0].strip()
 
-    return (
-        first_brand[:128]
-        if first_brand
-        else DEFAULT_BRAND_NAME
-    )
+    if not first_brand:
+        return DEFAULT_BRAND_NAME
+
+    return first_brand[:128]
 
 
-def category_from_tag(tag: str) -> str | None:
+def category_from_tag(
+    tag: str,
+) -> str | None:
+    """
+    Преобразует технический тег категории
+    Open Food Facts в читаемое название.
+    """
+
     cleaned = tag.strip()
 
     if not cleaned:
         return None
 
     if ":" in cleaned:
-        _, cleaned = cleaned.split(":", 1)
+        _, cleaned = cleaned.split(
+            ":",
+            1,
+        )
 
-    cleaned = cleaned.replace("-", " ")
-    cleaned = cleaned.replace("_", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.replace(
+        "-",
+        " ",
+    )
+    cleaned = cleaned.replace(
+        "_",
+        " ",
+    )
+    cleaned = re.sub(
+        r"\s+",
+        " ",
+        cleaned,
+    ).strip()
 
     if not cleaned:
         return None
@@ -134,14 +180,22 @@ def category_from_tag(tag: str) -> str | None:
 def choose_category_name(
     raw_product: dict[str, Any],
 ) -> str:
-    category_tags = raw_product.get("categories_tags")
+    """
+    Выбирает наиболее конкретную категорию товара.
+    """
+
+    category_tags = raw_product.get(
+        "categories_tags"
+    )
 
     if isinstance(category_tags, list):
         for tag in reversed(category_tags):
             if not isinstance(tag, str):
                 continue
 
-            category_name = category_from_tag(tag)
+            category_name = category_from_tag(
+                tag
+            )
 
             if category_name:
                 return category_name
@@ -163,6 +217,10 @@ def choose_category_name(
 def normalize_package_unit(
     unit: str | None,
 ) -> str | None:
+    """
+    Приводит единицы измерения к единому формату.
+    """
+
     if not unit:
         return None
 
@@ -172,27 +230,50 @@ def normalize_package_unit(
         "g": "г",
         "gram": "г",
         "grams": "г",
+        "гр": "г",
         "kg": "кг",
         "kilogram": "кг",
         "kilograms": "кг",
+        "кг": "кг",
         "ml": "мл",
+        "мл": "мл",
         "cl": "мл",
         "l": "л",
         "litre": "л",
         "liter": "л",
+        "литр": "л",
+        "литра": "л",
+        "литров": "л",
+        "л": "л",
     }
 
-    return unit_map.get(normalized, normalized[:20])
+    return unit_map.get(
+        normalized,
+        normalized[:20],
+    )
 
 
 def parse_quantity_text(
     quantity: str | None,
 ) -> tuple[Decimal | None, str | None]:
+    """
+    Извлекает значение и единицу измерения
+    из текстового поля quantity.
+
+    Примеры:
+    500 g
+    1.5 l
+    250 мл
+    """
+
     if not quantity:
         return None, None
 
     normalized = quantity.strip().lower()
-    normalized = normalized.replace(",", ".")
+    normalized = normalized.replace(
+        ",",
+        ".",
+    )
 
     match = re.search(
         r"(\d+(?:\.\d+)?)\s*"
@@ -225,7 +306,7 @@ def parse_quantity_text(
 
     unit = unit_map.get(raw_unit)
 
-    # Сантилитры преобразуем в миллилитры.
+    # Один сантилитр равен десяти миллилитрам.
     if raw_unit == "cl":
         value *= Decimal("10")
 
@@ -235,16 +316,32 @@ def parse_quantity_text(
 def parse_package(
     raw_product: dict[str, Any],
 ) -> tuple[Decimal | None, str | None]:
-    raw_value = raw_product.get("product_quantity")
+    """
+    Извлекает размер упаковки товара.
+
+    Сначала используются структурированные поля.
+    При их отсутствии разбирается строка quantity.
+    """
+
+    raw_value = raw_product.get(
+        "product_quantity"
+    )
+
     raw_unit = clean_text(
-        raw_product.get("product_quantity_unit"),
+        raw_product.get(
+            "product_quantity_unit"
+        ),
         max_length=20,
     )
 
     if raw_value is not None:
         try:
-            value = Decimal(str(raw_value))
-            unit = normalize_package_unit(raw_unit)
+            value = Decimal(
+                str(raw_value)
+            )
+            unit = normalize_package_unit(
+                raw_unit
+            )
 
             if value > 0 and unit:
                 return value, unit
@@ -256,16 +353,24 @@ def parse_package(
         max_length=100,
     )
 
-    return parse_quantity_text(quantity)
+    return parse_quantity_text(
+        quantity
+    )
 
 
 def choose_image_url(
     raw_product: dict[str, Any],
 ) -> str | None:
+    """
+    Выбирает доступное изображение товара.
+    """
+
     candidates = (
         raw_product.get("image_front_url"),
         raw_product.get("image_url"),
-        raw_product.get("image_front_small_url"),
+        raw_product.get(
+            "image_front_small_url"
+        ),
     )
 
     for candidate in candidates:
@@ -274,8 +379,14 @@ def choose_image_url(
             max_length=2000,
         )
 
-        if image_url and image_url.startswith(
-            ("https://", "http://")
+        if (
+            image_url
+            and image_url.startswith(
+                (
+                    "https://",
+                    "http://",
+                )
+            )
         ):
             return image_url
 
@@ -289,6 +400,10 @@ def build_keywords(
     brand_name: str,
     category_name: str,
 ) -> str:
+    """
+    Формирует базовую строку ключевых слов товара.
+    """
+
     values: list[str] = [
         name,
         brand_name,
@@ -325,12 +440,19 @@ def build_keywords(
         )
     )
 
-    return " ".join(unique_values)[:3000]
+    return " ".join(
+        unique_values
+    )[:3000]
 
 
 def prepare_product(
     raw_product: dict[str, Any],
 ) -> PreparedProduct | None:
+    """
+    Проверяет и преобразует товар Open Food Facts
+    в структуру, готовую для записи в базу.
+    """
+
     barcode = clean_text(
         raw_product.get("code"),
         max_length=32,
@@ -339,25 +461,41 @@ def prepare_product(
     if not barcode or not barcode.isdigit():
         return None
 
-    name = choose_product_name(raw_product)
+    name = choose_product_name(
+        raw_product
+    )
 
     if not name:
         return None
 
-    brand_name = choose_brand_name(raw_product)
-    category_name = choose_category_name(raw_product)
+    brand_name = choose_brand_name(
+        raw_product
+    )
+
+    category_name = choose_category_name(
+        raw_product
+    )
 
     package_value, package_unit = parse_package(
         raw_product
     )
 
-    image_url = choose_image_url(raw_product)
+    image_url = choose_image_url(
+        raw_product
+    )
 
     keywords = build_keywords(
         raw_product,
         name=name,
         brand_name=brand_name,
         category_name=category_name,
+    )
+
+    search_text = build_search_index(
+        name=name,
+        brand=brand_name,
+        category=category_name,
+        keywords=keywords,
     )
 
     return PreparedProduct(
@@ -369,6 +507,7 @@ def prepare_product(
         package_unit=package_unit,
         image_url=image_url,
         keywords=keywords,
+        search_text=search_text,
     )
 
 
@@ -377,11 +516,19 @@ async def get_or_create_brand(
     name: str,
     statistics: ImportStatistics,
 ) -> Brand:
-    normalized_name = normalize_text(name)
+    """
+    Возвращает существующий бренд
+    или создаёт новый.
+    """
+
+    normalized_name = normalize_text(
+        name
+    )
 
     result = await session.execute(
         select(Brand).where(
-            Brand.normalized_name == normalized_name
+            Brand.normalized_name
+            == normalized_name
         )
     )
 
@@ -408,11 +555,19 @@ async def get_or_create_category(
     name: str,
     statistics: ImportStatistics,
 ) -> Category:
-    normalized_name = normalize_text(name)
+    """
+    Возвращает существующую категорию
+    или создаёт новую.
+    """
+
+    normalized_name = normalize_text(
+        name
+    )
 
     result = await session.execute(
         select(Category).where(
-            Category.normalized_name == normalized_name
+            Category.normalized_name
+            == normalized_name
         )
     )
 
@@ -439,6 +594,11 @@ async def save_product(
     prepared: PreparedProduct,
     statistics: ImportStatistics,
 ) -> None:
+    """
+    Создаёт новый товар или обновляет существующий
+    по уникальному штрихкоду.
+    """
+
     brand = await get_or_create_brand(
         session=session,
         name=prepared.brand_name,
@@ -453,7 +613,8 @@ async def save_product(
 
     result = await session.execute(
         select(Product).where(
-            Product.barcode == prepared.barcode
+            Product.barcode
+            == prepared.barcode
         )
     )
 
@@ -472,6 +633,7 @@ async def save_product(
             package_unit=prepared.package_unit,
             image_url=prepared.image_url,
             keywords=prepared.keywords,
+            search_text=prepared.search_text,
             is_active=True,
         )
 
@@ -480,18 +642,29 @@ async def save_product(
         return
 
     product.name = prepared.name
+
     product.normalized_name = normalize_text(
         prepared.name
     )
+
     product.brand_id = brand.id
     product.category_id = category.id
-    product.package_value = prepared.package_value
-    product.package_unit = prepared.package_unit
+
+    product.package_value = (
+        prepared.package_value
+    )
+
+    product.package_unit = (
+        prepared.package_unit
+    )
+
     product.image_url = (
         prepared.image_url
         or product.image_url
     )
+
     product.keywords = prepared.keywords
+    product.search_text = prepared.search_text
     product.is_active = True
 
     statistics.updated += 1
@@ -503,6 +676,11 @@ async def import_open_food_facts_products(
     page_size: int = 100,
     country: str = "russia",
 ) -> ImportStatistics:
+    """
+    Загружает страницу товаров Open Food Facts
+    и сохраняет её в базу данных.
+    """
+
     client = OpenFoodFactsClient()
 
     raw_products = await client.search_products(
@@ -517,7 +695,9 @@ async def import_open_food_facts_products(
 
     async with async_session_maker() as session:
         for raw_product in raw_products:
-            prepared = prepare_product(raw_product)
+            prepared = prepare_product(
+                raw_product
+            )
 
             if prepared is None:
                 statistics.skipped += 1
