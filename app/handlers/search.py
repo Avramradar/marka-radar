@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 SEARCH_LOADER_PATH = (
     Path(__file__).resolve().parent.parent
     / "assets"
-    / "markaradar_runner_shops.gif"
+    / "markaradar_dino_shop_runner.gif"
 )
 
 
