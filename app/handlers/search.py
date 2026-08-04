@@ -7,18 +7,28 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
-from app.database.repositories.product_repository import search_products
+from app.database.repositories.product_repository import (
+    search_products,
+)
 from app.database.session import async_session_maker
 from app.keyboards.rating import get_rating_keyboard
+from app.keyboards.search import (
+    get_search_suggestions_keyboard,
+)
+from app.search.suggestions import get_search_suggestions
 from app.services.price_service import get_price_statistics
-from app.services.rating_service import get_full_product_rating
+from app.services.rating_service import (
+    get_full_product_rating,
+)
 
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
-def format_number(value: Decimal | float | int | None) -> str:
+def format_number(
+    value: Decimal | float | int | None,
+) -> str:
     """
     Убирает лишние нули у веса и объёма.
 
@@ -36,7 +46,10 @@ def format_number(value: Decimal | float | int | None) -> str:
     if decimal_value == decimal_value.to_integral():
         return str(int(decimal_value))
 
-    return format(decimal_value.normalize(), "f")
+    return format(
+        decimal_value.normalize(),
+        "f",
+    )
 
 
 def format_package(
@@ -52,23 +65,33 @@ def format_package(
     )
 
 
-def format_subtype(subtype: str | None) -> str:
+def format_subtype(
+    subtype: str | None,
+) -> str:
     if not subtype:
         return "не указан"
 
-    subtype = subtype.strip()
+    cleaned_subtype = subtype.strip()
 
-    if not subtype:
+    if not cleaned_subtype:
         return "не указан"
 
-    return escape(subtype[0].upper() + subtype[1:])
+    return escape(
+        cleaned_subtype[0].upper()
+        + cleaned_subtype[1:]
+    )
 
 
 def format_rating_text(
     rating: dict[str, float | int],
 ) -> str:
-    votes_count = int(rating["votes_count"])
-    average_rating = float(rating["average_rating"])
+    votes_count = int(
+        rating["votes_count"]
+    )
+
+    average_rating = float(
+        rating["average_rating"]
+    )
 
     if votes_count == 0:
         return (
@@ -103,14 +126,29 @@ def format_price_text(
             "источников цен."
         )
 
-    median_price = float(price_stats["median"])
-    minimum = float(price_stats["minimum"])
-    maximum = float(price_stats["maximum"])
-    spread = float(price_stats["spread"])
+    median_price = float(
+        price_stats["median"]
+    )
+
+    minimum = float(
+        price_stats["minimum"]
+    )
+
+    maximum = float(
+        price_stats["maximum"]
+    )
+
+    spread = float(
+        price_stats["spread"]
+    )
+
     spread_percent = float(
         price_stats["spread_percent"]
     )
-    prices_count = int(price_stats["prices_count"])
+
+    prices_count = int(
+        price_stats["prices_count"]
+    )
 
     lines = [
         (
@@ -137,12 +175,15 @@ def format_price_text(
     if spread >= 500:
         lines.append(
             "⚠️ <b>Очень большая разница в цене.</b>\n"
-            "Перед покупкой обязательно сравните магазины."
+            "Перед покупкой обязательно "
+            "сравните магазины."
         )
+
     elif spread_percent >= 40:
         lines.append(
             "⚠️ <b>Заметный разброс цен.</b>\n"
-            "Стоимость лучше проверить перед покупкой."
+            "Стоимость лучше проверить "
+            "перед покупкой."
         )
 
     return "\n".join(lines)
@@ -166,15 +207,29 @@ def build_product_card(
         product.package_unit,
     )
 
-    subtype_text = format_subtype(product.subtype)
+    subtype_text = format_subtype(
+        product.subtype
+    )
 
     product_lines = [
         title,
         "",
-        f"📂 <b>Категория:</b> {escape(category.name)}",
-        f"🏷 <b>Бренд:</b> {escape(brand.name)}",
-        f"🥫 <b>Тип:</b> {subtype_text}",
-        f"📦 <b>Упаковка:</b> {package_text}",
+        (
+            "📂 <b>Категория:</b> "
+            f"{escape(category.name)}"
+        ),
+        (
+            "🏷 <b>Бренд:</b> "
+            f"{escape(brand.name)}"
+        ),
+        (
+            "🥫 <b>Тип:</b> "
+            f"{subtype_text}"
+        ),
+        (
+            "📦 <b>Упаковка:</b> "
+            f"{package_text}"
+        ),
     ]
 
     if product.barcode:
@@ -214,7 +269,9 @@ async def send_product_card(
         price_stats=price_stats,
     )
 
-    keyboard = get_rating_keyboard(product.id)
+    keyboard = get_rating_keyboard(
+        product.id
+    )
 
     if product.image_url:
         try:
@@ -224,15 +281,19 @@ async def send_product_card(
                 reply_markup=keyboard,
             )
             return
+
         except TelegramBadRequest:
             logger.warning(
-                "Не удалось отправить изображение товара %s",
+                "Не удалось отправить "
+                "изображение товара %s",
                 product.id,
                 exc_info=True,
             )
+
         except Exception:
             logger.exception(
-                "Ошибка отправки изображения товара %s",
+                "Ошибка отправки "
+                "изображения товара %s",
                 product.id,
             )
 
@@ -242,8 +303,43 @@ async def send_product_card(
     )
 
 
+async def show_single_product(
+    *,
+    message: Message,
+    session,
+    product,
+    brand,
+    category,
+) -> None:
+    """
+    Загружает рейтинг и цены,
+    затем отправляет карточку одного товара.
+    """
+
+    rating = await get_full_product_rating(
+        session=session,
+        product_id=product.id,
+    )
+
+    price_stats = await get_price_statistics(
+        session=session,
+        product_id=product.id,
+    )
+
+    await send_product_card(
+        message=message,
+        product=product,
+        brand=brand,
+        category=category,
+        rating=rating,
+        price_stats=price_stats,
+    )
+
+
 @router.message(F.text)
-async def search_handler(message: Message) -> None:
+async def search_handler(
+    message: Message,
+) -> None:
     if message.text is None:
         return
 
@@ -255,10 +351,55 @@ async def search_handler(message: Message) -> None:
         )
         return
 
+    # Команды обрабатываются другими роутерами.
     if query.startswith("/"):
         return
 
     async with async_session_maker() as session:
+        # Для штрихкода сразу используем основной поиск.
+        if query.isdigit():
+            barcode_products = await search_products(
+                session=session,
+                query=query,
+                limit=1,
+            )
+
+            if barcode_products:
+                product, brand, category = (
+                    barcode_products[0]
+                )
+
+                await show_single_product(
+                    message=message,
+                    session=session,
+                    product=product,
+                    brand=brand,
+                    category=category,
+                )
+                return
+
+        # Сначала пробуем получить компактные подсказки.
+        suggestions = await get_search_suggestions(
+            session=session,
+            query=query,
+            limit=8,
+        )
+
+        if suggestions:
+            await message.answer(
+                "🔍 <b>Лучшие совпадения</b>\n\n"
+                f"Запрос: «{escape(query)}»\n"
+                "Выберите подходящий товар:",
+                reply_markup=(
+                    get_search_suggestions_keyboard(
+                        suggestions
+                    )
+                ),
+            )
+            return
+
+        # Если поисковый индекс пока не дал результата,
+        # используем основной расширенный поиск.
         products = await search_products(
             session=session,
             query=query,
@@ -267,7 +408,8 @@ async def search_handler(message: Message) -> None:
 
         if not products:
             await message.answer(
-                "🔍 По вашему запросу ничего не найдено.\n\n"
+                "🔍 По вашему запросу "
+                "ничего не найдено.\n\n"
                 "Попробуйте:\n"
                 "• написать название короче;\n"
                 "• указать бренд;\n"
@@ -276,27 +418,39 @@ async def search_handler(message: Message) -> None:
             )
             return
 
-        await message.answer(
-            f"🔍 По запросу «<b>{escape(query)}</b>» "
-            f"найдено вариантов: <b>{len(products)}</b>"
-        )
+        # Один точный результат открываем сразу.
+        if len(products) == 1:
+            product, brand, category = products[0]
 
-        for product, brand, category in products[:10]:
-            rating = await get_full_product_rating(
-                session=session,
-                product_id=product.id,
-            )
-
-            price_stats = await get_price_statistics(
-                session=session,
-                product_id=product.id,
-            )
-
-            await send_product_card(
+            await show_single_product(
                 message=message,
+                session=session,
                 product=product,
                 brand=brand,
                 category=category,
-                rating=rating,
-                price_stats=price_stats,
             )
+            return
+
+        # Создаём компактные кнопки из результатов
+        # резервного поиска.
+        fallback_suggestions = [
+            {
+                "product_id": product.id,
+                "name": product.name,
+                "brand": brand.name,
+                "score": 0.0,
+            }
+            for product, brand, _category
+            in products[:8]
+        ]
+
+        await message.answer(
+            "🔍 <b>Найдено несколько вариантов</b>\n\n"
+            f"Запрос: «{escape(query)}»\n"
+            "Нажмите на товар, чтобы открыть карточку:",
+            reply_markup=(
+                get_search_suggestions_keyboard(
+                    fallback_suggestions
+                )
+            ),
+        )
