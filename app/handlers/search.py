@@ -16,9 +16,17 @@ from app.database.repositories.product_repository import (
 from app.database.session import async_session_maker
 from app.keyboards.rating import get_rating_keyboard
 from app.keyboards.search import (
+    get_intent_groups_keyboard,
     get_search_suggestions_keyboard,
 )
-from app.search.suggestions import get_search_suggestions
+from app.search.engine import (
+    SearchMode,
+    run_search_engine,
+)
+from app.search.intent_state import (
+    clear_intent_groups,
+    save_intent_groups,
+)
 from app.services.price_service import get_price_statistics
 from app.services.rating_service import (
     get_full_product_rating,
@@ -268,8 +276,8 @@ async def send_search_loader(
     """
     Сразу показывает пользователю, что поиск начался.
 
-    Если GIF отсутствует, отправляет обычное
-    текстовое сообщение.
+    Если GIF отсутствует, отправляет
+    обычное текстовое сообщение.
     """
 
     with suppress(Exception):
@@ -414,6 +422,73 @@ async def show_single_product(
     )
 
 
+async def show_fallback_products(
+    *,
+    message: Message,
+    session,
+    query: str,
+) -> None:
+    """
+    Выполняет резервный расширенный поиск.
+
+    Используется, если Search Engine 2.0
+    не построил группы и не нашёл подсказки.
+    """
+
+    products = await search_products(
+        session=session,
+        query=query,
+        limit=20,
+    )
+
+    if not products:
+        await message.answer(
+            "🔍 По вашему запросу "
+            "ничего не найдено.\n\n"
+            "Попробуйте:\n"
+            "• написать название короче;\n"
+            "• указать бренд;\n"
+            "• проверить написание;\n"
+            "• отправить штрихкод."
+        )
+        return
+
+    if len(products) == 1:
+        product, brand, category = products[0]
+
+        await show_single_product(
+            message=message,
+            session=session,
+            product=product,
+            brand=brand,
+            category=category,
+        )
+        return
+
+    fallback_suggestions = [
+        {
+            "product_id": product.id,
+            "name": product.name,
+            "brand": brand.name,
+            "score": 0.0,
+        }
+        for product, brand, _category
+        in products[:8]
+    ]
+
+    await message.answer(
+        "🔍 <b>Найдено несколько вариантов</b>\n\n"
+        f"Запрос: «{escape(query)}»\n"
+        "Нажмите на товар, "
+        "чтобы открыть карточку:",
+        reply_markup=(
+            get_search_suggestions_keyboard(
+                fallback_suggestions
+            )
+        ),
+    )
+
+
 @router.message(F.text)
 async def search_handler(
     message: Message,
@@ -439,7 +514,8 @@ async def search_handler(
 
     try:
         async with async_session_maker() as session:
-            # Для штрихкода сразу используем основной поиск.
+            # Штрихкод обрабатывается сразу,
+            # без построения уточняющих групп.
             if query.isdigit():
                 barcode_products = await search_products(
                     session=session,
@@ -461,82 +537,84 @@ async def search_handler(
                     )
                     return
 
-            # Сначала получаем компактные подсказки.
-            suggestions = await get_search_suggestions(
+            engine_result = await run_search_engine(
                 session=session,
                 query=query,
-                limit=8,
+                intent_limit=8,
+                suggestion_limit=8,
             )
 
-            if suggestions:
+            if engine_result.mode == SearchMode.INTENTS:
+                user = message.from_user
+
+                if user is None:
+                    await show_fallback_products(
+                        message=message,
+                        session=session,
+                        query=query,
+                    )
+                    return
+
+                groups_as_dicts = [
+                    {
+                        "title": group["title"],
+                        "query": group["query"],
+                        "count": group["count"],
+                    }
+                    for group in engine_result.intent_groups
+                ]
+
+                save_intent_groups(
+                    chat_id=message.chat.id,
+                    user_id=user.id,
+                    groups=groups_as_dicts,
+                )
+
+                await message.answer(
+                    "🧭 <b>Что именно вы ищете?</b>\n\n"
+                    f"Запрос: «{escape(query)}»\n"
+                    "Выберите подходящий вариант:",
+                    reply_markup=(
+                        get_intent_groups_keyboard(
+                            groups_as_dicts
+                        )
+                    ),
+                )
+                return
+
+            if engine_result.mode == SearchMode.PRODUCTS:
+                user = message.from_user
+
+                if user is not None:
+                    clear_intent_groups(
+                        chat_id=message.chat.id,
+                        user_id=user.id,
+                    )
+
                 await message.answer(
                     "🔍 <b>Лучшие совпадения</b>\n\n"
                     f"Запрос: «{escape(query)}»\n"
                     "Выберите подходящий товар:",
                     reply_markup=(
                         get_search_suggestions_keyboard(
-                            suggestions
+                            engine_result.product_suggestions
                         )
                     ),
                 )
                 return
 
-            # Если индекс не дал результата,
-            # используем расширенный поиск.
-            products = await search_products(
+            user = message.from_user
+
+            if user is not None:
+                clear_intent_groups(
+                    chat_id=message.chat.id,
+                    user_id=user.id,
+                )
+
+            await show_fallback_products(
+                message=message,
                 session=session,
                 query=query,
-                limit=20,
-            )
-
-            if not products:
-                await message.answer(
-                    "🔍 По вашему запросу "
-                    "ничего не найдено.\n\n"
-                    "Попробуйте:\n"
-                    "• написать название короче;\n"
-                    "• указать бренд;\n"
-                    "• проверить написание;\n"
-                    "• отправить штрихкод."
-                )
-                return
-
-            # Единственный результат открываем сразу.
-            if len(products) == 1:
-                product, brand, category = products[0]
-
-                await show_single_product(
-                    message=message,
-                    session=session,
-                    product=product,
-                    brand=brand,
-                    category=category,
-                )
-                return
-
-            # Создаём кнопки из результатов
-            # резервного поиска.
-            fallback_suggestions = [
-                {
-                    "product_id": product.id,
-                    "name": product.name,
-                    "brand": brand.name,
-                    "score": 0.0,
-                }
-                for product, brand, _category
-                in products[:8]
-            ]
-
-            await message.answer(
-                "🔍 <b>Найдено несколько вариантов</b>\n\n"
-                f"Запрос: «{escape(query)}»\n"
-                "Нажмите на товар, "
-                "чтобы открыть карточку:",
-                reply_markup=(
-                    get_search_suggestions_keyboard(
-                        fallback_suggestions
-                    )
-                ),
             )
 
     except Exception:
