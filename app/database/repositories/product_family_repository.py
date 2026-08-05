@@ -38,8 +38,9 @@ async def get_or_create_product_family(
     family_name = build_product_family_name(
         product_name=product_name,
         brand_name=brand_name,
+        category_name=category.name,
         subtype=subtype,
-    )
+    ) 
 
     normalized_family_name = normalize_text(
         family_name
