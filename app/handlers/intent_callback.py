@@ -1,25 +1,34 @@
 import logging
+from dataclasses import replace
 from html import escape
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 
-from app.database.repositories.product_repository import (
-    search_products,
-)
 from app.database.session import async_session_maker
+from app.keyboards.decision_search import (
+    get_decision_search_keyboard,
+)
+from app.keyboards.product_family import (
+    get_product_families_keyboard,
+)
 from app.keyboards.search import (
-    PRODUCTS_PER_PAGE,
-    get_paginated_products_keyboard,
+    get_intent_groups_keyboard,
+)
+from app.search.decision_search import (
+    DecisionProduct,
+    DecisionSearchResult,
 )
 from app.search.intent_state import (
     clear_intent_groups,
     get_intent_group,
+    save_intent_groups,
 )
-from app.search.product_list_state import (
-    get_product_list,
-    save_product_list,
+from app.search.search_pipeline import (
+    SearchPipelineResult,
+    SearchPipelineScreen,
+    run_search_pipeline,
 )
 
 
@@ -27,150 +36,407 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 
-def build_products_page_text(
-    *,
-    title: str,
-    total_products: int,
-    page: int,
+def format_decision_product(
+    item: DecisionProduct,
 ) -> str:
     """
-    Формирует текст сообщения со списком товаров.
+    Форматирует товар для экрана выбора.
     """
 
-    total_pages = max(
-        1,
-        (
-            total_products
-            + PRODUCTS_PER_PAGE
-            - 1
+    if item.brand_name:
+        title = (
+            f"{escape(item.brand_name)} — "
+            f"{escape(item.name)}"
         )
-        // PRODUCTS_PER_PAGE,
-    )
-
-    safe_page = max(
-        0,
-        min(
-            page,
-            total_pages - 1,
-        ),
-    )
-
-    first_product_number = (
-        safe_page
-        * PRODUCTS_PER_PAGE
-        + 1
-    )
-
-    last_product_number = min(
-        (
-            safe_page + 1
+    else:
+        title = escape(
+            item.name
         )
-        * PRODUCTS_PER_PAGE,
-        total_products,
-    )
+
+    if item.votes_count > 0:
+        rating_text = (
+            f"⭐ {item.average_rating:.1f} из 10"
+            f" · 👥 {item.votes_count}"
+        )
+    else:
+        rating_text = (
+            "⭐ Оценок пока нет"
+        )
 
     return (
-        "🔍 <b>Подходящие товары</b>\n\n"
-        f"Уточнение: «{escape(title)}»\n"
-        f"Найдено вариантов: "
-        f"<b>{total_products}</b>\n"
-        f"Показаны товары: "
-        f"<b>{first_product_number}–"
-        f"{last_product_number}</b>\n"
-        f"Страница: "
-        f"<b>{safe_page + 1} из "
-        f"{total_pages}</b>\n\n"
-        "Выберите товар:"
+        f"<b>{title}</b>\n"
+        f"{rating_text}\n"
+        f"🛡 {escape(item.trust_result.trust_title)}"
     )
 
 
-async def show_products_page(
+def prepare_decision_result(
+    result: DecisionSearchResult,
+) -> DecisionSearchResult:
+    """
+    Подготавливает компактную выдачу.
+
+    Пока callback-пагинация Decision Search
+    не подключена, остальные товары не передаются
+    в клавиатуру, чтобы не создавать неработающую
+    кнопку «Показать ещё».
+    """
+
+    alternatives = list(
+        result.alternatives
+    )
+
+    if (
+        result.best_choice is None
+        and not alternatives
+        and result.other_products
+    ):
+        alternatives = list(
+            result.other_products[:3]
+        )
+
+    return replace(
+        result,
+        alternatives=alternatives,
+        other_products=[],
+    )
+
+
+def build_decision_text(
+    *,
+    query: str,
+    result: DecisionSearchResult,
+    explanation: str | None,
+) -> str:
+    """
+    Формирует экран решения после выбора фасета.
+    """
+
+    lines = [
+        "🎯 <b>Результат MarkaRadar</b>",
+        "",
+        f"Уточнение: «{escape(query)}»",
+        "",
+    ]
+
+    if result.best_choice is not None:
+        lines.extend(
+            [
+                "🏆 <b>Лучший подтверждённый выбор</b>",
+                "",
+                format_decision_product(
+                    result.best_choice
+                ),
+                "",
+            ]
+        )
+
+        reasons = (
+            result.best_choice
+            .trust_result
+            .explanation
+        )
+
+        if reasons:
+            lines.extend(
+                [
+                    (
+                        "Почему рекомендуем: "
+                        f"{escape(reasons[0])}"
+                    ),
+                    "",
+                ]
+            )
+
+    else:
+        lines.extend(
+            [
+                "⚪ <b>Уверенного лидера пока нет</b>",
+                "",
+                (
+                    "Подходящие товары найдены, "
+                    "но оценок пока недостаточно, "
+                    "чтобы уверенно назвать лучший."
+                ),
+                "",
+            ]
+        )
+
+    if result.alternatives:
+        lines.extend(
+            [
+                "👍 <b>Подходящие варианты</b>",
+                (
+                    "Выберите товар, чтобы увидеть "
+                    "его рейтинг и уровень доверия."
+                ),
+                "",
+            ]
+        )
+
+    if result.insufficient_data:
+        lines.extend(
+            [
+                "⚪ <b>Мало данных</b>",
+                (
+                    "У этих товаров пока слишком "
+                    "мало оценок для устойчивого вывода."
+                ),
+                "",
+            ]
+        )
+
+    if explanation:
+        lines.append(
+            f"ℹ️ {escape(explanation)}"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+async def edit_or_send(
     *,
     callback: CallbackQuery,
-    page: int,
+    text: str,
+    reply_markup=None,
 ) -> None:
     """
-    Показывает выбранную страницу сохранённого
-    списка товаров.
+    Пытается заменить текущее сообщение.
+
+    Если Telegram не разрешает редактирование,
+    отправляет новое сообщение.
     """
 
     if callback.message is None:
-        await callback.answer()
         return
-
-    state = get_product_list(
-        chat_id=callback.message.chat.id,
-        user_id=callback.from_user.id,
-    )
-
-    if state is None:
-        await callback.answer(
-            (
-                "Список товаров устарел. "
-                "Повторите поиск."
-            ),
-            show_alert=True,
-        )
-        return
-
-    total_products = len(
-        state.products
-    )
-
-    if total_products == 0:
-        await callback.answer(
-            "Список товаров пуст",
-            show_alert=True,
-        )
-        return
-
-    total_pages = max(
-        1,
-        (
-            total_products
-            + PRODUCTS_PER_PAGE
-            - 1
-        )
-        // PRODUCTS_PER_PAGE,
-    )
-
-    safe_page = max(
-        0,
-        min(
-            page,
-            total_pages - 1,
-        ),
-    )
-
-    text = build_products_page_text(
-        title=state.title,
-        total_products=total_products,
-        page=safe_page,
-    )
-
-    keyboard = get_paginated_products_keyboard(
-        products=state.products,
-        page=safe_page,
-    )
 
     try:
         await callback.message.edit_text(
             text,
-            reply_markup=keyboard,
+            reply_markup=reply_markup,
         )
 
     except TelegramBadRequest as error:
-        error_text = str(error).lower()
+        error_text = str(
+            error
+        ).lower()
 
-        # Telegram возвращает эту ошибку,
-        # если пользователь нажал на уже открытую страницу.
-        if "message is not modified" not in error_text:
-            logger.warning(
-                "Не удалось обновить страницу товаров",
-                exc_info=True,
+        if "message is not modified" in error_text:
+            return
+
+        logger.warning(
+            "Не удалось изменить сообщение "
+            "после выбора уточнения",
+            exc_info=True,
+        )
+
+        await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+        )
+
+
+async def show_pipeline_decision(
+    *,
+    callback: CallbackQuery,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Показывает результат Decision Search.
+    """
+
+    decision = pipeline_result.decision
+
+    if (
+        decision is None
+        or not decision.has_results
+    ):
+        await edit_or_send(
+            callback=callback,
+            text=(
+                "🔍 <b>Подходящих товаров "
+                "не найдено</b>\n\n"
+                f"Запрос: «"
+                f"{escape(pipeline_result.normalized_query)}"
+                f"»\n\n"
+                "Попробуйте выбрать другое уточнение."
+            ),
+        )
+        return
+
+    prepared_result = prepare_decision_result(
+        decision
+    )
+
+    has_buttons = bool(
+        prepared_result.best_choice
+        or prepared_result.alternatives
+        or prepared_result.insufficient_data
+    )
+
+    keyboard = (
+        get_decision_search_keyboard(
+            prepared_result
+        )
+        if has_buttons
+        else None
+    )
+
+    text = build_decision_text(
+        query=pipeline_result.normalized_query,
+        result=prepared_result,
+        explanation=pipeline_result.explanation,
+    )
+
+    await edit_or_send(
+        callback=callback,
+        text=text,
+        reply_markup=keyboard,
+    )
+
+
+async def show_pipeline_intents(
+    *,
+    callback: CallbackQuery,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Показывает следующий уровень фасетов.
+
+    Это возможно, если после первого уточнения
+    запрос всё ещё остаётся широким.
+    """
+
+    if callback.message is None:
+        return
+
+    groups = pipeline_result.intent_groups
+
+    if not groups:
+        await show_pipeline_decision(
+            callback=callback,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    save_intent_groups(
+        chat_id=callback.message.chat.id,
+        user_id=callback.from_user.id,
+        groups=groups,
+    )
+
+    await edit_or_send(
+        callback=callback,
+        text=(
+            "🧭 <b>Уточните выбор</b>\n\n"
+            f"Запрос: «"
+            f"{escape(pipeline_result.normalized_query)}"
+            f"»\n\n"
+            "Можно выбрать ещё одну характеристику. "
+            "После этого MarkaRadar сравнит товары "
+            "по оценкам и уровню доверия:"
+        ),
+        reply_markup=(
+            get_intent_groups_keyboard(
+                groups
             )
+        ),
+    )
 
-    await callback.answer()
+
+async def show_pipeline_families(
+    *,
+    callback: CallbackQuery,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Показывает резервные семейства товаров.
+    """
+
+    families = pipeline_result.families
+
+    if not families:
+        await show_pipeline_decision(
+            callback=callback,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    await edit_or_send(
+        callback=callback,
+        text=(
+            "🧭 <b>Уточните вид продукта</b>\n\n"
+            f"Запрос: «"
+            f"{escape(pipeline_result.normalized_query)}"
+            f"»\n\n"
+            "Выберите подходящий вариант:"
+        ),
+        reply_markup=(
+            get_product_families_keyboard(
+                families
+            )
+        ),
+    )
+
+
+async def process_callback_pipeline_result(
+    *,
+    callback: CallbackQuery,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Отображает экран, выбранный Search Pipeline.
+    """
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.INTENTS
+    ):
+        await show_pipeline_intents(
+            callback=callback,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    clear_intent_groups(
+        chat_id=callback.message.chat.id,
+        user_id=callback.from_user.id,
+    )
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.FAMILIES
+    ):
+        await show_pipeline_families(
+            callback=callback,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.DECISION
+    ):
+        await show_pipeline_decision(
+            callback=callback,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    await edit_or_send(
+        callback=callback,
+        text=(
+            "🔍 <b>Подходящих товаров "
+            "не найдено</b>\n\n"
+            f"Запрос: «"
+            f"{escape(pipeline_result.normalized_query)}"
+            f"»\n\n"
+            "Попробуйте выбрать другое уточнение "
+            "или выполнить новый поиск."
+        ),
+    )
 
 
 @router.callback_query(
@@ -180,15 +446,18 @@ async def intent_callback_handler(
     callback: CallbackQuery,
 ) -> None:
     """
-    Обрабатывает выбор уточняющей группы.
+    Обрабатывает выбор фасета.
 
-    Пример:
+    Главное отличие от старой версии:
 
-    intent:0
+    Раньше:
+        фасет → search_products(limit=100)
+        → каталог с пагинацией.
 
-    может соответствовать запросу:
-
-    сельдь в масле
+    Теперь:
+        фасет → Search Pipeline
+        → Decision Search
+        → лучший выбор и альтернативы.
     """
 
     if callback.data is None:
@@ -239,13 +508,6 @@ async def intent_callback_handler(
         )
     ).strip()
 
-    title = str(
-        group.get(
-            "title",
-            query,
-        )
-    ).strip()
-
     if not query:
         await callback.answer(
             "Пустой поисковый запрос",
@@ -254,21 +516,25 @@ async def intent_callback_handler(
         return
 
     await callback.answer(
-        "Ищу подходящие товары…"
+        "Сравниваю товары и оценки…"
     )
 
     try:
         async with async_session_maker() as session:
-            products = await search_products(
-                session=session,
-                query=query,
-                limit=100,
+            pipeline_result = (
+                await run_search_pipeline(
+                    session=session,
+                    query=query,
+                    intent_limit=6,
+                    family_limit=6,
+                    decision_candidates_limit=30,
+                )
             )
 
     except Exception:
         logger.exception(
-            "Ошибка поиска товаров "
-            "для уточнения: %s",
+            "Ошибка Search Pipeline "
+            "после выбора фасета: %s",
             query,
         )
 
@@ -278,144 +544,27 @@ async def intent_callback_handler(
         )
         return
 
-    if not products:
-        await callback.message.answer(
-            (
-                "🔍 По выбранному уточнению "
-                "ничего не найдено.\n\n"
-                "Попробуйте другой вариант."
-            )
-        )
-        return
-
-    product_items = [
-        {
-            "product_id": product.id,
-            "name": product.name,
-            "brand": brand.name,
-        }
-        for product, brand, _category
-        in products
-    ]
-
-    save_product_list(
-        chat_id=callback.message.chat.id,
-        user_id=callback.from_user.id,
-        title=title,
-        products=product_items,
-    )
-
-    clear_intent_groups(
-        chat_id=callback.message.chat.id,
-        user_id=callback.from_user.id,
-    )
-
-    text = build_products_page_text(
-        title=title,
-        total_products=len(product_items),
-        page=0,
-    )
-
-    keyboard = get_paginated_products_keyboard(
-        products=product_items,
-        page=0,
-    )
-
-    try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=keyboard,
-        )
-
-    except TelegramBadRequest:
-        logger.warning(
-            "Не удалось заменить список уточнений "
-            "на список товаров",
-            exc_info=True,
-        )
-
-        await callback.message.answer(
-            text,
-            reply_markup=keyboard,
-        )
-
-
-@router.callback_query(
-    F.data.startswith("products_page:")
-)
-async def products_page_callback_handler(
-    callback: CallbackQuery,
-) -> None:
-    """
-    Переключает страницы списка товаров.
-    """
-
-    if callback.data is None:
-        return
-
-    try:
-        page = int(
-            callback.data.split(
-                ":",
-                1,
-            )[1]
-        )
-
-    except (
-        IndexError,
-        ValueError,
-    ):
-        await callback.answer(
-            "Некорректная страница",
-            show_alert=True,
-        )
-        return
-
-    await show_products_page(
-        callback=callback,
-        page=page,
-    )
-
-
-@router.callback_query(
-    F.data == "products_page_info"
-)
-async def products_page_info_handler(
-    callback: CallbackQuery,
-) -> None:
-    """
-    Обрабатывает нажатие на кнопку номера страницы.
-    """
-
-    if callback.message is None:
-        await callback.answer()
-        return
-
-    state = get_product_list(
-        chat_id=callback.message.chat.id,
-        user_id=callback.from_user.id,
-    )
-
-    if state is None:
-        await callback.answer(
-            (
-                "Список товаров устарел. "
-                "Повторите поиск."
-            ),
-            show_alert=True,
-        )
-        return
-
-    total_pages = max(
-        1,
+    logger.info(
+        "Facet callback: query=%r, screen=%s, "
+        "intents=%s, families=%s, candidates=%s",
+        query,
+        pipeline_result.screen,
+        len(
+            pipeline_result.intent_groups
+        ),
+        len(
+            pipeline_result.families
+        ),
         (
-            len(state.products)
-            + PRODUCTS_PER_PAGE
-            - 1
-        )
-        // PRODUCTS_PER_PAGE,
+            pipeline_result
+            .decision
+            .total_candidates
+            if pipeline_result.decision
+            else 0
+        ),
     )
 
-    await callback.answer(
-        f"Всего страниц: {total_pages}"
+    await process_callback_pipeline_result(
+        callback=callback,
+        pipeline_result=pipeline_result,
     )
