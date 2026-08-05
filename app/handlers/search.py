@@ -39,6 +39,10 @@ from app.services.price_service import (
 from app.services.rating_service import (
     get_full_product_rating,
 )
+from app.services.trust_engine import (
+    TrustEngineResult,
+    evaluate_product,
+)
 
 
 router = Router()
@@ -52,11 +56,21 @@ SEARCH_LOADER_PATH = (
 )
 
 
+UNKNOWN_BRAND_NAMES = {
+    "",
+    "бренд не указан",
+    "не указан",
+    "unknown",
+    "no brand",
+    "без бренда",
+}
+
+
 def format_number(
     value: Decimal | float | int | None,
 ) -> str:
     """
-    Убирает лишние нули у веса и объёма.
+    Убирает лишние нули у чисел.
 
     Примеры:
     245.000 -> 245
@@ -126,43 +140,202 @@ def format_subtype(
     )
 
 
-def format_rating_text(
-    rating: dict[str, float | int],
-) -> str:
+def is_real_brand(
+    brand_name: str | None,
+) -> bool:
     """
-    Форматирует пользовательский рейтинг.
+    Проверяет, указан ли настоящий бренд.
     """
 
-    votes_count = int(
-        rating["votes_count"]
-    )
-
-    average_rating = float(
-        rating["average_rating"]
-    )
-
-    if votes_count == 0:
-        return (
-            "⭐ <b>Оценок пока нет</b>\n"
-            "Будьте первым, кто оценит этот товар."
-        )
-
-    if votes_count < 5:
-        confidence = (
-            "пока недостаточно подтверждён"
-        )
-    elif votes_count < 20:
-        confidence = "средняя"
-    else:
-        confidence = "высокая"
+    normalized_brand = str(
+        brand_name or ""
+    ).strip().lower()
 
     return (
-        "⭐ <b>Рейтинг пользователей:</b> "
-        f"{average_rating:.1f} из 10\n"
-        "👥 <b>Количество оценок:</b> "
-        f"{votes_count}\n"
-        "🛡 <b>Достоверность:</b> "
-        f"{confidence}"
+        normalized_brand
+        not in UNKNOWN_BRAND_NAMES
+    )
+
+
+def build_product_title(
+    *,
+    product,
+    brand,
+) -> str:
+    """
+    Формирует заголовок карточки.
+
+    Служебное значение «Бренд не указан»
+    пользователю не показывается.
+    """
+
+    product_name = escape(
+        product.name
+    )
+
+    if not is_real_brand(
+        brand.name
+    ):
+        return f"<b>{product_name}</b>"
+
+    return (
+        f"<b>{escape(brand.name)} — "
+        f"{product_name}</b>"
+    )
+
+
+def calculate_data_quality_score(
+    *,
+    product,
+    brand,
+    category,
+    price_stats: dict[str, Any] | None,
+) -> float:
+    """
+    Оценивает полноту карточки товара.
+
+    Этот показатель не оценивает качество самого
+    продукта. Он показывает, насколько достаточно
+    информации для принятия решения.
+    """
+
+    score = 0.0
+
+    product_name = str(
+        product.name or ""
+    ).strip()
+
+    if product_name:
+        score += 20.0
+
+    if (
+        product_name
+        and len(product_name) >= 4
+    ):
+        score += 5.0
+
+    if is_real_brand(
+        brand.name
+    ):
+        score += 15.0
+
+    category_name = str(
+        category.name or ""
+    ).strip()
+
+    if category_name:
+        score += 10.0
+
+    if product.image_url:
+        score += 15.0
+
+    if product.barcode:
+        score += 15.0
+
+    if (
+        product.package_value is not None
+        and product.package_unit
+    ):
+        score += 10.0
+
+    if product.description:
+        score += 5.0
+
+    if product.subtype:
+        score += 3.0
+
+    if product.keywords:
+        score += 2.0
+
+    if price_stats is not None:
+        score += 5.0
+
+    return min(
+        score,
+        100.0,
+    )
+
+
+def format_explanation(
+    trust_result: TrustEngineResult,
+) -> str:
+    """
+    Форматирует объяснение решения Trust Engine.
+    """
+
+    if not trust_result.explanation:
+        return (
+            "• Пока недостаточно информации "
+            "для подробного объяснения."
+        )
+
+    return "\n".join(
+        f"• {escape(reason)}"
+        for reason in trust_result.explanation
+    )
+
+
+def format_trust_engine_text(
+    trust_result: TrustEngineResult,
+) -> str:
+    """
+    Формирует главный блок решения MarkaRadar.
+
+    Этот блок всегда показывается раньше
+    технических характеристик товара.
+    """
+
+    lines = [
+        (
+            f"<b>"
+            f"{escape(trust_result.recommendation_title)}"
+            f"</b>"
+        ),
+        "",
+    ]
+
+    if trust_result.votes_count == 0:
+        lines.extend(
+            [
+                "⭐ <b>Рейтинг:</b> пока нет оценок",
+                "👥 <b>Оценок:</b> 0",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                (
+                    "⭐ <b>Рейтинг пользователей:</b> "
+                    f"{trust_result.average_rating:.1f} "
+                    "из 10"
+                ),
+                (
+                    "👥 <b>Количество оценок:</b> "
+                    f"{trust_result.votes_count}"
+                ),
+            ]
+        )
+
+    lines.extend(
+        [
+            (
+                "🛡 <b>Уровень доверия:</b> "
+                f"{escape(trust_result.trust_title)}"
+            ),
+            (
+                "📊 <b>Доверие к данным:</b> "
+                f"{trust_result.trust_score:.0f} из 100"
+            ),
+            "",
+            "<b>Почему такой вывод:</b>",
+            format_explanation(
+                trust_result
+            ),
+        ]
+    )
+
+    return "\n".join(
+        lines
     )
 
 
@@ -206,7 +379,7 @@ def format_price_text(
 
     lines = [
         (
-            "💰 <b>Средняя цена по рынку:</b> "
+            "💰 <b>Ориентир по цене:</b> "
             f"около {median_price:.0f} ₽"
         ),
         (
@@ -251,16 +424,25 @@ def build_product_card(
     product,
     brand,
     category,
-    rating: dict[str, float | int],
+    trust_result: TrustEngineResult,
     price_stats: dict[str, Any] | None,
 ) -> str:
     """
-    Формирует полную карточку товара.
+    Формирует карточку товара.
+
+    Порядок принципиально важен:
+
+    1. решение MarkaRadar;
+    2. объяснение и доверие;
+    3. название товара;
+    4. цена;
+    5. технические характеристики;
+    6. возможность поставить оценку.
     """
 
-    title = (
-        f"<b>{escape(brand.name)} — "
-        f"{escape(product.name)}</b>"
+    title = build_product_title(
+        product=product,
+        brand=brand,
     )
 
     package_text = format_package(
@@ -273,25 +455,50 @@ def build_product_card(
     )
 
     product_lines = [
+        format_trust_engine_text(
+            trust_result
+        ),
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
         title,
         "",
+        format_price_text(
+            price_stats
+        ),
+        "",
+        "<b>Информация о товаре:</b>",
         (
             "📂 <b>Категория:</b> "
             f"{escape(category.name)}"
         ),
-        (
+    ]
+
+    if is_real_brand(
+        brand.name
+    ):
+        product_lines.append(
             "🏷 <b>Бренд:</b> "
             f"{escape(brand.name)}"
-        ),
-        (
-            "🥫 <b>Тип:</b> "
-            f"{subtype_text}"
-        ),
-        (
-            "📦 <b>Упаковка:</b> "
-            f"{package_text}"
-        ),
-    ]
+        )
+    else:
+        product_lines.append(
+            "🏷 <b>Бренд:</b> "
+            "информация отсутствует"
+        )
+
+    product_lines.extend(
+        [
+            (
+                "🥫 <b>Тип:</b> "
+                f"{subtype_text}"
+            ),
+            (
+                "📦 <b>Упаковка:</b> "
+                f"{package_text}"
+            ),
+        ]
+    )
 
     if product.barcode:
         product_lines.append(
@@ -304,15 +511,12 @@ def build_product_card(
     product_lines.extend(
         [
             "",
-            format_price_text(
-                price_stats
-            ),
+            "━━━━━━━━━━━━━━━━━━",
             "",
-            format_rating_text(
-                rating
+            (
+                "Ваша оценка поможет другим "
+                "покупателям сделать выбор 👇"
             ),
-            "",
-            "Поставьте свою оценку 👇",
         ]
     )
 
@@ -345,8 +549,8 @@ async def send_search_loader(
         )
 
         return await message.answer(
-            "🔎 <b>Ищу товары…</b>\n"
-            "Проверяю виды товаров, бренды "
+            "🔎 <b>Ищу подходящие товары…</b>\n"
+            "Проверяю оценки, доверие "
             "и похожие варианты."
         )
 
@@ -359,8 +563,8 @@ async def send_search_loader(
             animation=animation,
             caption=(
                 "🏃 <b>Бегу вдоль витрин…</b>\n"
-                "Ищу виды товаров, бренды "
-                "и лучшие совпадения."
+                "Сравниваю товары, оценки "
+                "и надёжность результатов."
             ),
         )
 
@@ -370,8 +574,8 @@ async def send_search_loader(
         )
 
         return await message.answer(
-            "🔎 <b>Ищу товары…</b>\n"
-            "Проверяю виды товаров, бренды "
+            "🔎 <b>Ищу подходящие товары…</b>\n"
+            "Проверяю оценки, доверие "
             "и похожие варианты."
         )
 
@@ -397,7 +601,7 @@ async def send_product_card(
     product,
     brand,
     category,
-    rating: dict[str, float | int],
+    trust_result: TrustEngineResult,
     price_stats: dict[str, Any] | None,
 ) -> None:
     """
@@ -408,7 +612,7 @@ async def send_product_card(
         product=product,
         brand=brand,
         category=category,
-        rating=rating,
+        trust_result=trust_result,
         price_stats=price_stats,
     )
 
@@ -455,8 +659,8 @@ async def show_single_product(
     category,
 ) -> None:
     """
-    Загружает рейтинг и цены,
-    затем отправляет карточку товара.
+    Загружает рейтинг и цены, запускает
+    Trust Engine и отправляет карточку.
     """
 
     rating = await get_full_product_rating(
@@ -469,12 +673,45 @@ async def show_single_product(
         product_id=product.id,
     )
 
+    average_rating = float(
+        rating.get(
+            "average_rating",
+            0.0,
+        )
+    )
+
+    votes_count = int(
+        rating.get(
+            "votes_count",
+            0,
+        )
+    )
+
+    data_quality_score = (
+        calculate_data_quality_score(
+            product=product,
+            brand=brand,
+            category=category,
+            price_stats=price_stats,
+        )
+    )
+
+    trust_result = evaluate_product(
+        average_rating=average_rating,
+        votes_count=votes_count,
+        data_quality_score=(
+            data_quality_score
+        ),
+        popularity_score=0.0,
+        relevance_score=100.0,
+    )
+
     await send_product_card(
         message=message,
         product=product,
         brand=brand,
         category=category,
-        rating=rating,
+        trust_result=trust_result,
         price_stats=price_stats,
     )
 
@@ -486,13 +723,7 @@ async def show_product_families(
     query: str,
 ) -> None:
     """
-    Показывает найденные семейства товаров.
-
-    Например:
-
-    Сельдь филе в масле · 18
-    Сельдь слабосолёная · 11
-    Сельдь по-царски · 6
+    Показывает найденные виды товаров.
     """
 
     total_products = sum(
@@ -506,13 +737,14 @@ async def show_product_families(
     )
 
     await message.answer(
-        "🧺 <b>Найдены виды товаров</b>\n\n"
+        "🧭 <b>Уточните, что именно нужно</b>\n\n"
         f"Запрос: «{escape(query)}»\n"
-        f"Вариантов: "
+        f"Подходящих направлений: "
         f"<b>{len(families)}</b>\n"
         f"Товаров внутри: "
         f"<b>{total_products}</b>\n\n"
-        "Выберите подходящий вид:",
+        "После выбора MarkaRadar покажет "
+        "товары с учётом оценок и доверия:",
         reply_markup=(
             get_product_families_keyboard(
                 families
@@ -529,9 +761,6 @@ async def show_fallback_products(
 ) -> None:
     """
     Выполняет резервный расширенный поиск.
-
-    Используется, если не удалось построить
-    уточнения, семейства и обычные подсказки.
     """
 
     products = await search_products(
@@ -578,11 +807,10 @@ async def show_fallback_products(
     ]
 
     await message.answer(
-        "🔍 <b>Найдено несколько "
-        "вариантов</b>\n\n"
+        "🔍 <b>Подходящие варианты</b>\n\n"
         f"Запрос: «{escape(query)}»\n"
-        "Нажмите на товар, "
-        "чтобы открыть карточку:",
+        "Выберите товар — MarkaRadar покажет "
+        "его оценку и надёжность:",
         reply_markup=(
             get_search_suggestions_keyboard(
                 fallback_suggestions
@@ -619,8 +847,6 @@ async def search_handler(
         )
         return
 
-    # Команды обрабатываются
-    # другими роутерами.
     if query.startswith("/"):
         return
 
@@ -632,7 +858,6 @@ async def search_handler(
         async with async_session_maker() as session:
             user = message.from_user
 
-            # Штрихкод обрабатываем сразу.
             if query.isdigit():
                 barcode_products = await search_products(
                     session=session,
@@ -654,8 +879,6 @@ async def search_handler(
                     )
                     return
 
-            # Первый уровень:
-            # уточняющие группы.
             engine_result = await run_search_engine(
                 session=session,
                 query=query,
@@ -704,8 +927,6 @@ async def search_handler(
                 )
                 return
 
-            # Второй уровень:
-            # семейства товаров.
             families = await find_product_families(
                 session=session,
                 query=query,
@@ -726,8 +947,6 @@ async def search_handler(
                 )
                 return
 
-            # Третий уровень:
-            # конкретные товары.
             if (
                 engine_result.mode
                 == SearchMode.PRODUCTS
@@ -741,7 +960,8 @@ async def search_handler(
                 await message.answer(
                     "🔍 <b>Лучшие совпадения</b>\n\n"
                     f"Запрос: «{escape(query)}»\n"
-                    "Выберите подходящий товар:",
+                    "Выберите товар — MarkaRadar "
+                    "покажет оценку и уровень доверия:",
                     reply_markup=(
                         get_search_suggestions_keyboard(
                             engine_result
@@ -757,8 +977,6 @@ async def search_handler(
                     user_id=user.id,
                 )
 
-            # Последний уровень:
-            # резервный поиск.
             await show_fallback_products(
                 message=message,
                 session=session,
@@ -780,4 +998,4 @@ async def search_handler(
     finally:
         await remove_search_loader(
             loading_message
-        )
+    )
