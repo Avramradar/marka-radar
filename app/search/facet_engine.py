@@ -13,6 +13,10 @@ from app.utils.text import normalize_text
 
 
 class FacetType(StrEnum):
+    """
+    Поддерживаемые типы уточнений.
+    """
+
     PRODUCT_KIND = "product_kind"
     PROCESSING = "processing"
     SPECIAL = "special"
@@ -24,18 +28,20 @@ class FacetType(StrEnum):
 @dataclass(slots=True, frozen=True)
 class FacetDefinition:
     """
-    Описание одного разрешённого фасета.
+    Описание контролируемого фасета.
 
-    match_terms:
-        Слова и фразы, по которым фасет
-        определяется в данных товара.
+    key:
+        Внутренний уникальный идентификатор.
 
     title:
-        Понятное название кнопки.
+        Понятный текст кнопки.
 
     query_term:
-        Значение, добавляемое к запросу
-        после выбора фасета.
+        Значение, добавляемое к поисковому запросу.
+
+    match_terms:
+        Слова и фразы, по которым определяется
+        принадлежность товара к фасету.
     """
 
     key: str
@@ -45,9 +51,29 @@ class FacetDefinition:
 
 
 @dataclass(slots=True, frozen=True)
+class FacetCandidate:
+    """
+    Подготовленный товар для анализа фасетов.
+
+    normalized_text:
+        Нормализованный текст для поиска слов
+        и смысловых характеристик.
+
+    raw_text:
+        Исходный текст с сохранёнными знаками
+        процентов, запятыми и числами.
+
+        Он необходим для извлечения жирности.
+    """
+
+    normalized_text: str
+    raw_text: str
+
+
+@dataclass(slots=True, frozen=True)
 class FacetOption:
     """
-    Один вариант уточнения для пользователя.
+    Один вариант уточнения.
     """
 
     facet_type: FacetType
@@ -55,6 +81,7 @@ class FacetOption:
     title: str
     query: str
     count: int
+    usefulness: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +90,7 @@ class FacetOption:
             "title": self.title,
             "query": self.query,
             "count": self.count,
+            "usefulness": self.usefulness,
         }
 
 
@@ -73,20 +101,38 @@ class FacetGroup:
 
     Например:
 
-    Вид продукта:
-    - питьевое;
-    - сгущённое;
-    - сухое.
+    Способ обработки:
+    - пастеризованное;
+    - ультрапастеризованное.
     """
 
     facet_type: FacetType
     title: str
     options: tuple[FacetOption, ...]
+    priority: int = 100
+
+    @property
+    def total_count(self) -> int:
+        return sum(
+            option.count
+            for option in self.options
+        )
+
+    @property
+    def average_usefulness(self) -> float:
+        if not self.options:
+            return 0.0
+
+        return sum(
+            option.usefulness
+            for option in self.options
+        ) / len(self.options)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "facet_type": self.facet_type.value,
             "title": self.title,
+            "priority": self.priority,
             "options": [
                 option.as_dict()
                 for option in self.options
@@ -97,15 +143,10 @@ class FacetGroup:
 @dataclass(slots=True, frozen=True)
 class FacetSearchResult:
     """
-    Результат анализа фасетов.
+    Результат работы Facet Engine.
 
-    product_type:
-        Понятный базовый тип продукта:
-        молоко, кофе или сельдь.
-
-    groups:
-        Только разрешённые и реально найденные
-        варианты уточнения.
+    В groups обычно возвращается только одна
+    наиболее полезная группа следующего уровня.
     """
 
     original_query: str
@@ -129,6 +170,46 @@ class FacetSearchResult:
         )
 
 
+MILK_PROCESSING = (
+    FacetDefinition(
+        key="pasteurized",
+        title="Пастеризованное",
+        query_term="пастеризованное",
+        match_terms=(
+            "пастеризованное",
+            "пастеризованный",
+            "пастеризованная",
+        ),
+    ),
+    FacetDefinition(
+        key="ultra_pasteurized",
+        title="Ультрапастеризованное",
+        query_term="ультрапастеризованное",
+        match_terms=(
+            "ультрапастеризованное",
+            "ультрапастеризованный",
+            "ультрапастеризованная",
+            "ультравысокотемпературно",
+            "ультравысокотемпературное",
+            "uht",
+        ),
+    ),
+    FacetDefinition(
+        key="baked",
+        title="Топлёное",
+        query_term="топлёное",
+        match_terms=(
+            "топленое",
+            "топлёное",
+            "топленый",
+            "топлёный",
+            "топленая",
+            "топлёная",
+        ),
+    ),
+)
+
+
 MILK_PRODUCT_KIND = (
     FacetDefinition(
         key="drinking",
@@ -146,6 +227,8 @@ MILK_PRODUCT_KIND = (
         match_terms=(
             "сгущенное",
             "сгущённое",
+            "сгущенка",
+            "сгущёнка",
             "condensed milk",
         ),
     ),
@@ -177,41 +260,6 @@ MILK_PRODUCT_KIND = (
     ),
 )
 
-MILK_PROCESSING = (
-    FacetDefinition(
-        key="pasteurized",
-        title="Пастеризованное",
-        query_term="пастеризованное",
-        match_terms=(
-            "пастеризованное",
-            "пастеризованный",
-        ),
-    ),
-    FacetDefinition(
-        key="ultra_pasteurized",
-        title="Ультрапастеризованное",
-        query_term="ультрапастеризованное",
-        match_terms=(
-            "ультрапастеризованное",
-            "ультрапастеризованный",
-            "ультравысокотемпературно",
-            "ультравысокотемпературное",
-            "uhт",
-            "uht",
-        ),
-    ),
-    FacetDefinition(
-        key="baked",
-        title="Топлёное",
-        query_term="топлёное",
-        match_terms=(
-            "топленое",
-            "топлёное",
-            "топленый",
-            "топлёный",
-        ),
-    ),
-)
 
 MILK_SPECIAL = (
     FacetDefinition(
@@ -227,6 +275,7 @@ MILK_SPECIAL = (
         ),
     ),
 )
+
 
 COFFEE_FORM = (
     FacetDefinition(
@@ -278,11 +327,14 @@ COFFEE_FORM = (
         match_terms=(
             "дрип пакет",
             "дрип-пакет",
+            "дрип пакеты",
+            "дрип-пакеты",
             "drip coffee",
             "coffee drip",
         ),
     ),
 )
+
 
 COFFEE_PREPARATION = (
     FacetDefinition(
@@ -302,10 +354,23 @@ COFFEE_PREPARATION = (
         match_terms=(
             "без кофеина",
             "декофеинизированный",
+            "декофеинизированное",
             "decaf",
         ),
     ),
+    FacetDefinition(
+        key="sublimated",
+        title="Сублимированный",
+        query_term="сублимированный",
+        match_terms=(
+            "сублимированный",
+            "сублимированное",
+            "freeze dried",
+            "freeze-dried",
+        ),
+    ),
 )
+
 
 HERRING_PRODUCT_KIND = (
     FacetDefinition(
@@ -341,6 +406,7 @@ HERRING_PRODUCT_KIND = (
     ),
 )
 
+
 HERRING_PREPARATION = (
     FacetDefinition(
         key="lightly_salted",
@@ -349,6 +415,8 @@ HERRING_PREPARATION = (
         match_terms=(
             "слабосоленая",
             "слабосолёная",
+            "слабосоленый",
+            "слабосолёный",
             "малосольная",
         ),
     ),
@@ -377,7 +445,7 @@ HERRING_PREPARATION = (
         query_term="с луком",
         match_terms=(
             "с луком",
-            "лук",
+            "луковая заливка",
         ),
     ),
 )
@@ -409,49 +477,57 @@ FACET_SCHEMAS: dict[
             FacetType,
             str,
             tuple[FacetDefinition, ...],
+            int,
         ],
         ...,
     ],
 ] = {
     "молоко": (
         (
-            FacetType.PRODUCT_KIND,
-            "Какой вид молока?",
-            MILK_PRODUCT_KIND,
-        ),
-        (
             FacetType.PROCESSING,
             "Способ обработки",
             MILK_PROCESSING,
+            10,
+        ),
+        (
+            FacetType.PRODUCT_KIND,
+            "Вид молока",
+            MILK_PRODUCT_KIND,
+            20,
         ),
         (
             FacetType.SPECIAL,
             "Особенности",
             MILK_SPECIAL,
+            30,
         ),
     ),
     "кофе": (
         (
             FacetType.FORM,
-            "Какой кофе?",
+            "Вид кофе",
             COFFEE_FORM,
+            10,
         ),
         (
             FacetType.PREPARATION,
             "Особенности",
             COFFEE_PREPARATION,
+            20,
         ),
     ),
     "сельдь": (
         (
             FacetType.PRODUCT_KIND,
-            "Какой вид сельди?",
+            "Вид сельди",
             HERRING_PRODUCT_KIND,
+            10,
         ),
         (
             FacetType.PREPARATION,
             "Способ приготовления",
             HERRING_PREPARATION,
+            20,
         ),
     ),
 }
@@ -459,7 +535,7 @@ FACET_SCHEMAS: dict[
 
 FAT_PERCENT_PATTERN = re.compile(
     r"(?<!\d)"
-    r"(\d{1,2}(?:[.,]\d)?)"
+    r"(\d{1,2}(?:[.,]\d{1,2})?)"
     r"\s*%"
 )
 
@@ -468,7 +544,11 @@ def normalize_facet_text(
     value: Any,
 ) -> str:
     """
-    Нормализует текст товара для анализа фасетов.
+    Нормализует текст для смыслового анализа.
+
+    Этот вариант используется для словесных
+    фасетов. Проценты извлекаются отдельно
+    из исходного текста.
     """
 
     if value is None:
@@ -492,25 +572,56 @@ def normalize_facet_text(
     return normalized
 
 
+def normalize_raw_text(
+    value: Any,
+) -> str:
+    """
+    Мягко нормализует исходный текст.
+
+    В отличие от normalize_text(), сохраняет:
+    - знак процента;
+    - запятые;
+    - точки;
+    - числовые значения.
+    """
+
+    if value is None:
+        return ""
+
+    text = str(value).lower()
+
+    text = text.replace(
+        "ё",
+        "е",
+    )
+
+    text = text.replace(
+        "\xa0",
+        " ",
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text
+
+
 def detect_product_type(
     query: str,
 ) -> str | None:
     """
-    Определяет базовый тип продукта по запросу.
-
-    На первом этапе поддерживаются:
-    - молоко;
-    - кофе;
-    - сельдь.
+    Определяет базовый тип продукта.
     """
 
     normalized_query = normalize_facet_text(
         query
     )
 
-    query_words = set(
-        normalized_query.split()
-    )
+    if not normalized_query:
+        return None
 
     for product_type, aliases in (
         PRODUCT_TYPE_ALIASES.items()
@@ -520,33 +631,37 @@ def detect_product_type(
                 alias
             )
 
-            if (
-                normalized_alias
-                in normalized_query
-            ):
-                return product_type
+            if not normalized_alias:
+                continue
 
-            if normalized_alias in query_words:
+            if " " in normalized_alias:
+                if normalized_alias in normalized_query:
+                    return product_type
+                continue
+
+            if re.search(
+                rf"(?<!\w)"
+                rf"{re.escape(normalized_alias)}"
+                rf"(?!\w)",
+                normalized_query,
+            ):
                 return product_type
 
     return None
 
 
-def build_product_search_text(
+def get_candidate_values(
     *,
     product,
     brand,
     category,
-) -> str:
+) -> tuple[Any, ...]:
     """
-    Собирает внутренний текст товара,
-    используемый только для анализа фасетов.
-
-    Этот текст никогда не показывается
-    пользователю.
+    Возвращает поля товара, которые можно
+    использовать для анализа фасетов.
     """
 
-    values = (
+    return (
         getattr(
             product,
             "name",
@@ -589,14 +704,49 @@ def build_product_search_text(
         ),
     )
 
-    normalized_values = [
+
+def build_facet_candidate(
+    *,
+    product,
+    brand,
+    category,
+) -> FacetCandidate:
+    """
+    Собирает две версии текста товара:
+
+    1. нормализованную — для слов;
+    2. исходную — для процентов и чисел.
+    """
+
+    values = get_candidate_values(
+        product=product,
+        brand=brand,
+        category=category,
+    )
+
+    normalized_parts = [
         normalize_facet_text(value)
         for value in values
-        if value
+        if value is not None
     ]
 
-    return " ".join(
-        normalized_values
+    raw_parts = [
+        normalize_raw_text(value)
+        for value in values
+        if value is not None
+    ]
+
+    return FacetCandidate(
+        normalized_text=" ".join(
+            part
+            for part in normalized_parts
+            if part
+        ),
+        raw_text=" ".join(
+            part
+            for part in raw_parts
+            if part
+        ),
     )
 
 
@@ -607,10 +757,6 @@ def text_contains_term(
 ) -> bool:
     """
     Проверяет наличие слова или фразы.
-
-    Для однословного значения используются
-    границы слова, чтобы избегать случайных
-    частичных совпадений.
     """
 
     normalized_term = normalize_facet_text(
@@ -635,35 +781,39 @@ def text_contains_term(
 
 def matches_definition(
     *,
-    product_text: str,
+    candidate: FacetCandidate,
     definition: FacetDefinition,
 ) -> bool:
     """
-    Проверяет соответствие товара
-    разрешённому варианту фасета.
+    Проверяет соответствие товара фасету.
     """
 
     return any(
         text_contains_term(
-            text=product_text,
+            text=candidate.normalized_text,
             term=term,
         )
         for term in definition.match_terms
     )
 
 
-def query_already_contains_option(
+def query_already_contains_definition(
     *,
     query: str,
     definition: FacetDefinition,
 ) -> bool:
     """
-    Не показывает фасет, уже указанный
-    пользователем в исходном запросе.
+    Проверяет, выбрал ли пользователь
+    этот фасет ранее.
     """
 
     normalized_query = normalize_facet_text(
         query
+    )
+
+    terms = (
+        definition.query_term,
+        *definition.match_terms,
     )
 
     return any(
@@ -671,9 +821,24 @@ def query_already_contains_option(
             text=normalized_query,
             term=term,
         )
-        for term in (
-            definition.query_term,
-            *definition.match_terms,
+        for term in terms
+    )
+
+
+def query_contains_fat_percent(
+    query: str,
+) -> bool:
+    """
+    Проверяет, указана ли жирность в запросе.
+    """
+
+    raw_query = normalize_raw_text(
+        query
+    )
+
+    return bool(
+        FAT_PERCENT_PATTERN.search(
+            raw_query
         )
     )
 
@@ -684,11 +849,7 @@ def build_refined_query(
     query_term: str,
 ) -> str:
     """
-    Формирует безопасный поисковый запрос
-    после выбора фасета.
-
-    В отличие от старых интентов, исходный
-    запрос не теряется.
+    Формирует новый запрос после выбора фасета.
     """
 
     normalized_original = " ".join(
@@ -705,20 +866,36 @@ def build_refined_query(
     if not normalized_term:
         return normalized_original
 
-    combined = (
-        f"{normalized_original} "
-        f"{normalized_term}"
+    normalized_original_for_check = (
+        normalize_raw_text(
+            normalized_original
+        )
     )
 
+    normalized_term_for_check = (
+        normalize_raw_text(
+            normalized_term
+        )
+    )
+
+    if (
+        normalized_term_for_check
+        in normalized_original_for_check
+    ):
+        return normalized_original
+
     return " ".join(
-        combined.split()
+        (
+            normalized_original,
+            normalized_term,
+        )
     )
 
 
 def count_facet_options(
     *,
     original_query: str,
-    candidate_texts: Iterable[str],
+    candidates: Iterable[FacetCandidate],
     definitions: tuple[FacetDefinition, ...],
 ) -> list[
     tuple[
@@ -728,7 +905,7 @@ def count_facet_options(
 ]:
     """
     Подсчитывает количество товаров
-    для каждого разрешённого фасета.
+    для каждого фасета.
     """
 
     counts: Counter[str] = Counter()
@@ -738,18 +915,18 @@ def count_facet_options(
         for definition in definitions
     }
 
-    for product_text in candidate_texts:
+    for candidate in candidates:
         matched_keys: set[str] = set()
 
         for definition in definitions:
-            if query_already_contains_option(
+            if query_already_contains_definition(
                 query=original_query,
                 definition=definition,
             ):
                 continue
 
             if matches_definition(
-                product_text=product_text,
+                candidate=candidate,
                 definition=definition,
             ):
                 matched_keys.add(
@@ -790,15 +967,12 @@ def calculate_option_usefulness(
     candidates_count: int,
 ) -> float:
     """
-    Оценивает полезность фасета.
+    Оценивает полезность отдельного варианта.
 
-    Плохие варианты:
-    - встречаются только у одного товара;
-    - охватывают почти всю выдачу и ничего
-      фактически не уточняют.
-
-    Лучшие варианты делят выдачу
-    на осмысленные части.
+    Вариант полезен, если:
+    - поддерживается несколькими товарами;
+    - не охватывает почти всю выдачу;
+    - реально уменьшает множество кандидатов.
     """
 
     if (
@@ -807,71 +981,73 @@ def calculate_option_usefulness(
     ):
         return 0.0
 
+    if count < 2:
+        return 0.0
+
     coverage = (
         count
         / candidates_count
     )
 
-    if count < 2:
+    if coverage >= 0.96:
         return 0.0
 
-    if coverage >= 0.95:
-        return 0.0
-
-    balance_score = (
-        1.0
-        - abs(
-            coverage - 0.40
-        )
+    balance_score = max(
+        0.0,
+        1.0 - abs(
+            coverage - 0.35
+        ),
     )
 
     support_score = min(
-        count / 10.0,
+        count / 12.0,
         1.0,
     )
 
+    narrowing_score = (
+        1.0 - coverage
+    )
+
     return (
-        balance_score * 0.7
-        + support_score * 0.3
+        balance_score * 0.45
+        + support_score * 0.25
+        + narrowing_score * 0.30
     )
 
 
-def build_facet_group(
+def build_definition_group(
     *,
     original_query: str,
     facet_type: FacetType,
     group_title: str,
     definitions: tuple[FacetDefinition, ...],
-    candidate_texts: list[str],
+    candidates: list[FacetCandidate],
     candidates_count: int,
     option_limit: int,
+    priority: int,
 ) -> FacetGroup | None:
     """
-    Создаёт одну группу полезных фасетов.
+    Строит группу словесных фасетов.
     """
 
     counted_options = count_facet_options(
         original_query=original_query,
-        candidate_texts=candidate_texts,
+        candidates=candidates,
         definitions=definitions,
     )
 
     ranked_options: list[
         tuple[
             float,
-            FacetDefinition,
             int,
+            FacetDefinition,
         ]
     ] = []
 
     for definition, count in counted_options:
-        usefulness = (
-            calculate_option_usefulness(
-                count=count,
-                candidates_count=(
-                    candidates_count
-                ),
-            )
+        usefulness = calculate_option_usefulness(
+            count=count,
+            candidates_count=candidates_count,
         )
 
         if usefulness <= 0:
@@ -880,16 +1056,16 @@ def build_facet_group(
         ranked_options.append(
             (
                 usefulness,
-                definition,
                 count,
+                definition,
             )
         )
 
     ranked_options.sort(
         key=lambda item: (
             item[0],
-            item[2],
-            item[1].title,
+            item[1],
+            item[2].title,
         ),
         reverse=True,
     )
@@ -904,11 +1080,12 @@ def build_facet_group(
                 query_term=definition.query_term,
             ),
             count=count,
+            usefulness=usefulness,
         )
         for (
-            _usefulness,
-            definition,
+            usefulness,
             count,
+            definition,
         ) in ranked_options[
             :option_limit
         ]
@@ -921,45 +1098,56 @@ def build_facet_group(
         facet_type=facet_type,
         title=group_title,
         options=options,
+        priority=priority,
+    )
+
+
+def normalize_fat_value(
+    value: float,
+) -> str:
+    """
+    Форматирует значение жирности.
+
+    3.0 -> 3
+    3.2 -> 3,2
+    """
+
+    formatted = f"{value:g}"
+
+    return formatted.replace(
+        ".",
+        ",",
     )
 
 
 def extract_fat_percentages(
     *,
     original_query: str,
-    candidate_texts: list[str],
+    candidates: list[FacetCandidate],
     candidates_count: int,
     option_limit: int,
+    priority: int = 15,
 ) -> FacetGroup | None:
     """
-    Извлекает реальные значения жирности
-    из найденных молочных товаров.
+    Извлекает жирность из исходных строк.
 
-    Вместо кнопок «Жира», «Долей»
-    пользователь получает:
-
-    - 1,5%;
-    - 2,5%;
-    - 3,2%;
-    - 3,5%.
+    Важно: используется candidate.raw_text,
+    потому что обычная нормализация может
+    удалить знак процента.
     """
 
-    normalized_query = normalize_facet_text(
+    if query_contains_fat_percent(
         original_query
-    )
-
-    if FAT_PERCENT_PATTERN.search(
-        normalized_query
     ):
         return None
 
     counts: Counter[str] = Counter()
 
-    for product_text in candidate_texts:
-        values_in_product: set[str] = set()
+    for candidate in candidates:
+        values_in_candidate: set[str] = set()
 
         for match in FAT_PERCENT_PATTERN.finditer(
-            product_text
+            candidate.raw_text
         ):
             raw_value = (
                 match.group(1)
@@ -973,37 +1161,33 @@ def extract_fat_percentages(
             except ValueError:
                 continue
 
-            if not 0 <= numeric_value <= 20:
+            # Реалистичный диапазон жирности
+            # молочных продуктов.
+            if not 0.0 <= numeric_value <= 20.0:
                 continue
 
-            normalized_value = (
-                f"{numeric_value:g}"
-            )
+            normalized_value = f"{numeric_value:g}"
 
-            values_in_product.add(
+            values_in_candidate.add(
                 normalized_value
             )
 
-        for value in values_in_product:
+        for value in values_in_candidate:
             counts[value] += 1
 
-    ranked: list[
+    ranked_options: list[
         tuple[
             float,
-            float,
             int,
+            float,
             str,
         ]
     ] = []
 
     for value, count in counts.items():
-        usefulness = (
-            calculate_option_usefulness(
-                count=count,
-                candidates_count=(
-                    candidates_count
-                ),
-            )
+        usefulness = calculate_option_usefulness(
+            count=count,
+            candidates_count=candidates_count,
         )
 
         if usefulness <= 0:
@@ -1013,19 +1197,24 @@ def extract_fat_percentages(
             value
         )
 
-        ranked.append(
+        ranked_options.append(
             (
                 usefulness,
-                -abs(
-                    numeric_value - 3.2
-                ),
                 count,
+                numeric_value,
                 value,
             )
         )
 
-    ranked.sort(
-        reverse=True
+    ranked_options.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            -abs(
+                item[2] - 3.2
+            ),
+        ),
+        reverse=True,
     )
 
     options = tuple(
@@ -1039,30 +1228,23 @@ def extract_fat_percentages(
                 )
             ),
             title=(
-                value.replace(
-                    ".",
-                    ",",
-                )
-                + "%"
+                f"{normalize_fat_value(numeric_value)}%"
             ),
             query=build_refined_query(
                 original_query=original_query,
                 query_term=(
-                    value.replace(
-                        ".",
-                        ",",
-                    )
-                    + "%"
+                    f"{normalize_fat_value(numeric_value)}%"
                 ),
             ),
             count=count,
+            usefulness=usefulness,
         )
         for (
-            _usefulness,
-            _preferred_value,
+            usefulness,
             count,
+            numeric_value,
             value,
-        ) in ranked[
+        ) in ranked_options[
             :option_limit
         ]
     )
@@ -1074,7 +1256,40 @@ def extract_fat_percentages(
         facet_type=FacetType.FAT_PERCENT,
         title="Жирность",
         options=options,
+        priority=priority,
     )
+
+
+def select_next_group(
+    groups: list[FacetGroup],
+) -> FacetGroup | None:
+    """
+    Выбирает только один следующий уровень.
+
+    Сначала учитывается смысловой приоритет,
+    затем полезность вариантов.
+
+    Это предотвращает смешивание кнопок:
+
+    - пастеризованное;
+    - 3,2%;
+    - безлактозное
+
+    на одном экране.
+    """
+
+    if not groups:
+        return None
+
+    return sorted(
+        groups,
+        key=lambda group: (
+            group.priority,
+            -group.average_usefulness,
+            -group.total_count,
+            group.title,
+        ),
+    )[0]
 
 
 async def build_product_facets(
@@ -1082,7 +1297,7 @@ async def build_product_facets(
     session: AsyncSession,
     query: str,
     candidates_limit: int = 100,
-    group_limit: int = 2,
+    group_limit: int = 1,
     option_limit: int = 5,
 ) -> FacetSearchResult:
     """
@@ -1090,15 +1305,17 @@ async def build_product_facets(
 
     Алгоритм:
 
-    1. определяет базовый продукт;
-    2. находит релевантных кандидатов;
-    3. анализирует только разрешённые фасеты;
-    4. показывает только реально встречающиеся
-       и полезные варианты;
-    5. сохраняет исходный запрос при уточнении.
+    1. определяет тип продукта;
+    2. получает подходящие товары;
+    3. строит контролируемые фасеты;
+    4. извлекает жирность из исходных строк;
+    5. выбирает только один следующий уровень;
+    6. не показывает уже выбранные параметры.
 
-    Facet Engine не строит варианты
-    из случайных слов базы.
+    group_limit сохранён для совместимости
+    с существующим Search Pipeline, но движок
+    намеренно возвращает только один лучший
+    следующий уровень.
     """
 
     cleaned_query = " ".join(
@@ -1133,14 +1350,6 @@ async def build_product_facets(
         ),
     )
 
-    safe_group_limit = max(
-        1,
-        min(
-            group_limit,
-            4,
-        ),
-    )
-
     safe_option_limit = max(
         2,
         min(
@@ -1164,8 +1373,8 @@ async def build_product_facets(
             candidates_count=0,
         )
 
-    candidate_texts = [
-        build_product_search_text(
+    candidates = [
+        build_facet_candidate(
             product=product,
             brand=brand,
             category=category,
@@ -1175,71 +1384,75 @@ async def build_product_facets(
     ]
 
     candidates_count = len(
-        candidate_texts
+        candidates
     )
+
+    available_groups: list[
+        FacetGroup
+    ] = []
 
     schema = FACET_SCHEMAS.get(
         product_type,
         (),
     )
 
-    candidate_groups: list[
-        FacetGroup
-    ] = []
-
     for (
         facet_type,
         group_title,
         definitions,
+        priority,
     ) in schema:
-        group = build_facet_group(
+        group = build_definition_group(
             original_query=cleaned_query,
             facet_type=facet_type,
             group_title=group_title,
             definitions=definitions,
-            candidate_texts=candidate_texts,
+            candidates=candidates,
             candidates_count=candidates_count,
             option_limit=safe_option_limit,
+            priority=priority,
         )
 
         if group is not None:
-            candidate_groups.append(
+            available_groups.append(
                 group
             )
 
     if product_type == "молоко":
         fat_group = extract_fat_percentages(
             original_query=cleaned_query,
-            candidate_texts=candidate_texts,
+            candidates=candidates,
             candidates_count=candidates_count,
             option_limit=safe_option_limit,
+            priority=15,
         )
 
         if fat_group is not None:
-            candidate_groups.append(
+            available_groups.append(
                 fat_group
             )
 
-    candidate_groups.sort(
-        key=lambda group: (
-            len(group.options),
-            sum(
-                option.count
-                for option in group.options
-            ),
-        ),
-        reverse=True,
+    selected_group = select_next_group(
+        available_groups
     )
+
+    selected_groups: tuple[
+        FacetGroup,
+        ...
+    ]
+
+    if selected_group is None:
+        selected_groups = ()
+    else:
+        selected_groups = (
+            selected_group,
+        )
 
     return FacetSearchResult(
         original_query=cleaned_query,
         normalized_query=normalized_query,
         product_type=product_type,
-        groups=tuple(
-            candidate_groups[
-                :safe_group_limit
-            ]
-        ),
+        groups=selected_groups,
         candidates_count=candidates_count,
     )
 
@@ -1250,11 +1463,11 @@ def flatten_facet_options(
     limit: int = 6,
 ) -> list[dict[str, Any]]:
     """
-    Превращает группы фасетов в компактный
-    список кнопок для текущей клавиатуры.
+    Превращает выбранную группу
+    в список кнопок для Telegram.
 
-    Позже интерфейс сможет показывать
-    отдельные секции по группам.
+    Порядок вариантов сохраняется таким,
+    каким его определил Facet Engine.
     """
 
     safe_limit = max(
@@ -1265,22 +1478,10 @@ def flatten_facet_options(
         ),
     )
 
-    options: list[
-        FacetOption
-    ] = []
+    if not result.groups:
+        return []
 
-    for group in result.groups:
-        options.extend(
-            group.options
-        )
-
-    options.sort(
-        key=lambda option: (
-            option.count,
-            option.title,
-        ),
-        reverse=True,
-    )
+    group = result.groups[0]
 
     return [
         {
@@ -1291,8 +1492,9 @@ def flatten_facet_options(
                 option.facet_type.value
             ),
             "facet_key": option.key,
+            "group_title": group.title,
         }
-        for option in options[
+        for option in group.options[
             :safe_limit
         ]
-  ]
+    ]
