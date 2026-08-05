@@ -10,10 +10,10 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 
-from app.database.repositories.product_repository import (
-    search_products,
-)
 from app.database.session import async_session_maker
+from app.keyboards.decision_search import (
+    get_decision_search_keyboard,
+)
 from app.keyboards.product_family import (
     get_product_families_keyboard,
 )
@@ -22,16 +22,18 @@ from app.keyboards.search import (
     get_intent_groups_keyboard,
     get_search_suggestions_keyboard,
 )
-from app.search.engine import (
-    SearchMode,
-    run_search_engine,
-)
-from app.search.family_search import (
-    find_product_families,
+from app.search.decision_search import (
+    DecisionProduct,
+    DecisionSearchResult,
 )
 from app.search.intent_state import (
     clear_intent_groups,
     save_intent_groups,
+)
+from app.search.search_pipeline import (
+    SearchPipelineResult,
+    SearchPipelineScreen,
+    run_search_pipeline,
 )
 from app.services.price_service import (
     get_price_statistics,
@@ -115,7 +117,7 @@ def format_package(
 
     return (
         f"{format_number(package_value)} "
-        f"{escape(package_unit)}"
+        f"{escape(str(package_unit))}"
     )
 
 
@@ -134,9 +136,13 @@ def format_subtype(
     if not cleaned_subtype:
         return "не указан"
 
-    return escape(
+    formatted_subtype = (
         cleaned_subtype[0].upper()
         + cleaned_subtype[1:]
+    )
+
+    return escape(
+        formatted_subtype
     )
 
 
@@ -170,7 +176,7 @@ def build_product_title(
     """
 
     product_name = escape(
-        product.name
+        str(product.name)
     )
 
     if not is_real_brand(
@@ -179,7 +185,7 @@ def build_product_title(
         return f"<b>{product_name}</b>"
 
     return (
-        f"<b>{escape(brand.name)} — "
+        f"<b>{escape(str(brand.name))} — "
         f"{product_name}</b>"
     )
 
@@ -195,8 +201,8 @@ def calculate_data_quality_score(
     Оценивает полноту карточки товара.
 
     Этот показатель не оценивает качество самого
-    продукта. Он показывает, насколько достаточно
-    информации для принятия решения.
+    продукта. Он показывает полноту информации,
+    на которой основано решение MarkaRadar.
     """
 
     score = 0.0
@@ -208,10 +214,7 @@ def calculate_data_quality_score(
     if product_name:
         score += 20.0
 
-    if (
-        product_name
-        and len(product_name) >= 4
-    ):
+    if len(product_name) >= 4:
         score += 5.0
 
     if is_real_brand(
@@ -271,7 +274,8 @@ def format_explanation(
 
     return "\n".join(
         f"• {escape(reason)}"
-        for reason in trust_result.explanation
+        for reason
+        in trust_result.explanation
     )
 
 
@@ -281,8 +285,8 @@ def format_trust_engine_text(
     """
     Формирует главный блок решения MarkaRadar.
 
-    Этот блок всегда показывается раньше
-    технических характеристик товара.
+    Этот блок показывается раньше
+    технической информации о товаре.
     """
 
     lines = [
@@ -324,7 +328,8 @@ def format_trust_engine_text(
             ),
             (
                 "📊 <b>Доверие к данным:</b> "
-                f"{trust_result.trust_score:.0f} из 100"
+                f"{trust_result.trust_score:.0f} "
+                "из 100"
             ),
             "",
             "<b>Почему такой вывод:</b>",
@@ -430,14 +435,14 @@ def build_product_card(
     """
     Формирует карточку товара.
 
-    Порядок принципиально важен:
+    Порядок:
 
     1. решение MarkaRadar;
-    2. объяснение и доверие;
+    2. доверие и объяснение;
     3. название товара;
     4. цена;
-    5. технические характеристики;
-    6. возможность поставить оценку.
+    5. техническая информация;
+    6. предложение поставить оценку.
     """
 
     title = build_product_title(
@@ -452,6 +457,10 @@ def build_product_card(
 
     subtype_text = format_subtype(
         product.subtype
+    )
+
+    category_name = escape(
+        str(category.name)
     )
 
     product_lines = [
@@ -470,7 +479,7 @@ def build_product_card(
         "<b>Информация о товаре:</b>",
         (
             "📂 <b>Категория:</b> "
-            f"{escape(category.name)}"
+            f"{category_name}"
         ),
     ]
 
@@ -479,7 +488,7 @@ def build_product_card(
     ):
         product_lines.append(
             "🏷 <b>Бренд:</b> "
-            f"{escape(brand.name)}"
+            f"{escape(str(brand.name))}"
         )
     else:
         product_lines.append(
@@ -504,7 +513,7 @@ def build_product_card(
         product_lines.append(
             "🔢 <b>Штрихкод:</b> "
             f"<code>"
-            f"{escape(product.barcode)}"
+            f"{escape(str(product.barcode))}"
             f"</code>"
         )
 
@@ -529,8 +538,7 @@ async def send_search_loader(
     message: Message,
 ) -> Message | None:
     """
-    Сразу показывает пользователю,
-    что поиск начался.
+    Показывает пользователю, что поиск начался.
 
     Если GIF отсутствует, отправляет
     обычное текстовое сообщение.
@@ -550,8 +558,8 @@ async def send_search_loader(
 
         return await message.answer(
             "🔎 <b>Ищу подходящие товары…</b>\n"
-            "Проверяю оценки, доверие "
-            "и похожие варианты."
+            "Сравниваю совпадения, оценки "
+            "и надёжность результатов."
         )
 
     try:
@@ -575,8 +583,8 @@ async def send_search_loader(
 
         return await message.answer(
             "🔎 <b>Ищу подходящие товары…</b>\n"
-            "Проверяю оценки, доверие "
-            "и похожие варианты."
+            "Сравниваю совпадения, оценки "
+            "и надёжность результатов."
         )
 
 
@@ -660,7 +668,7 @@ async def show_single_product(
 ) -> None:
     """
     Загружает рейтинг и цены, запускает
-    Trust Engine и отправляет карточку.
+    Trust Engine и показывает карточку.
     """
 
     rating = await get_full_product_rating(
@@ -716,15 +724,312 @@ async def show_single_product(
     )
 
 
-async def show_product_families(
+def format_decision_product(
+    item: DecisionProduct,
+) -> str:
+    """
+    Форматирует товар для первого экрана решения.
+    """
+
+    if item.brand_name:
+        title = (
+            f"{escape(item.brand_name)} — "
+            f"{escape(item.name)}"
+        )
+    else:
+        title = escape(
+            item.name
+        )
+
+    if item.votes_count > 0:
+        rating_line = (
+            f"⭐ {item.average_rating:.1f} из 10"
+            f" · 👥 {item.votes_count}"
+        )
+    else:
+        rating_line = "⭐ Оценок пока нет"
+
+    return (
+        f"<b>{title}</b>\n"
+        f"{rating_line}\n"
+        f"{escape(item.trust_result.trust_title)}"
+    )
+
+
+def build_decision_screen_text(
+    *,
+    result: DecisionSearchResult,
+    query: str,
+    explanation: str | None,
+) -> str:
+    """
+    Формирует первый экран помощника выбора.
+    """
+
+    lines = [
+        "🎯 <b>Помощник выбора MarkaRadar</b>",
+        "",
+        f"Запрос: «{escape(query)}»",
+        "",
+    ]
+
+    if result.best_choice is not None:
+        lines.extend(
+            [
+                "🏆 <b>Лучший подтверждённый выбор</b>",
+                "",
+                format_decision_product(
+                    result.best_choice
+                ),
+                "",
+            ]
+        )
+
+        reasons = (
+            result.best_choice
+            .trust_result
+            .explanation
+        )
+
+        if reasons:
+            lines.extend(
+                [
+                    (
+                        "Почему рекомендуем: "
+                        f"{escape(reasons[0])}"
+                    ),
+                    "",
+                ]
+            )
+
+    else:
+        lines.extend(
+            [
+                "⚪ <b>Уверенного лидера пока нет</b>",
+                "",
+                (
+                    "Подходящие товары найдены, "
+                    "но данных пока недостаточно "
+                    "для надёжной рекомендации."
+                ),
+                "",
+            ]
+        )
+
+    if result.alternatives:
+        lines.extend(
+            [
+                "👍 <b>Подходящие варианты</b>",
+                (
+                    "Ниже — товары, которые лучше "
+                    "всего соответствуют запросу."
+                ),
+                "",
+            ]
+        )
+
+    if result.insufficient_data:
+        lines.extend(
+            [
+                "⚪ <b>Товары с небольшим "
+                "количеством оценок</b>",
+                (
+                    "Они подходят по запросу, "
+                    "но их рейтинг пока нельзя "
+                    "считать устойчивым."
+                ),
+                "",
+            ]
+        )
+
+    if explanation:
+        lines.extend(
+            [
+                f"ℹ️ {escape(explanation)}",
+                "",
+            ]
+        )
+
+    lines.append(
+        "Нажмите на товар, чтобы увидеть "
+        "подробную оценку и объяснение."
+    )
+
+    return "\n".join(
+        lines
+    )
+
+
+def build_decision_keyboard_result(
+    result: DecisionSearchResult,
+) -> DecisionSearchResult:
+    """
+    Подготавливает Decision Search для клавиатуры.
+
+    Пока callback-пагинация Decision Search
+    не подключена, кнопка «Показать ещё»
+    не отображается.
+    """
+
+    alternatives = list(
+        result.alternatives
+    )
+
+    insufficient_data = list(
+        result.insufficient_data
+    )
+
+    if (
+        result.best_choice is None
+        and not alternatives
+        and result.other_products
+    ):
+        alternatives = list(
+            result.other_products[:3]
+        )
+
+    return DecisionSearchResult(
+        query=result.query,
+        total_candidates=result.total_candidates,
+        best_choice=result.best_choice,
+        alternatives=alternatives,
+        insufficient_data=insufficient_data,
+        other_products=[],
+    )
+
+
+async def show_decision_screen(
     *,
     message: Message,
-    families: list[dict],
-    query: str,
+    pipeline_result: SearchPipelineResult,
 ) -> None:
     """
-    Показывает найденные виды товаров.
+    Показывает экран решения MarkaRadar.
     """
+
+    decision = pipeline_result.decision
+
+    if (
+        decision is None
+        or not decision.has_results
+    ):
+        await show_not_found_screen(
+            message=message,
+            query=pipeline_result.normalized_query,
+        )
+        return
+
+    keyboard_result = (
+        build_decision_keyboard_result(
+            decision
+        )
+    )
+
+    has_buttons = bool(
+        keyboard_result.best_choice
+        or keyboard_result.alternatives
+        or keyboard_result.insufficient_data
+    )
+
+    if has_buttons:
+        keyboard = get_decision_search_keyboard(
+            keyboard_result
+        )
+    else:
+        fallback_products = [
+            {
+                "product_id": item.product_id,
+                "name": item.name,
+                "brand": item.brand_name,
+                "score": (
+                    item.recommendation_score
+                ),
+            }
+            for item
+            in decision.other_products[:8]
+        ]
+
+        keyboard = get_search_suggestions_keyboard(
+            fallback_products
+        )
+
+    text = build_decision_screen_text(
+        result=keyboard_result,
+        query=pipeline_result.normalized_query,
+        explanation=pipeline_result.explanation,
+    )
+
+    await message.answer(
+        text,
+        reply_markup=keyboard,
+    )
+
+
+async def show_intents_screen(
+    *,
+    message: Message,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Показывает очищенные человеческие уточнения.
+    """
+
+    user = message.from_user
+    groups = pipeline_result.intent_groups
+
+    if not groups:
+        await show_decision_screen(
+            message=message,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    if user is None:
+        await show_decision_screen(
+            message=message,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    save_intent_groups(
+        chat_id=message.chat.id,
+        user_id=user.id,
+        groups=groups,
+    )
+
+    await message.answer(
+        "🧭 <b>Что именно вы ищете?</b>\n\n"
+        f"Запрос: «"
+        f"{escape(pipeline_result.normalized_query)}"
+        f"»\n\n"
+        "Выберите подходящий вариант. "
+        "Дальше MarkaRadar сравнит товары "
+        "по оценкам и уровню доверия:",
+        reply_markup=(
+            get_intent_groups_keyboard(
+                groups
+            )
+        ),
+    )
+
+
+async def show_families_screen(
+    *,
+    message: Message,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Показывает компактные виды товара.
+    """
+
+    families = pipeline_result.families
+
+    if not families:
+        await show_decision_screen(
+            message=message,
+            pipeline_result=pipeline_result,
+        )
+        return
 
     total_products = sum(
         int(
@@ -737,14 +1042,16 @@ async def show_product_families(
     )
 
     await message.answer(
-        "🧭 <b>Уточните, что именно нужно</b>\n\n"
-        f"Запрос: «{escape(query)}»\n"
-        f"Подходящих направлений: "
+        "🧭 <b>Уточните вид продукта</b>\n\n"
+        f"Запрос: «"
+        f"{escape(pipeline_result.normalized_query)}"
+        f"»\n"
+        f"Направлений: "
         f"<b>{len(families)}</b>\n"
         f"Товаров внутри: "
         f"<b>{total_products}</b>\n\n"
-        "После выбора MarkaRadar покажет "
-        "товары с учётом оценок и доверия:",
+        "После выбора MarkaRadar сравнит "
+        "подходящие товары по оценкам:",
         reply_markup=(
             get_product_families_keyboard(
                 families
@@ -753,69 +1060,108 @@ async def show_product_families(
     )
 
 
-async def show_fallback_products(
+async def show_not_found_screen(
     *,
     message: Message,
-    session,
     query: str,
 ) -> None:
     """
-    Выполняет резервный расширенный поиск.
+    Показывает понятный экран отсутствия результатов.
     """
 
-    products = await search_products(
-        session=session,
-        query=query,
-        limit=20,
+    await message.answer(
+        "🔍 <b>Подходящих товаров не найдено</b>\n\n"
+        f"Запрос: «{escape(query)}»\n\n"
+        "Попробуйте:\n"
+        "• написать название короче;\n"
+        "• убрать лишние характеристики;\n"
+        "• указать бренд;\n"
+        "• проверить написание;\n"
+        "• отправить штрихкод."
     )
 
-    if not products:
-        await message.answer(
-            "🔍 По вашему запросу "
-            "ничего не найдено.\n\n"
-            "Попробуйте:\n"
-            "• написать название короче;\n"
-            "• указать бренд;\n"
-            "• проверить написание;\n"
-            "• отправить штрихкод."
-        )
-        return
 
-    if len(products) == 1:
-        product, brand, category = (
-            products[0]
+async def process_pipeline_result(
+    *,
+    message: Message,
+    session,
+    pipeline_result: SearchPipelineResult,
+) -> None:
+    """
+    Показывает экран, выбранный Search Pipeline.
+    """
+
+    user = message.from_user
+
+    if (
+        pipeline_result.screen
+        != SearchPipelineScreen.INTENTS
+        and user is not None
+    ):
+        clear_intent_groups(
+            chat_id=message.chat.id,
+            user_id=user.id,
         )
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.BARCODE_PRODUCT
+    ):
+        barcode_product = (
+            pipeline_result.barcode_product
+        )
+
+        if barcode_product is None:
+            await show_not_found_screen(
+                message=message,
+                query=(
+                    pipeline_result.normalized_query
+                ),
+            )
+            return
 
         await show_single_product(
             message=message,
             session=session,
-            product=product,
-            brand=brand,
-            category=category,
+            product=barcode_product.product,
+            brand=barcode_product.brand,
+            category=barcode_product.category,
         )
         return
 
-    fallback_suggestions = [
-        {
-            "product_id": product.id,
-            "name": product.name,
-            "brand": brand.name,
-            "score": 0.0,
-        }
-        for product, brand, _category
-        in products[:8]
-    ]
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.INTENTS
+    ):
+        await show_intents_screen(
+            message=message,
+            pipeline_result=pipeline_result,
+        )
+        return
 
-    await message.answer(
-        "🔍 <b>Подходящие варианты</b>\n\n"
-        f"Запрос: «{escape(query)}»\n"
-        "Выберите товар — MarkaRadar покажет "
-        "его оценку и надёжность:",
-        reply_markup=(
-            get_search_suggestions_keyboard(
-                fallback_suggestions
-            )
-        ),
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.FAMILIES
+    ):
+        await show_families_screen(
+            message=message,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.DECISION
+    ):
+        await show_decision_screen(
+            message=message,
+            pipeline_result=pipeline_result,
+        )
+        return
+
+    await show_not_found_screen(
+        message=message,
+        query=pipeline_result.normalized_query,
     )
 
 
@@ -826,13 +1172,9 @@ async def search_handler(
     """
     Главный обработчик поиска MarkaRadar.
 
-    Порядок:
-
-    1. Поиск по штрихкоду.
-    2. Уточняющие группы.
-    3. Семейства товаров.
-    4. Конкретные товары.
-    5. Резервный расширенный поиск.
+    Этот обработчик не принимает поисковых решений
+    самостоятельно. Он вызывает только единый
+    Search Pipeline.
     """
 
     if message.text is None:
@@ -842,8 +1184,8 @@ async def search_handler(
 
     if not query:
         await message.answer(
-            "Введите название продукта "
-            "или бренда."
+            "Введите название продукта, "
+            "бренда или штрихкод."
         )
         return
 
@@ -856,136 +1198,46 @@ async def search_handler(
 
     try:
         async with async_session_maker() as session:
-            user = message.from_user
-
-            if query.isdigit():
-                barcode_products = await search_products(
+            pipeline_result = (
+                await run_search_pipeline(
                     session=session,
                     query=query,
-                    limit=1,
+                    intent_limit=6,
+                    family_limit=6,
+                    decision_candidates_limit=20,
                 )
-
-                if barcode_products:
-                    product, brand, category = (
-                        barcode_products[0]
-                    )
-
-                    await show_single_product(
-                        message=message,
-                        session=session,
-                        product=product,
-                        brand=brand,
-                        category=category,
-                    )
-                    return
-
-            engine_result = await run_search_engine(
-                session=session,
-                query=query,
-                intent_limit=8,
-                suggestion_limit=8,
             )
 
-            if (
-                engine_result.mode
-                == SearchMode.INTENTS
-            ):
-                if user is None:
-                    await show_fallback_products(
-                        message=message,
-                        session=session,
-                        query=query,
-                    )
-                    return
-
-                groups_as_dicts = [
-                    {
-                        "title": group["title"],
-                        "query": group["query"],
-                        "count": group["count"],
-                    }
-                    for group
-                    in engine_result.intent_groups
-                ]
-
-                save_intent_groups(
-                    chat_id=message.chat.id,
-                    user_id=user.id,
-                    groups=groups_as_dicts,
-                )
-
-                await message.answer(
-                    "🧭 <b>Что именно "
-                    "вы ищете?</b>\n\n"
-                    f"Запрос: «{escape(query)}»\n"
-                    "Выберите подходящий вариант:",
-                    reply_markup=(
-                        get_intent_groups_keyboard(
-                            groups_as_dicts
-                        )
-                    ),
-                )
-                return
-
-            families = await find_product_families(
-                session=session,
-                query=query,
-                limit=10,
+            logger.info(
+                "Search Pipeline: query=%r, screen=%s, "
+                "intents=%s, families=%s, candidates=%s",
+                query,
+                pipeline_result.screen,
+                len(
+                    pipeline_result.intent_groups
+                ),
+                len(
+                    pipeline_result.families
+                ),
+                (
+                    pipeline_result
+                    .decision
+                    .total_candidates
+                    if pipeline_result.decision
+                    else 0
+                ),
             )
 
-            if families:
-                if user is not None:
-                    clear_intent_groups(
-                        chat_id=message.chat.id,
-                        user_id=user.id,
-                    )
-
-                await show_product_families(
-                    message=message,
-                    families=families,
-                    query=query,
-                )
-                return
-
-            if (
-                engine_result.mode
-                == SearchMode.PRODUCTS
-            ):
-                if user is not None:
-                    clear_intent_groups(
-                        chat_id=message.chat.id,
-                        user_id=user.id,
-                    )
-
-                await message.answer(
-                    "🔍 <b>Лучшие совпадения</b>\n\n"
-                    f"Запрос: «{escape(query)}»\n"
-                    "Выберите товар — MarkaRadar "
-                    "покажет оценку и уровень доверия:",
-                    reply_markup=(
-                        get_search_suggestions_keyboard(
-                            engine_result
-                            .product_suggestions
-                        )
-                    ),
-                )
-                return
-
-            if user is not None:
-                clear_intent_groups(
-                    chat_id=message.chat.id,
-                    user_id=user.id,
-                )
-
-            await show_fallback_products(
+            await process_pipeline_result(
                 message=message,
                 session=session,
-                query=query,
+                pipeline_result=pipeline_result,
             )
 
     except Exception:
         logger.exception(
-            "Ошибка поиска по запросу: %s",
+            "Ошибка Search Pipeline "
+            "по запросу: %s",
             query,
         )
 
