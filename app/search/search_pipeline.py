@@ -130,13 +130,12 @@ def is_broad_query(
     query: str,
 ) -> bool:
     """
-    Широкий запрос обычно состоит
-    из одного или двух слов.
+    Определяет широкий запрос.
 
-    Примеры:
-    молоко
-    растворимый кофе
-    сельдь
+    Примеры широких запросов:
+    - молоко;
+    - кофе;
+    - растворимый кофе.
     """
 
     return len(
@@ -151,13 +150,15 @@ def should_show_facets(
     decision: DecisionSearchResult,
 ) -> bool:
     """
-    Решает, нужно ли сначала показать уточнения.
+    Решает, нужно ли показывать фасеты.
 
-    Фасеты показываются только для широкого запроса,
-    если нет подтверждённого лучшего выбора.
+    Они нужны только для широкого запроса,
+    если уверенного лидера пока нет.
     """
 
-    if not is_broad_query(query):
+    if not is_broad_query(
+        query
+    ):
         return False
 
     if len(facet_options) < 2:
@@ -202,7 +203,8 @@ def normalize_family_name(
     value: str,
 ) -> str:
     """
-    Нормализует семейство для удаления дублей.
+    Нормализует название семейства
+    для удаления дублей.
     """
 
     return " ".join(
@@ -221,9 +223,6 @@ def prepare_families(
 ) -> list[dict[str, Any]]:
     """
     Удаляет пустые и повторяющиеся семейства.
-
-    Семейства временно остаются резервным способом
-    уточнения для категорий без Facet Engine.
     """
 
     safe_limit = max(
@@ -298,14 +297,16 @@ def should_show_families(
     """
     Семейства используются только как резерв.
 
-    Если Facet Engine уже построил понятные кнопки,
+    Если Facet Engine уже дал понятные кнопки,
     семейства не показываются.
     """
 
     if facet_options:
         return False
 
-    if not is_broad_query(query):
+    if not is_broad_query(
+        query
+    ):
         return False
 
     if len(families) < 2:
@@ -356,21 +357,19 @@ async def run_search_pipeline(
     intent_limit: int = 6,
     family_limit: int = 6,
     decision_candidates_limit: int = 20,
+    allow_refinements: bool = True,
 ) -> SearchPipelineResult:
     """
     Единственная точка входа поиска MarkaRadar.
 
-    Порядок:
+    allow_refinements=True:
+        обычный пользовательский запрос может
+        показать фасеты или семейства.
 
-    1. очистка запроса;
-    2. точный поиск по штрихкоду;
-    3. поиск и оценка товарных кандидатов;
-    4. построение управляемых фасетов;
-    5. резервное получение семейств;
-    6. выбор наиболее полезного экрана.
-
-    Старые автоматически сгенерированные
-    intent-группы здесь больше не используются.
+    allow_refinements=False:
+        пользователь уже выбрал уточнение,
+        поэтому Pipeline обязан перейти к товарам
+        и не создавать новый уровень навигации.
     """
 
     cleaned_query = clean_pipeline_query(
@@ -422,8 +421,8 @@ async def run_search_pipeline(
                 ),
             )
 
-    # Decision Search ищет кандидатов
-    # и оценивает их с помощью Trust Engine.
+    # Decision Search — основной источник
+    # товарных кандидатов и решений.
     decision = await run_decision_search(
         session=session,
         query=cleaned_query,
@@ -435,45 +434,94 @@ async def run_search_pipeline(
         other_limit=10,
     )
 
-    # Facet Engine строит только разрешённые,
-    # понятные человеку уточнения.
-    facet_result = await build_product_facets(
-        session=session,
-        query=cleaned_query,
-        candidates_limit=max(
-            decision_candidates_limit,
-            50,
-        ),
-        group_limit=2,
-        option_limit=5,
-    )
+    facet_options: list[
+        dict[str, Any]
+    ] = []
 
-    facet_options = flatten_facet_options(
-        facet_result,
-        limit=intent_limit,
-    )
+    families: list[
+        dict[str, Any]
+    ] = []
 
-    # Семейства остаются только резервом
-    # для продуктов, которых ещё нет
-    # в контролируемой схеме Facet Engine.
-    raw_families = await find_product_families(
-        session=session,
-        query=cleaned_query,
-        limit=max(
-            family_limit * 2,
-            10,
-        ),
-    )
+    # После выбора первого уточнения больше
+    # не строим фасеты и семейства.
+    if allow_refinements:
+        facet_result = await build_product_facets(
+            session=session,
+            query=cleaned_query,
+            candidates_limit=max(
+                decision_candidates_limit,
+                50,
+            ),
+            group_limit=2,
+            option_limit=5,
+        )
 
-    families = prepare_families(
-        raw_families,
-        limit=family_limit,
-    )
+        facet_options = flatten_facet_options(
+            facet_result,
+            limit=intent_limit,
+        )
 
-    # Конкретный запрос сразу ведёт к товарам.
+        # Семейства остаются резервом
+        # для категорий без контролируемых фасетов.
+        raw_families = (
+            await find_product_families(
+                session=session,
+                query=cleaned_query,
+                limit=max(
+                    family_limit * 2,
+                    10,
+                ),
+            )
+        )
+
+        families = prepare_families(
+            raw_families,
+            limit=family_limit,
+        )
+
+    # После нажатия на фасет пользователь уже
+    # уточнил запрос. Второй вопрос не задаём.
+    if not allow_refinements:
+        if decision.has_results:
+            return SearchPipelineResult(
+                screen=SearchPipelineScreen.DECISION,
+                original_query=query,
+                normalized_query=cleaned_query,
+                barcode_product=None,
+                intent_groups=[],
+                families=[],
+                decision=decision,
+                corrected_query=None,
+                explanation=(
+                    "Уточнение применено. "
+                    "MarkaRadar показывает "
+                    "наиболее подходящие товары "
+                    "с учётом оценок и доверия."
+                ),
+            )
+
+        return SearchPipelineResult(
+            screen=SearchPipelineScreen.NOT_FOUND,
+            original_query=query,
+            normalized_query=cleaned_query,
+            barcode_product=None,
+            intent_groups=[],
+            families=[],
+            decision=None,
+            corrected_query=None,
+            explanation=(
+                "По выбранному уточнению "
+                "подходящих товаров не найдено."
+            ),
+        )
+
+    # Конкретный текстовый запрос сразу
+    # приводит к товарам.
     if (
         decision.has_results
-        and not is_broad_query(cleaned_query)
+        and not is_broad_query(
+            cleaned_query
+        )
     ):
         return SearchPipelineResult(
             screen=SearchPipelineScreen.DECISION,
@@ -491,8 +539,8 @@ async def run_search_pipeline(
             ),
         )
 
-    # Если есть подтверждённый лидер,
-    # не заставляем пользователя уточнять запрос.
+    # Если найден подтверждённый лидер,
+    # не создаём лишний шаг.
     if (
         decision.has_results
         and decision.has_confirmed_choice
@@ -512,8 +560,8 @@ async def run_search_pipeline(
             ),
         )
 
-    # Для широкого запроса без лидера
-    # показываем управляемые фасеты.
+    # Для широкого запроса показываем
+    # только контролируемые фасеты.
     if should_show_facets(
         query=cleaned_query,
         facet_options=facet_options,
@@ -535,7 +583,8 @@ async def run_search_pipeline(
             ),
         )
 
-    # Резерв для пока неподдерживаемых категорий.
+    # Семейства — только резерв для пока
+    # неподдерживаемых Facet Engine категорий.
     if should_show_families(
         query=cleaned_query,
         families=families,
@@ -557,8 +606,8 @@ async def run_search_pipeline(
             ),
         )
 
-    # Если товары найдены, показываем честный
-    # экран решения даже при недостатке оценок.
+    # Если товары найдены, показываем решение
+    # даже при недостатке оценок.
     if decision.has_results:
         return SearchPipelineResult(
             screen=SearchPipelineScreen.DECISION,
