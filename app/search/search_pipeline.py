@@ -12,11 +12,13 @@ from app.search.decision_search import (
     run_decision_search,
 )
 from app.search.engine import (
-    SearchMode,
     run_search_engine,
 )
 from app.search.family_search import (
     find_product_families,
+)
+from app.search.human_intents import (
+    prepare_human_intents,
 )
 
 
@@ -163,7 +165,7 @@ def should_use_intents(
     if len(query_words) > 2:
         return False
 
-    if len(intent_groups) < 3:
+    if len(intent_groups) < 2:
         return False
 
     return True
@@ -233,6 +235,23 @@ def family_quality_key(
     )
 
 
+def normalize_family_name(
+    value: str,
+) -> str:
+    """
+    Нормализует название семейства
+    для поиска дублей.
+    """
+
+    return " ".join(
+        value
+        .strip()
+        .lower()
+        .replace("ё", "е")
+        .split()
+    )
+
+
 def prepare_families(
     families: list[dict[str, Any]],
     *,
@@ -266,10 +285,8 @@ def prepare_families(
             )
         ).strip()
 
-        normalized_name = (
+        normalized_name = normalize_family_name(
             family_name
-            .lower()
-            .replace("ё", "е")
         )
 
         if not normalized_name:
@@ -305,13 +322,15 @@ def prepare_families(
 def prepare_intent_groups(
     groups: list[Any],
     *,
-    limit: int = 6,
+    limit: int = 18,
 ) -> list[dict[str, Any]]:
     """
     Приводит группы старого Search Engine
-    к единому формату Pipeline.
+    к единому техническому формату.
 
-    Удаляет пустые и повторяющиеся варианты.
+    На этом этапе варианты ещё не показываются
+    пользователю. После этого они обязательно
+    проходят через prepare_human_intents().
     """
 
     prepared_groups: list[
@@ -319,6 +338,14 @@ def prepare_intent_groups(
     ] = []
 
     seen_queries: set[str] = set()
+
+    safe_limit = max(
+        1,
+        min(
+            limit,
+            50,
+        ),
+    )
 
     for group in groups:
         title = str(
@@ -342,10 +369,11 @@ def prepare_intent_groups(
             )
         )
 
-        normalized_group_query = (
+        normalized_group_query = " ".join(
             group_query
             .lower()
             .replace("ё", "е")
+            .split()
         )
 
         if not title or not group_query:
@@ -369,7 +397,7 @@ def prepare_intent_groups(
             }
         )
 
-        if len(prepared_groups) >= limit:
+        if len(prepared_groups) >= safe_limit:
             break
 
     return prepared_groups
@@ -422,10 +450,11 @@ async def run_search_pipeline(
 
     1. очищает запрос;
     2. проверяет штрихкод;
-    3. получает возможные уточнения;
-    4. получает компактные семейства;
-    5. запускает Decision Search;
-    6. выбирает наиболее полезный экран.
+    3. получает технические уточнения;
+    4. превращает их в человеческие варианты;
+    5. получает компактные семейства;
+    6. запускает Decision Search;
+    7. выбирает наиболее полезный экран.
 
     Главный принцип:
 
@@ -471,9 +500,7 @@ async def run_search_pipeline(
                 ),
                 original_query=query,
                 normalized_query=cleaned_query,
-                barcode_product=(
-                    barcode_product
-                ),
+                barcode_product=barcode_product,
                 intent_groups=[],
                 families=[],
                 decision=None,
@@ -485,17 +512,41 @@ async def run_search_pipeline(
             )
 
     # Старый Search Engine временно используется
-    # как поставщик уточняющих групп.
-    # Позже его заменит новый Query Parser.
+    # только как поставщик технических групп.
+    #
+    # Запрашиваем больше вариантов, чем покажем,
+    # потому что часть из них будет удалена
+    # как мусор, технические слова или дубли.
+    technical_intent_limit = max(
+        intent_limit * 3,
+        18,
+    )
+
     engine_result = await run_search_engine(
         session=session,
         query=cleaned_query,
-        intent_limit=intent_limit,
+        intent_limit=technical_intent_limit,
         suggestion_limit=8,
     )
 
-    intent_groups = prepare_intent_groups(
-        engine_result.intent_groups,
+    technical_intent_groups = (
+        prepare_intent_groups(
+            engine_result.intent_groups,
+            limit=technical_intent_limit,
+        )
+    )
+
+    # Пользователь никогда не должен видеть
+    # технические названия из базы.
+    #
+    # На этом этапе:
+    # - удаляются английские служебные слова;
+    # - сокращаются длинные варианты;
+    # - объединяются дубли;
+    # - создаются понятные человеку кнопки.
+    intent_groups = prepare_human_intents(
+        original_query=cleaned_query,
+        groups=technical_intent_groups,
         limit=intent_limit,
     )
 
@@ -549,8 +600,8 @@ async def run_search_pipeline(
             ),
         )
 
-    # Для конкретного запроса также показываем
-    # товары сразу, даже если оценок пока мало.
+    # Для конкретного запроса показываем товары
+    # сразу, даже если оценок пока мало.
     query_words_count = len(
         cleaned_query.split()
     )
@@ -575,7 +626,7 @@ async def run_search_pipeline(
         )
 
     # Для широкого запроса сначала предлагаем
-    # максимум несколько понятных направлений.
+    # несколько коротких человеческих уточнений.
     if should_use_intents(
         query=cleaned_query,
         intent_groups=intent_groups,
@@ -596,6 +647,8 @@ async def run_search_pipeline(
             ),
         )
 
+    # Если человеческих уточнений недостаточно,
+    # можно использовать компактные семейства.
     if should_use_families(
         query=cleaned_query,
         families=families,
