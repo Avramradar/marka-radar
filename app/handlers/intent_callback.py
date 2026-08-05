@@ -1,10 +1,12 @@
 import logging
 from dataclasses import replace
 from html import escape
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
+from aiogram.types import InlineKeyboardMarkup
 
 from app.database.session import async_session_maker
 from app.keyboards.decision_search import (
@@ -40,18 +42,24 @@ def format_decision_product(
     item: DecisionProduct,
 ) -> str:
     """
-    Форматирует товар для экрана выбора.
+    Форматирует товар для экрана решения.
     """
 
-    if item.brand_name:
+    product_name = escape(
+        str(item.name)
+    )
+
+    brand_name = str(
+        item.brand_name or ""
+    ).strip()
+
+    if brand_name:
         title = (
-            f"{escape(item.brand_name)} — "
-            f"{escape(item.name)}"
+            f"{escape(brand_name)} — "
+            f"{product_name}"
         )
     else:
-        title = escape(
-            item.name
-        )
+        title = product_name
 
     if item.votes_count > 0:
         rating_text = (
@@ -59,14 +67,18 @@ def format_decision_product(
             f" · 👥 {item.votes_count}"
         )
     else:
-        rating_text = (
-            "⭐ Оценок пока нет"
+        rating_text = "⭐ Оценок пока нет"
+
+    trust_title = escape(
+        str(
+            item.trust_result.trust_title
         )
+    )
 
     return (
         f"<b>{title}</b>\n"
         f"{rating_text}\n"
-        f"🛡 {escape(item.trust_result.trust_title)}"
+        f"🛡 {trust_title}"
     )
 
 
@@ -76,14 +88,18 @@ def prepare_decision_result(
     """
     Подготавливает компактную выдачу.
 
-    Пока callback-пагинация Decision Search
+    Пока отдельная пагинация Decision Search
     не подключена, остальные товары не передаются
-    в клавиатуру, чтобы не создавать неработающую
-    кнопку «Показать ещё».
+    в клавиатуру. Это исключает появление
+    неработающей кнопки «Показать ещё».
     """
 
     alternatives = list(
         result.alternatives
+    )
+
+    insufficient_data = list(
+        result.insufficient_data
     )
 
     if (
@@ -98,6 +114,7 @@ def prepare_decision_result(
     return replace(
         result,
         alternatives=alternatives,
+        insufficient_data=insufficient_data,
         other_products=[],
     )
 
@@ -142,7 +159,7 @@ def build_decision_text(
                 [
                     (
                         "Почему рекомендуем: "
-                        f"{escape(reasons[0])}"
+                        f"{escape(str(reasons[0]))}"
                     ),
                     "",
                 ]
@@ -180,16 +197,25 @@ def build_decision_text(
                 "⚪ <b>Мало данных</b>",
                 (
                     "У этих товаров пока слишком "
-                    "мало оценок для устойчивого вывода."
+                    "мало оценок для устойчивого "
+                    "вывода."
                 ),
                 "",
             ]
         )
 
     if explanation:
-        lines.append(
-            f"ℹ️ {escape(explanation)}"
+        lines.extend(
+            [
+                f"ℹ️ {escape(explanation)}",
+                "",
+            ]
         )
+
+    lines.append(
+        "Нажмите на товар, чтобы открыть "
+        "подробную карточку и поставить оценку."
+    )
 
     return "\n".join(
         lines
@@ -200,10 +226,10 @@ async def edit_or_send(
     *,
     callback: CallbackQuery,
     text: str,
-    reply_markup=None,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     """
-    Пытается заменить текущее сообщение.
+    Пытается заменить исходное сообщение.
 
     Если Telegram не разрешает редактирование,
     отправляет новое сообщение.
@@ -238,6 +264,28 @@ async def edit_or_send(
         )
 
 
+async def show_not_found(
+    *,
+    callback: CallbackQuery,
+    query: str,
+) -> None:
+    """
+    Показывает отсутствие результатов
+    после выбора уточнения.
+    """
+
+    await edit_or_send(
+        callback=callback,
+        text=(
+            "🔍 <b>Подходящих товаров "
+            "не найдено</b>\n\n"
+            f"Запрос: «{escape(query)}»\n\n"
+            "Попробуйте выбрать другое уточнение "
+            "или выполнить новый поиск."
+        ),
+    )
+
+
 async def show_pipeline_decision(
     *,
     callback: CallbackQuery,
@@ -253,16 +301,9 @@ async def show_pipeline_decision(
         decision is None
         or not decision.has_results
     ):
-        await edit_or_send(
+        await show_not_found(
             callback=callback,
-            text=(
-                "🔍 <b>Подходящих товаров "
-                "не найдено</b>\n\n"
-                f"Запрос: «"
-                f"{escape(pipeline_result.normalized_query)}"
-                f"»\n\n"
-                "Попробуйте выбрать другое уточнение."
-            ),
+            query=pipeline_result.normalized_query,
         )
         return
 
@@ -276,13 +317,12 @@ async def show_pipeline_decision(
         or prepared_result.insufficient_data
     )
 
-    keyboard = (
-        get_decision_search_keyboard(
+    keyboard = None
+
+    if has_buttons:
+        keyboard = get_decision_search_keyboard(
             prepared_result
         )
-        if has_buttons
-        else None
-    )
 
     text = build_decision_text(
         query=pipeline_result.normalized_query,
@@ -305,8 +345,9 @@ async def show_pipeline_intents(
     """
     Показывает следующий уровень фасетов.
 
-    Это возможно, если после первого уточнения
-    запрос всё ещё остаётся широким.
+    При allow_refinements=False этот экран
+    обычно не должен возвращаться. Функция
+    оставлена как безопасная обработка результата.
     """
 
     if callback.message is None:
@@ -334,9 +375,9 @@ async def show_pipeline_intents(
             f"Запрос: «"
             f"{escape(pipeline_result.normalized_query)}"
             f"»\n\n"
-            "Можно выбрать ещё одну характеристику. "
-            "После этого MarkaRadar сравнит товары "
-            "по оценкам и уровню доверия:"
+            "Выберите подходящую характеристику. "
+            "После этого MarkaRadar сравнит "
+            "товары по оценкам и доверию:"
         ),
         reply_markup=(
             get_intent_groups_keyboard(
@@ -353,6 +394,9 @@ async def show_pipeline_families(
 ) -> None:
     """
     Показывает резервные семейства товаров.
+
+    При allow_refinements=False этот экран
+    также не должен возвращаться.
     """
 
     families = pipeline_result.families
@@ -387,8 +431,11 @@ async def process_callback_pipeline_result(
     pipeline_result: SearchPipelineResult,
 ) -> None:
     """
-    Отображает экран, выбранный Search Pipeline.
+    Показывает экран, выбранный Search Pipeline.
     """
+
+    if callback.message is None:
+        return
 
     if (
         pipeline_result.screen
@@ -425,17 +472,9 @@ async def process_callback_pipeline_result(
         )
         return
 
-    await edit_or_send(
+    await show_not_found(
         callback=callback,
-        text=(
-            "🔍 <b>Подходящих товаров "
-            "не найдено</b>\n\n"
-            f"Запрос: «"
-            f"{escape(pipeline_result.normalized_query)}"
-            f"»\n\n"
-            "Попробуйте выбрать другое уточнение "
-            "или выполнить новый поиск."
-        ),
+        query=pipeline_result.normalized_query,
     )
 
 
@@ -448,16 +487,21 @@ async def intent_callback_handler(
     """
     Обрабатывает выбор фасета.
 
-    Главное отличие от старой версии:
+    Старый сценарий:
 
-    Раньше:
-        фасет → search_products(limit=100)
+        фасет
+        → search_products(limit=100)
         → каталог с пагинацией.
 
-    Теперь:
-        фасет → Search Pipeline
+    Новый сценарий:
+
+        фасет
+        → Search Pipeline
         → Decision Search
         → лучший выбор и альтернативы.
+
+    После выбора фасета повторные уточнения
+    отключаются через allow_refinements=False.
     """
 
     if callback.data is None:
@@ -508,6 +552,13 @@ async def intent_callback_handler(
         )
     ).strip()
 
+    title = str(
+        group.get(
+            "title",
+            query,
+        )
+    ).strip()
+
     if not query:
         await callback.answer(
             "Пустой поисковый запрос",
@@ -528,6 +579,7 @@ async def intent_callback_handler(
                     intent_limit=6,
                     family_limit=6,
                     decision_candidates_limit=30,
+                    allow_refinements=False,
                 )
             )
 
@@ -545,16 +597,11 @@ async def intent_callback_handler(
         return
 
     logger.info(
-        "Facet callback: query=%r, screen=%s, "
-        "intents=%s, families=%s, candidates=%s",
+        "Facet callback: title=%r, query=%r, "
+        "screen=%s, candidates=%s",
+        title,
         query,
         pipeline_result.screen,
-        len(
-            pipeline_result.intent_groups
-        ),
-        len(
-            pipeline_result.families
-        ),
         (
             pipeline_result
             .decision
