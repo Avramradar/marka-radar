@@ -14,6 +14,9 @@ from app.database.repositories.product_repository import (
     search_products,
 )
 from app.database.session import async_session_maker
+from app.keyboards.product_family import (
+    get_product_families_keyboard,
+)
 from app.keyboards.rating import get_rating_keyboard
 from app.keyboards.search import (
     get_intent_groups_keyboard,
@@ -23,11 +26,16 @@ from app.search.engine import (
     SearchMode,
     run_search_engine,
 )
+from app.search.family_search import (
+    find_product_families,
+)
 from app.search.intent_state import (
     clear_intent_groups,
     save_intent_groups,
 )
-from app.services.price_service import get_price_statistics
+from app.services.price_service import (
+    get_price_statistics,
+)
 from app.services.rating_service import (
     get_full_product_rating,
 )
@@ -59,10 +67,17 @@ def format_number(
     if value is None:
         return ""
 
-    decimal_value = Decimal(str(value))
+    decimal_value = Decimal(
+        str(value)
+    )
 
-    if decimal_value == decimal_value.to_integral():
-        return str(int(decimal_value))
+    if (
+        decimal_value
+        == decimal_value.to_integral()
+    ):
+        return str(
+            int(decimal_value)
+        )
 
     return format(
         decimal_value.normalize(),
@@ -74,7 +89,14 @@ def format_package(
     package_value: Decimal | float | int | None,
     package_unit: str | None,
 ) -> str:
-    if package_value is None or not package_unit:
+    """
+    Форматирует вес или объём упаковки.
+    """
+
+    if (
+        package_value is None
+        or not package_unit
+    ):
         return "не указана"
 
     return (
@@ -86,6 +108,10 @@ def format_package(
 def format_subtype(
     subtype: str | None,
 ) -> str:
+    """
+    Форматирует подтип товара.
+    """
+
     if not subtype:
         return "не указан"
 
@@ -103,6 +129,10 @@ def format_subtype(
 def format_rating_text(
     rating: dict[str, float | int],
 ) -> str:
+    """
+    Форматирует пользовательский рейтинг.
+    """
+
     votes_count = int(
         rating["votes_count"]
     )
@@ -118,7 +148,9 @@ def format_rating_text(
         )
 
     if votes_count < 5:
-        confidence = "пока недостаточно подтверждён"
+        confidence = (
+            "пока недостаточно подтверждён"
+        )
     elif votes_count < 20:
         confidence = "средняя"
     else:
@@ -137,6 +169,10 @@ def format_rating_text(
 def format_price_text(
     price_stats: dict[str, Any] | None,
 ) -> str:
+    """
+    Форматирует статистику цен.
+    """
+
     if price_stats is None:
         return (
             "💰 <b>Цена пока не собрана</b>\n"
@@ -192,7 +228,8 @@ def format_price_text(
 
     if spread >= 500:
         lines.append(
-            "⚠️ <b>Очень большая разница в цене.</b>\n"
+            "⚠️ <b>Очень большая разница "
+            "в цене.</b>\n"
             "Перед покупкой обязательно "
             "сравните магазины."
         )
@@ -204,7 +241,9 @@ def format_price_text(
             "перед покупкой."
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 def build_product_card(
@@ -215,6 +254,10 @@ def build_product_card(
     rating: dict[str, float | int],
     price_stats: dict[str, Any] | None,
 ) -> str:
+    """
+    Формирует полную карточку товара.
+    """
+
     title = (
         f"<b>{escape(brand.name)} — "
         f"{escape(product.name)}</b>"
@@ -253,28 +296,37 @@ def build_product_card(
     if product.barcode:
         product_lines.append(
             "🔢 <b>Штрихкод:</b> "
-            f"<code>{escape(product.barcode)}</code>"
+            f"<code>"
+            f"{escape(product.barcode)}"
+            f"</code>"
         )
 
     product_lines.extend(
         [
             "",
-            format_price_text(price_stats),
+            format_price_text(
+                price_stats
+            ),
             "",
-            format_rating_text(rating),
+            format_rating_text(
+                rating
+            ),
             "",
             "Поставьте свою оценку 👇",
         ]
     )
 
-    return "\n".join(product_lines)
+    return "\n".join(
+        product_lines
+    )
 
 
 async def send_search_loader(
     message: Message,
 ) -> Message | None:
     """
-    Сразу показывает пользователю, что поиск начался.
+    Сразу показывает пользователю,
+    что поиск начался.
 
     Если GIF отсутствует, отправляет
     обычное текстовое сообщение.
@@ -294,7 +346,7 @@ async def send_search_loader(
 
         return await message.answer(
             "🔎 <b>Ищу товары…</b>\n"
-            "Проверяю названия, бренды "
+            "Проверяю виды товаров, бренды "
             "и похожие варианты."
         )
 
@@ -307,7 +359,8 @@ async def send_search_loader(
             animation=animation,
             caption=(
                 "🏃 <b>Бегу вдоль витрин…</b>\n"
-                "Ищу подходящие товары и бренды."
+                "Ищу виды товаров, бренды "
+                "и лучшие совпадения."
             ),
         )
 
@@ -318,7 +371,7 @@ async def send_search_loader(
 
         return await message.answer(
             "🔎 <b>Ищу товары…</b>\n"
-            "Проверяю названия, бренды "
+            "Проверяю виды товаров, бренды "
             "и похожие варианты."
         )
 
@@ -347,6 +400,10 @@ async def send_product_card(
     rating: dict[str, float | int],
     price_stats: dict[str, Any] | None,
 ) -> None:
+    """
+    Отправляет карточку товара.
+    """
+
     card_text = build_product_card(
         product=product,
         brand=brand,
@@ -422,6 +479,48 @@ async def show_single_product(
     )
 
 
+async def show_product_families(
+    *,
+    message: Message,
+    families: list[dict],
+    query: str,
+) -> None:
+    """
+    Показывает найденные семейства товаров.
+
+    Например:
+
+    Сельдь филе в масле · 18
+    Сельдь слабосолёная · 11
+    Сельдь по-царски · 6
+    """
+
+    total_products = sum(
+        int(
+            family.get(
+                "products_count",
+                0,
+            )
+        )
+        for family in families
+    )
+
+    await message.answer(
+        "🧺 <b>Найдены виды товаров</b>\n\n"
+        f"Запрос: «{escape(query)}»\n"
+        f"Вариантов: "
+        f"<b>{len(families)}</b>\n"
+        f"Товаров внутри: "
+        f"<b>{total_products}</b>\n\n"
+        "Выберите подходящий вид:",
+        reply_markup=(
+            get_product_families_keyboard(
+                families
+            )
+        ),
+    )
+
+
 async def show_fallback_products(
     *,
     message: Message,
@@ -431,8 +530,8 @@ async def show_fallback_products(
     """
     Выполняет резервный расширенный поиск.
 
-    Используется, если Search Engine 2.0
-    не построил группы и не нашёл подсказки.
+    Используется, если не удалось построить
+    уточнения, семейства и обычные подсказки.
     """
 
     products = await search_products(
@@ -454,7 +553,9 @@ async def show_fallback_products(
         return
 
     if len(products) == 1:
-        product, brand, category = products[0]
+        product, brand, category = (
+            products[0]
+        )
 
         await show_single_product(
             message=message,
@@ -477,7 +578,8 @@ async def show_fallback_products(
     ]
 
     await message.answer(
-        "🔍 <b>Найдено несколько вариантов</b>\n\n"
+        "🔍 <b>Найдено несколько "
+        "вариантов</b>\n\n"
         f"Запрос: «{escape(query)}»\n"
         "Нажмите на товар, "
         "чтобы открыть карточку:",
@@ -493,6 +595,18 @@ async def show_fallback_products(
 async def search_handler(
     message: Message,
 ) -> None:
+    """
+    Главный обработчик поиска MarkaRadar.
+
+    Порядок:
+
+    1. Поиск по штрихкоду.
+    2. Уточняющие группы.
+    3. Семейства товаров.
+    4. Конкретные товары.
+    5. Резервный расширенный поиск.
+    """
+
     if message.text is None:
         return
 
@@ -500,11 +614,13 @@ async def search_handler(
 
     if not query:
         await message.answer(
-            "Введите название продукта или бренда."
+            "Введите название продукта "
+            "или бренда."
         )
         return
 
-    # Команды обрабатываются другими роутерами.
+    # Команды обрабатываются
+    # другими роутерами.
     if query.startswith("/"):
         return
 
@@ -514,8 +630,9 @@ async def search_handler(
 
     try:
         async with async_session_maker() as session:
-            # Штрихкод обрабатывается сразу,
-            # без построения уточняющих групп.
+            user = message.from_user
+
+            # Штрихкод обрабатываем сразу.
             if query.isdigit():
                 barcode_products = await search_products(
                     session=session,
@@ -537,6 +654,8 @@ async def search_handler(
                     )
                     return
 
+            # Первый уровень:
+            # уточняющие группы.
             engine_result = await run_search_engine(
                 session=session,
                 query=query,
@@ -544,9 +663,10 @@ async def search_handler(
                 suggestion_limit=8,
             )
 
-            if engine_result.mode == SearchMode.INTENTS:
-                user = message.from_user
-
+            if (
+                engine_result.mode
+                == SearchMode.INTENTS
+            ):
                 if user is None:
                     await show_fallback_products(
                         message=message,
@@ -561,7 +681,8 @@ async def search_handler(
                         "query": group["query"],
                         "count": group["count"],
                     }
-                    for group in engine_result.intent_groups
+                    for group
+                    in engine_result.intent_groups
                 ]
 
                 save_intent_groups(
@@ -571,7 +692,8 @@ async def search_handler(
                 )
 
                 await message.answer(
-                    "🧭 <b>Что именно вы ищете?</b>\n\n"
+                    "🧭 <b>Что именно "
+                    "вы ищете?</b>\n\n"
                     f"Запрос: «{escape(query)}»\n"
                     "Выберите подходящий вариант:",
                     reply_markup=(
@@ -582,9 +704,34 @@ async def search_handler(
                 )
                 return
 
-            if engine_result.mode == SearchMode.PRODUCTS:
-                user = message.from_user
+            # Второй уровень:
+            # семейства товаров.
+            families = await find_product_families(
+                session=session,
+                query=query,
+                limit=10,
+            )
 
+            if families:
+                if user is not None:
+                    clear_intent_groups(
+                        chat_id=message.chat.id,
+                        user_id=user.id,
+                    )
+
+                await show_product_families(
+                    message=message,
+                    families=families,
+                    query=query,
+                )
+                return
+
+            # Третий уровень:
+            # конкретные товары.
+            if (
+                engine_result.mode
+                == SearchMode.PRODUCTS
+            ):
                 if user is not None:
                     clear_intent_groups(
                         chat_id=message.chat.id,
@@ -597,13 +744,12 @@ async def search_handler(
                     "Выберите подходящий товар:",
                     reply_markup=(
                         get_search_suggestions_keyboard(
-                            engine_result.product_suggestions
+                            engine_result
+                            .product_suggestions
                         )
                     ),
                 )
                 return
-
-            user = message.from_user
 
             if user is not None:
                 clear_intent_groups(
@@ -611,6 +757,8 @@ async def search_handler(
                     user_id=user.id,
                 )
 
+            # Последний уровень:
+            # резервный поиск.
             await show_fallback_products(
                 message=message,
                 session=session,
@@ -625,7 +773,8 @@ async def search_handler(
 
         await message.answer(
             "⚠️ Во время поиска произошла ошибка.\n"
-            "Попробуйте повторить запрос немного позже."
+            "Попробуйте повторить запрос "
+            "немного позже."
         )
 
     finally:
