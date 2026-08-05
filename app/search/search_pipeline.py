@@ -11,23 +11,18 @@ from app.search.decision_search import (
     DecisionSearchResult,
     run_decision_search,
 )
-from app.search.engine import (
-    run_search_engine,
+from app.search.facet_engine import (
+    build_product_facets,
+    flatten_facet_options,
 )
 from app.search.family_search import (
     find_product_families,
-)
-from app.search.human_intents import (
-    prepare_human_intents,
 )
 
 
 class SearchPipelineScreen(StrEnum):
     """
     Экран, который должен увидеть пользователь.
-
-    Pipeline возвращает не просто товары,
-    а готовое решение для интерфейса.
     """
 
     EMPTY = "empty"
@@ -42,9 +37,6 @@ class SearchPipelineScreen(StrEnum):
 class SearchPipelineProduct:
     """
     Конкретный товар, найденный по штрихкоду.
-
-    Используется отдельно, потому что поиск
-    по штрихкоду не требует уточнений.
     """
 
     product: Any
@@ -55,11 +47,7 @@ class SearchPipelineProduct:
 @dataclass(slots=True)
 class SearchPipelineResult:
     """
-    Полный результат поискового конвейера.
-
-    Обработчик Telegram должен смотреть только
-    на поле screen и показывать соответствующий
-    пользовательский экран.
+    Результат единого поискового конвейера.
     """
 
     screen: SearchPipelineScreen
@@ -117,10 +105,7 @@ def clean_pipeline_query(
     query: str,
 ) -> str:
     """
-    Выполняет безопасную первичную очистку запроса.
-
-    Полная нормализация и исправление опечаток
-    позднее будут выполняться Query Parser.
+    Выполняет первичную очистку запроса.
     """
 
     return " ".join(
@@ -133,10 +118,6 @@ def is_possible_barcode(
 ) -> bool:
     """
     Проверяет, похож ли запрос на штрихкод.
-
-    Не каждое число является штрихкодом.
-    Поддерживаются распространённые длины:
-    EAN-8, UPC-A, EAN-13 и внутренние коды.
     """
 
     return (
@@ -145,72 +126,54 @@ def is_possible_barcode(
     )
 
 
-def should_use_intents(
-    *,
+def is_broad_query(
     query: str,
-    intent_groups: list[dict[str, Any]],
 ) -> bool:
     """
-    Решает, нужно ли показывать уточняющие варианты.
+    Широкий запрос обычно состоит
+    из одного или двух слов.
 
-    Уточнения показываются только для короткого
-    и широкого запроса.
-
-    Конкретный запрос не должен заставлять
-    пользователя проходить лишние уровни.
+    Примеры:
+    молоко
+    растворимый кофе
+    сельдь
     """
 
-    query_words = query.split()
+    return len(
+        query.split()
+    ) <= 2
 
-    if len(query_words) > 2:
+
+def should_show_facets(
+    *,
+    query: str,
+    facet_options: list[dict[str, Any]],
+    decision: DecisionSearchResult,
+) -> bool:
+    """
+    Решает, нужно ли сначала показать уточнения.
+
+    Фасеты показываются только для широкого запроса,
+    если нет подтверждённого лучшего выбора.
+    """
+
+    if not is_broad_query(query):
         return False
 
-    if len(intent_groups) < 2:
+    if len(facet_options) < 2:
+        return False
+
+    if decision.has_confirmed_choice:
         return False
 
     return True
-
-
-def should_use_families(
-    *,
-    query: str,
-    families: list[dict[str, Any]],
-) -> bool:
-    """
-    Решает, нужно ли показывать семейства.
-
-    Семейства используются как компактные фильтры,
-    а не как обязательный лабиринт поиска.
-    """
-
-    query_words = query.split()
-
-    if len(query_words) > 2:
-        return False
-
-    if len(families) < 2:
-        return False
-
-    meaningful_families = [
-        family
-        for family in families
-        if int(
-            family.get(
-                "products_count",
-                0,
-            )
-        ) > 0
-    ]
-
-    return len(meaningful_families) >= 2
 
 
 def family_quality_key(
     family: dict[str, Any],
 ) -> tuple[float, int, str]:
     """
-    Сортирует семейства по релевантности
-    и числу товаров.
+    Сортирует семейства по качеству совпадения.
     """
 
     return (
@@ -239,8 +202,7 @@ def normalize_family_name(
     value: str,
 ) -> str:
     """
-    Нормализует название семейства
-    для поиска дублей.
+    Нормализует семейство для удаления дублей.
     """
 
     return " ".join(
@@ -258,14 +220,21 @@ def prepare_families(
     limit: int = 6,
 ) -> list[dict[str, Any]]:
     """
-    Удаляет дубликаты и ограничивает число
-    уточняющих семейств.
+    Удаляет пустые и повторяющиеся семейства.
 
-    Пользователь не должен видеть длинный
-    технический список.
+    Семейства временно остаются резервным способом
+    уточнения для категорий без Facet Engine.
     """
 
-    unique_families: list[
+    safe_limit = max(
+        1,
+        min(
+            limit,
+            8,
+        ),
+    )
+
+    prepared: list[
         dict[str, Any]
     ] = []
 
@@ -289,12 +258,6 @@ def prepare_families(
             family_name
         )
 
-        if not normalized_name:
-            continue
-
-        if normalized_name in seen_names:
-            continue
-
         products_count = int(
             family.get(
                 "products_count",
@@ -302,105 +265,56 @@ def prepare_families(
             )
         )
 
+        if not normalized_name:
+            continue
+
         if products_count <= 0:
+            continue
+
+        if normalized_name in seen_names:
             continue
 
         seen_names.add(
             normalized_name
         )
 
-        unique_families.append(
+        prepared.append(
             family
         )
 
-        if len(unique_families) >= limit:
+        if len(prepared) >= safe_limit:
             break
 
-    return unique_families
+    return prepared
 
 
-def prepare_intent_groups(
-    groups: list[Any],
+def should_show_families(
     *,
-    limit: int = 18,
-) -> list[dict[str, Any]]:
+    query: str,
+    families: list[dict[str, Any]],
+    facet_options: list[dict[str, Any]],
+    decision: DecisionSearchResult,
+) -> bool:
     """
-    Приводит группы старого Search Engine
-    к единому техническому формату.
+    Семейства используются только как резерв.
 
-    На этом этапе варианты ещё не показываются
-    пользователю. После этого они обязательно
-    проходят через prepare_human_intents().
+    Если Facet Engine уже построил понятные кнопки,
+    семейства не показываются.
     """
 
-    prepared_groups: list[
-        dict[str, Any]
-    ] = []
+    if facet_options:
+        return False
 
-    seen_queries: set[str] = set()
+    if not is_broad_query(query):
+        return False
 
-    safe_limit = max(
-        1,
-        min(
-            limit,
-            50,
-        ),
-    )
+    if len(families) < 2:
+        return False
 
-    for group in groups:
-        title = str(
-            group.get(
-                "title",
-                "",
-            )
-        ).strip()
+    if decision.has_confirmed_choice:
+        return False
 
-        group_query = str(
-            group.get(
-                "query",
-                "",
-            )
-        ).strip()
-
-        count = int(
-            group.get(
-                "count",
-                0,
-            )
-        )
-
-        normalized_group_query = " ".join(
-            group_query
-            .lower()
-            .replace("ё", "е")
-            .split()
-        )
-
-        if not title or not group_query:
-            continue
-
-        if normalized_group_query in seen_queries:
-            continue
-
-        if count <= 0:
-            continue
-
-        seen_queries.add(
-            normalized_group_query
-        )
-
-        prepared_groups.append(
-            {
-                "title": title,
-                "query": group_query,
-                "count": count,
-            }
-        )
-
-        if len(prepared_groups) >= safe_limit:
-            break
-
-    return prepared_groups
+    return True
 
 
 async def find_barcode_product(
@@ -446,20 +360,17 @@ async def run_search_pipeline(
     """
     Единственная точка входа поиска MarkaRadar.
 
-    Последовательность:
+    Порядок:
 
-    1. очищает запрос;
-    2. проверяет штрихкод;
-    3. получает технические уточнения;
-    4. превращает их в человеческие варианты;
-    5. получает компактные семейства;
-    6. запускает Decision Search;
-    7. выбирает наиболее полезный экран.
+    1. очистка запроса;
+    2. точный поиск по штрихкоду;
+    3. поиск и оценка товарных кандидатов;
+    4. построение управляемых фасетов;
+    5. резервное получение семейств;
+    6. выбор наиболее полезного экрана.
 
-    Главный принцип:
-
-    Pipeline возвращает решение для пользователя,
-    а не обычный список строк из базы данных.
+    Старые автоматически сгенерированные
+    intent-группы здесь больше не используются.
     """
 
     cleaned_query = clean_pipeline_query(
@@ -481,7 +392,7 @@ async def run_search_pipeline(
             ),
         )
 
-    # Точный штрихкод всегда имеет высший приоритет.
+    # Штрихкод всегда имеет высший приоритет.
     if is_possible_barcode(
         cleaned_query
     ):
@@ -511,47 +422,40 @@ async def run_search_pipeline(
                 ),
             )
 
-    # Старый Search Engine временно используется
-    # только как поставщик технических групп.
-    #
-    # Запрашиваем больше вариантов, чем покажем,
-    # потому что часть из них будет удалена
-    # как мусор, технические слова или дубли.
-    technical_intent_limit = max(
-        intent_limit * 3,
-        18,
-    )
-
-    engine_result = await run_search_engine(
+    # Decision Search ищет кандидатов
+    # и оценивает их с помощью Trust Engine.
+    decision = await run_decision_search(
         session=session,
         query=cleaned_query,
-        intent_limit=technical_intent_limit,
-        suggestion_limit=8,
+        candidates_limit=(
+            decision_candidates_limit
+        ),
+        alternatives_limit=3,
+        insufficient_limit=3,
+        other_limit=10,
     )
 
-    technical_intent_groups = (
-        prepare_intent_groups(
-            engine_result.intent_groups,
-            limit=technical_intent_limit,
-        )
+    # Facet Engine строит только разрешённые,
+    # понятные человеку уточнения.
+    facet_result = await build_product_facets(
+        session=session,
+        query=cleaned_query,
+        candidates_limit=max(
+            decision_candidates_limit,
+            50,
+        ),
+        group_limit=2,
+        option_limit=5,
     )
 
-    # Пользователь никогда не должен видеть
-    # технические названия из базы.
-    #
-    # На этом этапе:
-    # - удаляются английские служебные слова;
-    # - сокращаются длинные варианты;
-    # - объединяются дубли;
-    # - создаются понятные человеку кнопки.
-    intent_groups = prepare_human_intents(
-        original_query=cleaned_query,
-        groups=technical_intent_groups,
+    facet_options = flatten_facet_options(
+        facet_result,
         limit=intent_limit,
     )
 
-    # Семейства являются только возможными
-    # компактными фильтрами.
+    # Семейства остаются только резервом
+    # для продуктов, которых ещё нет
+    # в контролируемой схеме Facet Engine.
     raw_families = await find_product_families(
         session=session,
         query=cleaned_query,
@@ -566,21 +470,29 @@ async def run_search_pipeline(
         limit=family_limit,
     )
 
-    # Decision Search — главный источник результата.
-    # Именно здесь учитываются оценки и доверие.
-    decision = await run_decision_search(
-        session=session,
-        query=cleaned_query,
-        candidates_limit=(
-            decision_candidates_limit
-        ),
-        alternatives_limit=3,
-        insufficient_limit=3,
-        other_limit=10,
-    )
+    # Конкретный запрос сразу ведёт к товарам.
+    if (
+        decision.has_results
+        and not is_broad_query(cleaned_query)
+    ):
+        return SearchPipelineResult(
+            screen=SearchPipelineScreen.DECISION,
+            original_query=query,
+            normalized_query=cleaned_query,
+            barcode_product=None,
+            intent_groups=facet_options,
+            families=families,
+            decision=decision,
+            corrected_query=None,
+            explanation=(
+                "Запрос достаточно конкретный. "
+                "MarkaRadar сразу показывает "
+                "подходящие товары и их оценки."
+            ),
+        )
 
-    # Если найден подтверждённый лучший вариант,
-    # сразу показываем решение.
+    # Если есть подтверждённый лидер,
+    # не заставляем пользователя уточнять запрос.
     if (
         decision.has_results
         and decision.has_confirmed_choice
@@ -590,7 +502,7 @@ async def run_search_pipeline(
             original_query=query,
             normalized_query=cleaned_query,
             barcode_product=None,
-            intent_groups=intent_groups,
+            intent_groups=facet_options,
             families=families,
             decision=decision,
             corrected_query=None,
@@ -600,84 +512,60 @@ async def run_search_pipeline(
             ),
         )
 
-    # Для конкретного запроса показываем товары
-    # сразу, даже если оценок пока мало.
-    query_words_count = len(
-        cleaned_query.split()
-    )
-
-    if (
-        decision.has_results
-        and query_words_count >= 3
-    ):
-        return SearchPipelineResult(
-            screen=SearchPipelineScreen.DECISION,
-            original_query=query,
-            normalized_query=cleaned_query,
-            barcode_product=None,
-            intent_groups=intent_groups,
-            families=families,
-            decision=decision,
-            corrected_query=None,
-            explanation=(
-                "Запрос достаточно конкретный, "
-                "поэтому показаны товары сразу."
-            ),
-        )
-
-    # Для широкого запроса сначала предлагаем
-    # несколько коротких человеческих уточнений.
-    if should_use_intents(
+    # Для широкого запроса без лидера
+    # показываем управляемые фасеты.
+    if should_show_facets(
         query=cleaned_query,
-        intent_groups=intent_groups,
+        facet_options=facet_options,
+        decision=decision,
     ):
         return SearchPipelineResult(
             screen=SearchPipelineScreen.INTENTS,
             original_query=query,
             normalized_query=cleaned_query,
             barcode_product=None,
-            intent_groups=intent_groups,
+            intent_groups=facet_options,
             families=families,
             decision=decision,
             corrected_query=None,
             explanation=(
-                "Запрос широкий. Небольшое "
-                "уточнение поможет дать более "
-                "полезную рекомендацию."
+                "Запрос широкий. Выберите "
+                "понятное уточнение, чтобы "
+                "сравнить подходящие товары."
             ),
         )
 
-    # Если человеческих уточнений недостаточно,
-    # можно использовать компактные семейства.
-    if should_use_families(
+    # Резерв для пока неподдерживаемых категорий.
+    if should_show_families(
         query=cleaned_query,
         families=families,
+        facet_options=facet_options,
+        decision=decision,
     ):
         return SearchPipelineResult(
             screen=SearchPipelineScreen.FAMILIES,
             original_query=query,
             normalized_query=cleaned_query,
             barcode_product=None,
-            intent_groups=intent_groups,
+            intent_groups=[],
             families=families,
             decision=decision,
             corrected_query=None,
             explanation=(
-                "Найдено несколько понятных "
-                "видов продукта."
+                "Найдено несколько видов "
+                "продукта для уточнения."
             ),
         )
 
-    # Если товары есть, но уверенного победителя нет,
-    # всё равно показываем честный экран решения:
-    # недостаточно данных, другие варианты и оценки.
+    # Если товары найдены, показываем честный
+    # экран решения даже при недостатке оценок.
     if decision.has_results:
         return SearchPipelineResult(
             screen=SearchPipelineScreen.DECISION,
             original_query=query,
             normalized_query=cleaned_query,
             barcode_product=None,
-            intent_groups=intent_groups,
+            intent_groups=facet_options,
             families=families,
             decision=decision,
             corrected_query=None,
