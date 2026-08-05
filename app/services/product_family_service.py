@@ -1,5 +1,8 @@
 import re
 
+from app.services.canonical_family_rules import (
+    find_canonical_family_name,
+)
 from app.utils.text import normalize_text
 
 
@@ -53,18 +56,41 @@ PACKAGE_WORDS = {
 }
 
 
+TECHNICAL_WORDS = {
+    "массовая",
+    "массовой",
+    "доля",
+    "долей",
+    "доли",
+    "жира",
+    "жир",
+    "пищевой",
+    "пищевая",
+    "пищевое",
+    "продукция",
+    "продукт",
+    "товар",
+    "coffees",
+    "coffee",
+    "dried",
+    "instant",
+}
+
+
 def remove_brand_from_name(
     *,
     product_name: str,
     brand_name: str,
 ) -> str:
     """
-    Удаляет бренд из начала или середины названия товара.
+    Удаляет бренд из названия товара.
+
+    Поддерживает бренды из нескольких слов.
 
     Пример:
-    "VICI Сельдь филе в масле"
+    "Молоко Домик в деревне 3.5%"
     ->
-    "Сельдь филе в масле"
+    "молоко 3 5"
     """
 
     normalized_product = normalize_text(
@@ -78,15 +104,18 @@ def remove_brand_from_name(
     if not normalized_brand:
         return normalized_product
 
-    brand_pattern = re.escape(
-        normalized_brand
-    )
+    if normalized_brand in {
+        "бренд не указан",
+        "не указан",
+        "unknown",
+        "no brand",
+        "без бренда",
+    }:
+        return normalized_product
 
-    cleaned = re.sub(
-        rf"\b{brand_pattern}\b",
+    cleaned = normalized_product.replace(
+        normalized_brand,
         " ",
-        normalized_product,
-        flags=re.IGNORECASE,
     )
 
     return " ".join(
@@ -98,16 +127,17 @@ def remove_package_information(
     value: str,
 ) -> str:
     """
-    Удаляет вес, объём, количество и проценты.
+    Удаляет вес, объём, количество, проценты
+    и номера разновидностей.
 
     Примеры:
-    "молоко 3.2 930 мл"
+    "молоко 3.5% 930 мл"
     ->
     "молоко"
 
-    "спагетти 450 г"
+    "spaghetti №5 500 г"
     ->
-    "спагетти"
+    "spaghetti"
     """
 
     cleaned = value
@@ -120,7 +150,13 @@ def remove_package_information(
 
     cleaned = re.sub(
         r"\b\d+(?:[.,]\d+)?\s*"
-        r"(?:г|гр|кг|мл|л|шт|штук)\b",
+        r"(?:г|гр|кг|мл|л|шт|штук|g|kg|ml|l)\b",
+        " ",
+        cleaned,
+    )
+
+    cleaned = re.sub(
+        r"(?:№|#)\s*\d+\b",
         " ",
         cleaned,
     )
@@ -141,17 +177,16 @@ def remove_marketing_words(
 ) -> str:
     """
     Удаляет слова, которые не определяют
-    реальный вид товара.
+    вид товара.
     """
-
-    words = value.split()
 
     filtered_words = [
         word
-        for word in words
+        for word in value.split()
         if (
             word not in MARKETING_WORDS
             and word not in PACKAGE_WORDS
+            and word not in TECHNICAL_WORDS
         )
     ]
 
@@ -160,46 +195,58 @@ def remove_marketing_words(
     )
 
 
-def limit_family_words(
+def remove_repeated_words(
     value: str,
-    *,
-    max_words: int = 6,
 ) -> str:
     """
-    Ограничивает название семейства,
-    чтобы оно не превращалось в полное
-    название товара.
+    Удаляет повторяющиеся слова,
+    сохраняя исходный порядок.
+
+    Пример:
+    "кофе кофе растворимый"
+    ->
+    "кофе растворимый"
     """
 
-    words = value.split()
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for word in value.split():
+        if word in seen:
+            continue
+
+        seen.add(word)
+        result.append(word)
 
     return " ".join(
-        words[:max_words]
+        result
     )
 
 
-def build_product_family_name(
+def limit_family_words(
+    value: str,
+    *,
+    max_words: int = 5,
+) -> str:
+    """
+    Ограничивает резервное название семейства,
+    чтобы оно не превращалось в полное название товара.
+    """
+
+    return " ".join(
+        value.split()[:max_words]
+    )
+
+
+def build_fallback_family_name(
     *,
     product_name: str,
     brand_name: str,
     subtype: str | None = None,
 ) -> str:
     """
-    Формирует нормализованное название семейства.
-
-    Примеры:
-
-    VICI Сельдь филе в масле 240 г
-    ->
-    сельдь филе в масле
-
-    Barilla Spaghetti №5 500 г
-    ->
-    spaghetti
-
-    Простоквашино Молоко 3.2% 930 мл
-    ->
-    молоко
+    Строит резервное семейство для товаров,
+    для которых пока нет канонического правила.
     """
 
     base_name = remove_brand_from_name(
@@ -222,21 +269,75 @@ def build_product_family_name(
 
         if (
             normalized_subtype
-            and normalized_subtype
-            not in base_name
+            and normalized_subtype not in base_name
         ):
             base_name = (
                 f"{base_name} "
                 f"{normalized_subtype}"
-            ).strip()
-
-    base_name = limit_family_words(
-        base_name,
-        max_words=6,
-    )
+            )
 
     base_name = normalize_text(
         base_name
     )
 
-    return base_name
+    base_name = remove_repeated_words(
+        base_name
+    )
+
+    return limit_family_words(
+        base_name,
+        max_words=5,
+    )
+
+
+def build_product_family_name(
+    *,
+    product_name: str,
+    brand_name: str,
+    category_name: str | None = None,
+    subtype: str | None = None,
+    keywords: str | None = None,
+) -> str:
+    """
+    Формирует название семейства товара.
+
+    Сначала используются канонические правила:
+
+    "Домик в деревне Молоко 3.5% 930 мл"
+    ->
+    "Молоко"
+
+    "Кофе растворимый сублимированный"
+    ->
+    "Кофе растворимый"
+
+    "Сельдь филе в масле"
+    ->
+    "Сельдь в масле"
+
+    Для остальных категорий используется
+    резервная нормализация названия.
+    """
+
+    canonical_name = find_canonical_family_name(
+        product_name=product_name,
+        brand_name=brand_name,
+        category_name=category_name,
+        subtype=subtype,
+        keywords=keywords,
+    )
+
+    if canonical_name:
+        return normalize_text(
+            canonical_name
+        )
+
+    fallback_name = build_fallback_family_name(
+        product_name=product_name,
+        brand_name=brand_name,
+        subtype=subtype,
+    )
+
+    return normalize_text(
+        fallback_name
+    )
