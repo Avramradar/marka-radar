@@ -1,0 +1,133 @@
+name: Rebuild Product Families
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_product_id:
+        description: "Продолжить после product_id"
+        required: true
+        default: "0"
+
+      max_products:
+        description: "Сколько товаров обработать"
+        required: true
+        default: "10000"
+
+      batch_size:
+        description: "Размер пакета"
+        required: true
+        default: "500"
+
+jobs:
+  rebuild-product-families:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_ID: ${{ secrets.ADMIN_ID }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      INPUT_START_PRODUCT_ID: ${{ inputs.start_product_id }}
+      INPUT_MAX_PRODUCTS: ${{ inputs.max_products }}
+      INPUT_BATCH_SIZE: ${{ inputs.batch_size }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check required secrets
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL secret is missing"
+            exit 1
+          fi
+
+      - name: Rebuild product families
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+
+          from app.services.rebuild_product_families import (
+              rebuild_product_families,
+          )
+
+
+          async def main() -> None:
+              start_product_id = int(
+                  os.environ["INPUT_START_PRODUCT_ID"]
+              )
+
+              max_products = int(
+                  os.environ["INPUT_MAX_PRODUCTS"]
+              )
+
+              batch_size = int(
+                  os.environ["INPUT_BATCH_SIZE"]
+              )
+
+              statistics = await rebuild_product_families(
+                  start_product_id=start_product_id,
+                  max_products=max_products,
+                  batch_size=batch_size,
+              )
+
+              print()
+              print("=" * 60)
+              print("РАСПРЕДЕЛЕНИЕ ПО СЕМЕЙСТВАМ ЗАВЕРШЕНО")
+              print("=" * 60)
+
+              print(
+                  f"Просмотрено товаров: "
+                  f"{statistics.scanned}"
+              )
+
+              print(
+                  f"Назначено семейств: "
+                  f"{statistics.assigned}"
+              )
+
+              print(
+                  f"Без изменений: "
+                  f"{statistics.unchanged}"
+              )
+
+              print(
+                  f"Пропущено: "
+                  f"{statistics.skipped}"
+              )
+
+              print(
+                  f"Ошибок: "
+                  f"{statistics.errors}"
+              )
+
+              print(
+                  f"Последний product_id: "
+                  f"{statistics.last_product_id}"
+              )
+
+              print()
+              print(
+                  "Для следующего запуска укажи "
+                  f"start_product_id="
+                  f"{statistics.last_product_id}"
+              )
+
+              print("=" * 60)
+
+
+          asyncio.run(main())
+          PY
