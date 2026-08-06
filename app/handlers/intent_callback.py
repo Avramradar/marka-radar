@@ -6,18 +6,24 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 
 from app.database.session import async_session_maker
-from app.handlers.search import process_pipeline_result
+from app.handlers.search import (
+    process_pipeline_result,
+)
 from app.keyboards.search import (
     PRODUCTS_PER_PAGE,
+    get_intent_groups_keyboard,
     get_paginated_products_keyboard,
 )
 from app.search.intent_state import (
+    clear_intent_groups,
     get_intent_group,
+    save_intent_groups,
 )
 from app.search.product_list_state import (
     get_product_list,
 )
 from app.search.search_pipeline import (
+    SearchPipelineScreen,
     run_search_pipeline,
 )
 
@@ -35,9 +41,9 @@ def build_products_page_text(
     """
     Формирует текст страницы сохранённого списка.
 
-    Этот механизм временно сохраняется для старых
-    списков, которые ещё могут создаваться
-    обработчиками семейств товаров.
+    Старая пагинация временно остаётся
+    для других обработчиков, которые ещё
+    используют product_list_state.
     """
 
     total_pages = max(
@@ -96,8 +102,8 @@ async def show_products_page(
     Показывает страницу ранее сохранённого
     списка товаров.
 
-    Оставлено для совместимости с обработчиком
-    семейств товаров и старой пагинацией.
+    Функция оставлена для совместимости
+    со старыми обработчиками пагинации.
     """
 
     if callback.message is None:
@@ -172,11 +178,87 @@ async def show_products_page(
 
         if "message is not modified" not in error_text:
             logger.warning(
-                "Не удалось обновить страницу товаров",
+                "Не удалось обновить "
+                "страницу товаров",
                 exc_info=True,
             )
 
     await callback.answer()
+
+
+async def remove_old_keyboard(
+    callback: CallbackQuery,
+) -> None:
+    """
+    Убирает кнопки предыдущего уровня поиска.
+
+    Это предотвращает повторные нажатия
+    по уже устаревшему набору фасетов.
+    """
+
+    if callback.message is None:
+        return
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+    except TelegramBadRequest as error:
+        error_text = str(
+            error
+        ).lower()
+
+        if "message is not modified" not in error_text:
+            logger.debug(
+                "Не удалось убрать старую "
+                "клавиатуру уточнений",
+                exc_info=True,
+            )
+
+
+async def show_next_intents(
+    *,
+    callback: CallbackQuery,
+    normalized_query: str,
+    groups: list[dict],
+) -> None:
+    """
+    Показывает следующий уровень фасетов.
+
+    Важный момент: состояние сохраняется
+    по callback.from_user.id — это настоящий
+    пользователь, нажавший кнопку.
+
+    Нельзя использовать message.from_user.id,
+    потому что автором сообщения является бот.
+    """
+
+    if callback.message is None:
+        return
+
+    save_intent_groups(
+        chat_id=callback.message.chat.id,
+        user_id=callback.from_user.id,
+        groups=groups,
+    )
+
+    await remove_old_keyboard(
+        callback
+    )
+
+    await callback.message.answer(
+        "🧭 <b>Что именно вы ищете?</b>\n\n"
+        f"Запрос: «{escape(normalized_query)}»\n\n"
+        "Выберите следующий параметр. "
+        "После уточнения MarkaRadar сравнит "
+        "товары по оценкам и уровню доверия:",
+        reply_markup=(
+            get_intent_groups_keyboard(
+                groups
+            )
+        ),
+    )
 
 
 @router.callback_query(
@@ -186,17 +268,18 @@ async def intent_callback_handler(
     callback: CallbackQuery,
 ) -> None:
     """
-    Обрабатывает выбор поискового фасета.
+    Обрабатывает выбор фасета.
 
-    Новый сценарий:
+    Правильная рекурсивная цепочка:
 
-        выбранный фасет
-        → полный уточнённый запрос
+        молоко
+        → ультрапастеризованное
+        → 3,2%
         → Search Pipeline
         → следующий фасет или Decision Search.
 
-    Обработчик сам больше не получает
-    и не сортирует список из 100 товаров.
+    Состояние каждого нового уровня сохраняется
+    под ID реального пользователя.
     """
 
     if callback.data is None:
@@ -279,12 +362,15 @@ async def intent_callback_handler(
             )
 
             logger.info(
-                "Recursive facet: title=%r, "
-                "query=%r, screen=%s, "
+                "Recursive facet: "
+                "user_id=%s, title=%r, query=%r, "
+                "normalized_query=%r, screen=%s, "
                 "intents=%s, families=%s, "
                 "candidates=%s",
+                callback.from_user.id,
                 title,
                 query,
+                pipeline_result.normalized_query,
                 pipeline_result.screen,
                 len(
                     pipeline_result.intent_groups
@@ -301,30 +387,71 @@ async def intent_callback_handler(
                 ),
             )
 
-            # Убираем старые кнопки перед показом
-            # следующего этапа поиска.
-            try:
-                await callback.message.edit_reply_markup(
-                    reply_markup=None
+            # Новый уровень фасетов обрабатываем
+            # непосредственно здесь.
+            #
+            # process_pipeline_result() нельзя
+            # использовать для INTENTS после
+            # callback, потому что внутри него
+            # message.from_user — это бот.
+            if (
+                pipeline_result.screen
+                == SearchPipelineScreen.INTENTS
+            ):
+                groups = (
+                    pipeline_result.intent_groups
                 )
 
-            except TelegramBadRequest as error:
-                error_text = str(
-                    error
-                ).lower()
-
-                if (
-                    "message is not modified"
-                    not in error_text
-                ):
-                    logger.debug(
-                        "Не удалось убрать старую "
-                        "клавиатуру фасетов",
-                        exc_info=True,
+                if not groups:
+                    logger.warning(
+                        "Pipeline вернул INTENTS "
+                        "без групп: query=%r",
+                        query,
                     )
 
-            # Все решения о следующем экране
-            # принимает только Search Pipeline.
+                    clear_intent_groups(
+                        chat_id=(
+                            callback.message.chat.id
+                        ),
+                        user_id=callback.from_user.id,
+                    )
+
+                    await remove_old_keyboard(
+                        callback
+                    )
+
+                    await callback.message.answer(
+                        "⚠️ Не удалось построить "
+                        "следующее уточнение.\n"
+                        "Попробуйте выполнить "
+                        "новый поиск."
+                    )
+                    return
+
+                await show_next_intents(
+                    callback=callback,
+                    normalized_query=(
+                        pipeline_result
+                        .normalized_query
+                    ),
+                    groups=groups,
+                )
+                return
+
+            # Если фасеты закончились,
+            # старое состояние больше не нужно.
+            clear_intent_groups(
+                chat_id=callback.message.chat.id,
+                user_id=callback.from_user.id,
+            )
+
+            await remove_old_keyboard(
+                callback
+            )
+
+            # DECISION, FAMILIES, NOT_FOUND
+            # и BARCODE отображает единый
+            # обработчик Search Pipeline.
             await process_pipeline_result(
                 message=callback.message,
                 session=session,
@@ -341,7 +468,8 @@ async def intent_callback_handler(
 
         await callback.message.answer(
             "⚠️ Не удалось применить уточнение.\n"
-            "Попробуйте повторить поиск немного позже."
+            "Попробуйте повторить поиск "
+            "немного позже."
         )
 
 
@@ -352,10 +480,11 @@ async def products_page_callback_handler(
     callback: CallbackQuery,
 ) -> None:
     """
-    Переключает страницы сохранённого списка.
+    Переключает страницы сохранённого
+    списка товаров.
 
-    Оставлено для совместимости с теми участками,
-    которые пока используют старую пагинацию.
+    Оставлено для совместимости
+    со старыми экранами.
     """
 
     if callback.data is None:
@@ -393,7 +522,7 @@ async def products_page_info_handler(
 ) -> None:
     """
     Показывает количество страниц
-    сохранённого списка товаров.
+    старого сохранённого списка.
     """
 
     if callback.message is None:
