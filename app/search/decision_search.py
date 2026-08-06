@@ -7,7 +7,7 @@ from app.database.repositories.product_repository import (
     search_products,
 )
 from app.services.rating_service import (
-    get_full_product_rating,
+    get_products_ratings,
 )
 from app.services.trust_engine import (
     RecommendationStatus,
@@ -26,13 +26,10 @@ UNKNOWN_BRAND_NAMES = {
 }
 
 
-# Decision Search не должен глубоко анализировать
-# десятки почти одинаковых товаров.
-#
-# search_products уже возвращает результаты
-# в порядке релевантности, поэтому достаточно
-# проверить верхнюю часть выдачи.
 MAX_DEEPLY_ANALYZED_CANDIDATES = 12
+
+
+RatingData = dict[str, float | int]
 
 
 @dataclass(slots=True)
@@ -46,9 +43,9 @@ class DecisionProduct:
     brand: Any
     category: Any
 
-    rating: dict[str, float | int]
+    rating: RatingData
 
-    # Цена не загружается во время Decision Search.
+    # Цена не загружается на этапе поиска.
     # Она будет получена при открытии карточки.
     price_stats: dict[str, Any] | None
 
@@ -144,6 +141,39 @@ class DecisionSearchResult:
         return self.best_choice is not None
 
 
+def build_empty_rating() -> RatingData:
+    """
+    Возвращает пустой рейтинг товара.
+
+    Используется как безопасный резерв,
+    если товар отсутствует в пакетном результате.
+    """
+
+    return {
+        "average_rating": 0.0,
+        "votes_count": 0,
+        "weighted_rating": 0.0,
+    }
+
+
+def build_empty_result(
+    *,
+    query: str,
+) -> DecisionSearchResult:
+    """
+    Создаёт пустой результат Decision Search.
+    """
+
+    return DecisionSearchResult(
+        query=query,
+        total_candidates=0,
+        best_choice=None,
+        alternatives=[],
+        insufficient_data=[],
+        other_products=[],
+    )
+
+
 def is_real_brand(
     brand_name: str | None,
 ) -> bool:
@@ -171,8 +201,8 @@ def calculate_data_quality_score(
     Оценивает полноту информации о товаре.
 
     Цена намеренно не учитывается на этапе поиска:
-    её загрузка для каждого кандидата сильно
-    замедляет выдачу и почти не влияет на решение.
+    её загрузка для каждого кандидата замедляет
+    выдачу и почти не влияет на первичное решение.
 
     Показатель не оценивает качество продукта.
     Он показывает полноту карточки товара.
@@ -367,45 +397,21 @@ def has_enough_data(
     )
 
 
-def build_empty_result(
+def prepare_decision_product(
     *,
-    query: str,
-) -> DecisionSearchResult:
-    """
-    Создаёт пустой результат Decision Search.
-    """
-
-    return DecisionSearchResult(
-        query=query,
-        total_candidates=0,
-        best_choice=None,
-        alternatives=[],
-        insufficient_data=[],
-        other_products=[],
-    )
-
-
-async def prepare_decision_product(
-    *,
-    session: AsyncSession,
     product,
     brand,
     category,
+    rating: RatingData,
     position: int,
     candidates_count: int,
 ) -> DecisionProduct:
     """
-    Загружает только пользовательский рейтинг
-    и запускает Trust Engine.
+    Подготавливает товар и запускает Trust Engine.
 
-    Цена здесь не запрашивается. Она нужна только
-    при открытии полной карточки товара.
+    Функция больше не делает SQL-запросов.
+    Рейтинг заранее передаётся из пакетной выборки.
     """
-
-    rating = await get_full_product_rating(
-        session=session,
-        product_id=product.id,
-    )
 
     average_rating = float(
         rating.get(
@@ -477,12 +483,12 @@ async def run_decision_search(
 
     1. получает релевантных кандидатов;
     2. оставляет верхние результаты;
-    3. загружает только пользовательские рейтинги;
-    4. запускает Trust Engine;
+    3. загружает все рейтинги одной пачкой;
+    4. запускает Trust Engine в памяти;
     5. сортирует товары по полезности;
     6. формирует лучший выбор и альтернативы.
 
-    Статистика цен здесь намеренно не загружается.
+    Цены здесь намеренно не загружаются.
     """
 
     cleaned_query = " ".join(
@@ -502,8 +508,6 @@ async def run_decision_search(
         ),
     )
 
-    # Глубоко анализируем только верхнюю часть
-    # уже отсортированной поисковой выдачи.
     analyzed_candidates_limit = min(
         requested_candidates_limit,
         MAX_DEEPLY_ANALYZED_CANDIDATES,
@@ -548,27 +552,51 @@ async def run_decision_search(
         rows
     )
 
+    product_ids = [
+        int(product.id)
+        for product, _brand, _category
+        in rows
+    ]
+
+    # Два SQL-запроса на весь набор:
+    # 1. глобальная средняя;
+    # 2. агрегаты рейтингов по product_id.
+    ratings_by_product_id = (
+        await get_products_ratings(
+            session=session,
+            product_ids=product_ids,
+        )
+    )
+
     prepared_products: list[
         DecisionProduct
     ] = []
 
-    # AsyncSession нельзя безопасно использовать
-    # для нескольких параллельных execute().
-    # Поэтому рейтинги загружаются последовательно,
-    # но только для 12 лучших кандидатов.
+    # Здесь SQL-запросов больше нет.
     for position, row in enumerate(
         rows
     ):
         product, brand, category = row
 
+        product_id = int(
+            product.id
+        )
+
+        rating = ratings_by_product_id.get(
+            product_id,
+            build_empty_rating(),
+        )
+
         decision_product = (
-            await prepare_decision_product(
-                session=session,
+            prepare_decision_product(
                 product=product,
                 brand=brand,
                 category=category,
+                rating=rating,
                 position=position,
-                candidates_count=candidates_count,
+                candidates_count=(
+                    candidates_count
+                ),
             )
         )
 
