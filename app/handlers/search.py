@@ -39,6 +39,9 @@ from app.search.search_pipeline import (
 from app.services.external_product_enrichment_service import (
     enrich_product_by_barcode,
 )
+from app.services.external_catalog_search_service import (
+    enrich_catalog_for_query,
+)
 from app.services.price_service import (
     get_price_statistics,
 )
@@ -1050,88 +1053,106 @@ async def show_not_found_screen( *, message: Message, query: str, ) -> None:
 
 
 async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> SearchPipelineResult:
-    """ Выполняет Search Pipeline и при необходимости подключает единый сервис внешнего обогащения. Здесь намеренно нет прямого вызова OpenFoodFacts. Конкретными внешними источниками управляет external_product_enrichment_service. """
+    """ Выполняет локальный Search Pipeline и подключает внешние источники только когда они действительно повышают качество результата. Текстовый поиск: конкретный запрос -> Лента -> Merge Engine -> повторный Pipeline. Штрихкод: локальная база -> OpenFoodFacts -> Merge Engine -> повторный Pipeline. """
+
+    cleaned_query = " ".join(
+        str(query or "").strip().split()
+    )
 
     pipeline_result = await run_search_pipeline(
         session=session,
-        query=query,
+        query=cleaned_query,
         intent_limit=6,
         family_limit=6,
         decision_candidates_limit=20,
     )
 
-    cleaned_query = " ".join(
-        query.strip().split()
-    )
+    # ------------------------------------------------------------
+    # Обычный текстовый запрос.
+    # ------------------------------------------------------------
+    if not is_possible_barcode(cleaned_query):
+        catalog_result = await enrich_catalog_for_query(
+            session=session,
+            query=cleaned_query,
+            decision=pipeline_result.decision,
+            limit=8,
+        )
 
-    if not is_possible_barcode(
-        cleaned_query
-    ):
-        return pipeline_result
+        if catalog_result.imported_count <= 0:
+            # Сервис мог выполнить rollback после неудачного внешнего
+            # поиска, поэтому возвращаем свежие ORM-объекты.
+            if catalog_result.attempted:
+                return await run_search_pipeline(
+                    session=session,
+                    query=cleaned_query,
+                    intent_limit=6,
+                    family_limit=6,
+                    decision_candidates_limit=20,
+                )
+            return pipeline_result
 
+        logger.info(
+            "Каталог дополнен: provider=%s query=%r imported=%s",
+            catalog_result.provider,
+            cleaned_query,
+            catalog_result.imported_count,
+        )
+
+        return await run_search_pipeline(
+            session=session,
+            query=cleaned_query,
+            intent_limit=6,
+            family_limit=6,
+            decision_candidates_limit=20,
+        )
+
+    # ------------------------------------------------------------
+    # Поиск по штрихкоду.
+    # ------------------------------------------------------------
     should_try_external = False
 
-    if (
-        pipeline_result.screen
-        == SearchPipelineScreen.NOT_FOUND
-    ):
+    if pipeline_result.screen == SearchPipelineScreen.NOT_FOUND:
         should_try_external = True
-    elif should_enrich_barcode_product(
-        pipeline_result
-    ):
+    elif should_enrich_barcode_product(pipeline_result):
         should_try_external = True
 
     if not should_try_external:
         return pipeline_result
 
     logger.info(
-        "Пробуем внешнее обогащение "
-        "для штрихкода %s",
+        "Пробуем внешнее обогащение для штрихкода %s",
         cleaned_query,
     )
 
-    barcode_item = (
-        pipeline_result.barcode_product
-    )
+    barcode_item = pipeline_result.barcode_product
 
-    enrichment_result = (
-        await enrich_product_by_barcode(
-            session=session,
-            barcode=cleaned_query,
-            product=(
-                barcode_item.product
-                if barcode_item is not None
-                else None
-            ),
-            brand=(
-                barcode_item.brand
-                if barcode_item is not None
-                else None
-            ),
-            category=(
-                barcode_item.category
-                if barcode_item is not None
-                else None
-            ),
-        )
+    enrichment_result = await enrich_product_by_barcode(
+        session=session,
+        barcode=cleaned_query,
+        product=(
+            barcode_item.product
+            if barcode_item is not None
+            else None
+        ),
+        brand=(
+            barcode_item.brand
+            if barcode_item is not None
+            else None
+        ),
+        category=(
+            barcode_item.category
+            if barcode_item is not None
+            else None
+        ),
     )
 
     if not enrichment_result.enriched:
         logger.info(
-            "Внешние источники не дали "
-            "полезного обогащения для %s",
+            "Внешние источники не дали полезного обогащения для %s",
             cleaned_query,
         )
-
-        # rollback() истекает ORM-объекты даже при
-        # expire_on_commit=False. Поэтому нельзя
-        # возвращать старый pipeline_result: позднее
-        # обращение к product/brand/category может
-        # вызвать MissingGreenlet в AsyncSession.
         await session.rollback()
 
-        # Получаем полностью свежие ORM-объекты
-        # после rollback и только их отдаём UI.
         return await run_search_pipeline(
             session=session,
             query=cleaned_query,
@@ -1143,13 +1164,10 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
     await session.commit()
 
     logger.info(
-        "Внешнее обогащение выполнено: "
-        "provider=%s",
+        "Внешнее обогащение выполнено: provider=%s",
         enrichment_result.provider,
     )
 
-    # Новый запуск Pipeline нужен, чтобы получить
-    # свежие Product/Brand/Category после commit.
     return await run_search_pipeline(
         session=session,
         query=cleaned_query,
