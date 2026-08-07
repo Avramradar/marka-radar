@@ -1,10 +1,8 @@
 import re
 from decimal import Decimal
-from typing import Iterable
+from typing import Any, Iterable
 
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-)
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.openfoodfacts_client import (
     OpenFoodFactsClient,
@@ -24,7 +22,7 @@ QUANTITY_PATTERN = re.compile(
     r"(?P<value>\d+(?:[.,]\d+)?)"
     r"\s*"
     r"(?P<unit>"
-    r"kg|g|gr|гр|л|l|ml|мл|кг|г"
+    r"kg|kgs|g|gr|гр|л|l|lt|ml|мл|кг|г"
     r")",
     re.IGNORECASE,
 )
@@ -52,138 +50,110 @@ GENERIC_NAMES = {
     "kefir",
     "сельдь",
     "herring",
+    "продукт",
+    "product",
+}
+
+
+GENERIC_BRANDS = {
+    "",
+    "unknown",
+    "no brand",
+    "без бренда",
+    "бренд не указан",
+    "не указан",
 }
 
 
 def clean_text(
-    value: str | None,
+    value: Any,
 ) -> str:
     """
     Убирает лишние пробелы.
     """
 
+    if value is None:
+        return ""
+
     return " ".join(
-        str(
-            value or ""
-        )
+        str(value)
         .strip()
         .split()
     )
 
 
 def normalized(
+    value: Any,
+) -> str:
+    """
+    Простая нормализация
+    для внутренних сравнений.
+    """
+
+    return (
+        clean_text(value)
+        .lower()
+        .replace("ё", "е")
+    )
+
+
+def humanize_tag(
     value: str | None,
 ) -> str:
     """
-    Простая нормализация для сравнений.
+    Делает технический tag OpenFoodFacts
+    немного более человеческим.
+
+    Например:
+
+        en:poetti -> Poetti
+        en:instant-coffee -> Instant coffee
     """
+
+    cleaned = clean_text(
+        value
+    )
+
+    if not cleaned:
+        return ""
+
+    if ":" in cleaned:
+        prefix, remainder = (
+            cleaned.split(
+                ":",
+                1,
+            )
+        )
+
+        if (
+            len(prefix) <= 3
+            and remainder
+        ):
+            cleaned = remainder
+
+    cleaned = cleaned.replace(
+        "-",
+        " ",
+    )
+
+    cleaned = " ".join(
+        cleaned.split()
+    )
+
+    if not cleaned:
+        return ""
 
     return (
-        clean_text(
-            value
-        )
-        .lower()
-        .replace(
-            "ё",
-            "е",
-        )
+        cleaned[0].upper()
+        + cleaned[1:]
     )
-
-
-def is_generic_name(
-    value: str | None,
-) -> bool:
-    """
-    Проверяет слишком общее название товара.
-    """
-
-    return (
-        normalized(
-            value
-        )
-        in GENERIC_NAMES
-    )
-
-
-def parse_quantity(
-    quantity: str | None,
-) -> tuple[
-    Decimal | None,
-    str | None,
-]:
-    """
-    Преобразует:
-
-        95 g
-        1 l
-        0.5 L
-        900 мл
-        250 гр
-
-    в package_value/package_unit.
-    """
-
-    if not quantity:
-        return None, None
-
-    match = QUANTITY_PATTERN.search(
-        quantity
-    )
-
-    if match is None:
-        return None, None
-
-    raw_value = (
-        match.group(
-            "value"
-        )
-        .replace(
-            ",",
-            ".",
-        )
-    )
-
-    try:
-        value = Decimal(
-            raw_value
-        )
-    except Exception:
-        return None, None
-
-    raw_unit = (
-        match.group(
-            "unit"
-        )
-        .strip()
-        .lower()
-    )
-
-    unit_map = {
-        "g": "г",
-        "gr": "г",
-        "гр": "г",
-        "г": "г",
-        "kg": "кг",
-        "кг": "кг",
-        "ml": "мл",
-        "мл": "мл",
-        "l": "л",
-        "л": "л",
-    }
-
-    unit = unit_map.get(
-        raw_unit
-    )
-
-    return value, unit
 
 
 def unique_values(
-    values: Iterable[str],
+    values: Iterable[Any],
 ) -> list[str]:
     """
-    Удаляет пустые значения и дубли,
-    сохраняя исходный порядок.
+    Удаляет пустые значения и дубли.
     """
 
     result: list[str] = []
@@ -218,27 +188,184 @@ def unique_values(
     return result
 
 
-def build_keywords(
-    product: OpenFoodFactsProduct,
-) -> str | None:
+def is_generic_name(
+    value: str | None,
+) -> bool:
     """
-    Использует категории и labels
-    как дополнительные поисковые признаки.
+    Проверяет слишком общее название.
     """
 
-    values = unique_values(
-        (
-            *product.categories,
-            *product.categories_tags,
-            *product.labels,
-        )
+    return (
+        normalized(value)
+        in GENERIC_NAMES
     )
 
-    if not values:
-        return None
 
-    return ", ".join(
-        values
+def is_real_brand(
+    value: str | None,
+) -> bool:
+    """
+    Проверяет, что бренд содержательный.
+    """
+
+    return (
+        normalized(value)
+        not in GENERIC_BRANDS
+    )
+
+
+def parse_quantity(
+    quantity: str | None,
+) -> tuple[
+    Decimal | None,
+    str | None,
+]:
+    """
+    Парсит строковую упаковку.
+
+    Примеры:
+
+        250 g
+        95 gr
+        1 l
+        900 мл
+        0.5 kg
+    """
+
+    if not quantity:
+        return None, None
+
+    match = QUANTITY_PATTERN.search(
+        clean_text(quantity)
+    )
+
+    if match is None:
+        return None, None
+
+    raw_value = (
+        match.group("value")
+        .replace(",", ".")
+    )
+
+    try:
+        value = Decimal(
+            raw_value
+        )
+    except Exception:
+        return None, None
+
+    raw_unit = (
+        match.group("unit")
+        .lower()
+        .strip()
+    )
+
+    unit_map = {
+        "g": "г",
+        "gr": "г",
+        "гр": "г",
+        "г": "г",
+
+        "kg": "кг",
+        "kgs": "кг",
+        "кг": "кг",
+
+        "ml": "мл",
+        "мл": "мл",
+
+        "l": "л",
+        "lt": "л",
+        "л": "л",
+    }
+
+    unit = unit_map.get(
+        raw_unit
+    )
+
+    if not unit:
+        return None, None
+
+    return value, unit
+
+
+def parse_structured_quantity(
+    product: OpenFoodFactsProduct,
+) -> tuple[
+    Decimal | None,
+    str | None,
+]:
+    """
+    Сначала использует структурированные поля OFF:
+
+        product_quantity
+        product_quantity_unit
+
+    И только потом старое поле quantity.
+    """
+
+    raw_value = clean_text(
+        product.product_quantity
+    )
+
+    raw_unit = clean_text(
+        product.product_quantity_unit
+    )
+
+    if raw_value and raw_unit:
+        try:
+            value = Decimal(
+                raw_value.replace(
+                    ",",
+                    ".",
+                )
+            )
+        except Exception:
+            value = None
+
+        unit_aliases = {
+            "g": "г",
+            "gram": "г",
+            "grams": "г",
+            "г": "г",
+
+            "kg": "кг",
+            "kilogram": "кг",
+            "kilograms": "кг",
+            "кг": "кг",
+
+            "ml": "мл",
+            "milliliter": "мл",
+            "milliliters": "мл",
+            "мл": "мл",
+
+            "l": "л",
+            "liter": "л",
+            "liters": "л",
+            "л": "л",
+        }
+
+        unit = unit_aliases.get(
+            normalized(
+                raw_unit
+            )
+        )
+
+        if (
+            value is not None
+            and value > 0
+            and unit
+        ):
+            return value, unit
+
+    quantity_result = parse_quantity(
+        product.quantity
+    )
+
+    if quantity_result[0] is not None:
+        return quantity_result
+
+    return parse_quantity(
+        product.serving_size
     )
 
 
@@ -246,79 +373,194 @@ def choose_brand(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Open Food Facts иногда возвращает
-    несколько брендов через запятую.
+    Приоритет бренда:
 
-    Берём первый содержательный бренд.
+    1. brands;
+    2. brands_tags.
+
+    Это важно для карточек, где поле brands
+    пустое, но brands_tags заполнено.
     """
 
     brands = clean_text(
         product.brands
     )
 
-    if not brands:
-        return None
-
-    candidates = [
-        clean_text(
-            value
-        )
-        for value in re.split(
+    if brands:
+        candidates = re.split(
             r"[,;/|]",
             brands,
         )
-    ]
 
-    for candidate in candidates:
-        if candidate:
+        for value in candidates:
+            candidate = clean_text(
+                value
+            )
+
+            if is_real_brand(
+                candidate
+            ):
+                return candidate
+
+    for raw_tag in (
+        product.brands_tags
+    ):
+        candidate = humanize_tag(
+            raw_tag
+        )
+
+        if is_real_brand(
+            candidate
+        ):
             return candidate
 
     return None
 
 
-def choose_base_name(
+def get_raw_names(
+    product: OpenFoodFactsProduct,
+) -> list[str]:
+    """
+    Собирает ВСЕ потенциальные названия
+    из raw OpenFoodFacts.
+
+    Это позволяет использовать, например:
+
+        product_name_it
+        product_name_fr
+        product_name_de
+
+    даже если мы заранее не добавляли
+    каждое поле в dataclass.
+    """
+
+    values: list[Any] = [
+        product.product_name_ru,
+        product.product_name,
+        product.product_name_en,
+        product.abbreviated_product_name,
+        product.generic_name_ru,
+        product.generic_name,
+        product.generic_name_en,
+    ]
+
+    raw = product.raw
+
+    if isinstance(
+        raw,
+        dict,
+    ):
+        preferred_keys = (
+            "product_name_ru",
+            "product_name",
+            "product_name_en",
+            "abbreviated_product_name",
+            "generic_name_ru",
+            "generic_name",
+            "generic_name_en",
+        )
+
+        for key in preferred_keys:
+            values.append(
+                raw.get(key)
+            )
+
+        # Ищем дополнительные языковые варианты:
+        # product_name_it, product_name_de и т.д.
+        for key, value in raw.items():
+            if (
+                key.startswith(
+                    "product_name_"
+                )
+                or key.startswith(
+                    "generic_name_"
+                )
+            ):
+                values.append(
+                    value
+                )
+
+    return unique_values(
+        values
+    )
+
+
+def choose_specific_name(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Выбирает базовое название товара.
+    Ищет наиболее содержательное название.
+
+    Главное правило:
+    если есть "Leggenda Original",
+    оно лучше, чем просто "Кофе".
     """
 
-    candidates = (
-        product.product_name,
-        product.generic_name,
+    names = get_raw_names(
+        product
     )
 
-    for candidate in candidates:
-        cleaned = clean_text(
-            candidate
+    if not names:
+        return None
+
+    non_generic = [
+        value
+        for value in names
+        if not is_generic_name(
+            value
         )
+    ]
 
-        if cleaned:
-            return cleaned
+    if not non_generic:
+        return names[0]
 
-    return None
+    # Предпочитаем более содержательное название,
+    # но не огромный состав или описание.
+    non_generic.sort(
+        key=lambda value: (
+            len(value.split()),
+            len(value),
+        ),
+        reverse=True,
+    )
+
+    return non_generic[0]
+
+
+def category_text(
+    product: OpenFoodFactsProduct,
+) -> str:
+    """
+    Собирает все категории OFF
+    в одну строку для определения типа товара.
+    """
+
+    values = (
+        *product.categories,
+        *product.categories_tags,
+        *product.categories_tags_ru,
+        *product.categories_tags_en,
+    )
+
+    return normalized(
+        " ".join(
+            clean_text(value)
+            for value in values
+            if clean_text(value)
+        )
+    )
 
 
 def choose_product_kind(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Пытается определить тип продукта
-    из категорий.
-
-    Используется только как fallback,
-    если название слишком общее.
+    Определяет базовый тип продукта
+    по категориям.
     """
 
-    category_text = " ".join(
-        (
-            *product.categories,
-            *product.categories_tags,
-        )
-    )
-
-    normalized_categories = normalized(
-        category_text
+    text = category_text(
+        product
     )
 
     rules = (
@@ -358,12 +600,26 @@ def choose_product_kind(
                 "селед",
             ),
         ),
+        (
+            "Сыр",
+            (
+                "cheese",
+                "сыр",
+            ),
+        ),
+        (
+            "Йогурт",
+            (
+                "yogurt",
+                "yoghurt",
+                "йогурт",
+            ),
+        ),
     )
 
     for title, terms in rules:
         if any(
-            term
-            in normalized_categories
+            term in text
             for term in terms
         ):
             return title
@@ -371,34 +627,71 @@ def choose_product_kind(
     return None
 
 
+def format_package_for_name(
+    *,
+    value: Decimal | None,
+    unit: str | None,
+) -> str | None:
+    """
+    Готовит короткую упаковку
+    для названия товара.
+    """
+
+    if (
+        value is None
+        or not unit
+    ):
+        return None
+
+    if (
+        value
+        == value.to_integral()
+    ):
+        number = str(
+            int(value)
+        )
+    else:
+        number = format(
+            value.normalize(),
+            "f",
+        )
+
+    return (
+        f"{number} {unit}"
+    )
+
+
 def build_informative_name(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Строит более полезное имя товара.
+    Формирует итоговое человеческое название.
 
-    Если OFF отдал просто:
+    Примеры:
 
-        Кофе
-
-    но есть бренд:
-
-        Poetti
-
-    получим хотя бы:
-
+        Кофе + Poetti
+        ->
         Кофе Poetti
 
-    Если есть упаковка:
+        Leggenda Original + Poetti
+        ->
+        Poetti Leggenda Original
 
+        Кофе + Poetti + 250 г
+        ->
         Кофе Poetti 250 г
-
-    Это лучше, чем оставлять десятки
-    одинаковых карточек "Кофе".
     """
 
-    base_name = choose_base_name(
-        product
+    specific_name = (
+        choose_specific_name(
+            product
+        )
+    )
+
+    product_kind = (
+        choose_product_kind(
+            product
+        )
     )
 
     brand = choose_brand(
@@ -406,14 +699,19 @@ def build_informative_name(
     )
 
     package_value, package_unit = (
-        parse_quantity(
-            product.quantity
+        parse_structured_quantity(
+            product
         )
     )
 
-    product_kind = choose_product_kind(
-        product
+    package_text = (
+        format_package_for_name(
+            value=package_value,
+            unit=package_unit,
+        )
     )
+
+    base_name = specific_name
 
     if not base_name:
         base_name = product_kind
@@ -421,48 +719,72 @@ def build_informative_name(
     if not base_name:
         return None
 
-    parts: list[str] = [
-        clean_text(
-            base_name
-        )
-    ]
+    parts: list[str] = []
 
-    current_text = normalized(
-        " ".join(parts)
-    )
+    #
+    # Если имя уже не общее:
+    #
+    # Leggenda Original
+    #
+    # ставим бренд впереди:
+    #
+    # Poetti Leggenda Original
+    #
 
     if (
         brand
+        and not is_generic_name(
+            base_name
+        )
         and normalized(brand)
-        not in current_text
+        not in normalized(
+            base_name
+        )
+    ):
+        parts.append(
+            brand
+        )
+
+    parts.append(
+        base_name
+    )
+
+    #
+    # Если название просто "Кофе",
+    # бренд добавляем после него.
+    #
+
+    if (
+        brand
+        and is_generic_name(
+            base_name
+        )
+        and normalized(brand)
+        not in normalized(
+            " ".join(parts)
+        )
     ):
         parts.append(
             brand
         )
 
     if (
-        package_value is not None
-        and package_unit
+        package_text
+        and normalized(
+            package_text
+        )
+        not in normalized(
+            " ".join(parts)
+        )
     ):
-        package_text = (
-            f"{package_value.normalize()} "
-            f"{package_unit}"
+        parts.append(
+            package_text
         )
 
-        if (
-            normalized(package_text)
-            not in normalized(
-                " ".join(parts)
-            )
-        ):
-            parts.append(
-                package_text
-            )
-
     return " ".join(
-        part
-        for part in parts
-        if part
+        unique_values(
+            parts
+        )
     )
 
 
@@ -470,78 +792,188 @@ def choose_name(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Выбирает итоговое имя для MarkaRadar.
-
-    Если название уже хорошее —
-    сохраняем его.
-
-    Если оно слишком общее —
-    пытаемся обогатить его брендом
-    и упаковкой.
+    Итоговое название для MarkaRadar.
     """
 
-    base_name = choose_base_name(
-        product
-    )
-
-    if not base_name:
-        return build_informative_name(
-            product
-        )
-
-    if not is_generic_name(
-        base_name
-    ):
-        return base_name
-
-    informative_name = (
+    informative = (
         build_informative_name(
             product
         )
     )
 
-    if (
-        informative_name
-        and normalized(
-            informative_name
-        )
-        != normalized(
-            base_name
-        )
-    ):
-        return informative_name
+    if informative:
+        return informative
 
-    return base_name
+    return choose_specific_name(
+        product
+    )
+
+
+def build_keywords(
+    product: OpenFoodFactsProduct,
+) -> str | None:
+    """
+    Собирает дополнительные поисковые признаки.
+    """
+
+    values: list[str] = []
+
+    source_values = (
+        *product.categories,
+        *product.categories_tags,
+        *product.categories_tags_ru,
+        *product.categories_tags_en,
+        *product.labels,
+        *product.labels_tags,
+        *product.packaging_tags,
+        *product.countries_tags,
+    )
+
+    for raw_value in source_values:
+        value = humanize_tag(
+            raw_value
+        )
+
+        if value:
+            values.append(
+                value
+            )
+
+    brand = choose_brand(
+        product
+    )
+
+    if brand:
+        values.append(
+            brand
+        )
+
+    product_kind = (
+        choose_product_kind(
+            product
+        )
+    )
+
+    if product_kind:
+        values.append(
+            product_kind
+        )
+
+    values = unique_values(
+        values
+    )
+
+    if not values:
+        return None
+
+    return ", ".join(
+        values
+    )
 
 
 def build_description(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Формирует описание товара.
-
-    Состав используем только если
-    другого полезного описания нет.
+    Выбирает дополнительное описание товара.
     """
 
-    generic_name = clean_text(
-        product.generic_name
+    candidates = (
+        product.generic_name_ru,
+        product.generic_name,
+        product.generic_name_en,
+        product.ingredients_text,
     )
 
-    ingredients = clean_text(
-        product.ingredients_text
-    )
-
-    if (
-        generic_name
-        and not is_generic_name(
-            generic_name
+    for value in candidates:
+        cleaned = clean_text(
+            value
         )
-    ):
-        return generic_name
 
-    if ingredients:
-        return ingredients
+        if (
+            cleaned
+            and not is_generic_name(
+                cleaned
+            )
+        ):
+            return cleaned
+
+    return None
+
+
+def build_subtype(
+    product: OpenFoodFactsProduct,
+) -> str | None:
+    """
+    Пытается получить полезный подтип.
+
+    Например для кофе:
+
+        растворимый
+        молотый
+        в зернах
+    """
+
+    text = category_text(
+        product
+    )
+
+    rules = (
+        (
+            "Растворимый",
+            (
+                "instant coffee",
+                "soluble coffee",
+                "растворим",
+            ),
+        ),
+        (
+            "Молотый",
+            (
+                "ground coffee",
+                "молот",
+            ),
+        ),
+        (
+            "В зёрнах",
+            (
+                "coffee beans",
+                "whole bean",
+                "зернах",
+                "зёрнах",
+            ),
+        ),
+        (
+            "Без кофеина",
+            (
+                "decaf",
+                "decaffeinated",
+                "без кофеина",
+            ),
+        ),
+        (
+            "Пастеризованное",
+            (
+                "pasteurized milk",
+                "pasteurised milk",
+                "пастеризован",
+            ),
+        ),
+        (
+            "Ультрапастеризованное",
+            (
+                "uht milk",
+                "ультрапастеризован",
+            ),
+        ),
+    )
+
+    for title, terms in rules:
+        if any(
+            term in text
+            for term in terms
+        ):
+            return title
 
     return None
 
@@ -557,13 +989,15 @@ async def import_openfoodfacts_product(
 
         barcode
           ↓
-        Open Food Facts
+        OpenFoodFacts
+          ↓
+        нормализация
           ↓
         Category Mapper
           ↓
         Product Merge Engine
           ↓
-        MarkaRadar DB
+        MarkaRadar
     """
 
     client = OpenFoodFactsClient()
@@ -584,10 +1018,18 @@ async def import_openfoodfacts_product(
     if not product_name:
         return None
 
-    category_values = unique_values(
-        (
-            *external_product.categories,
-            *external_product.categories_tags,
+    #
+    # CATEGORY
+    #
+
+    category_values = (
+        unique_values(
+            (
+                *external_product.categories,
+                *external_product.categories_tags,
+                *external_product.categories_tags_ru,
+                *external_product.categories_tags_en,
+            )
         )
     )
 
@@ -598,7 +1040,7 @@ async def import_openfoodfacts_product(
         )
     )
 
-    category_id = None
+    category_id: int | None = None
 
     if (
         category_mapping.category
@@ -608,33 +1050,63 @@ async def import_openfoodfacts_product(
             category_mapping.category.id
         )
 
+    #
+    # PACKAGE
+    #
+
     package_value, package_unit = (
-        parse_quantity(
-            external_product.quantity
+        parse_structured_quantity(
+            external_product
         )
     )
+
+    #
+    # IMAGE
+    #
 
     image_url = (
         external_product.image_front_url
         or external_product.image_url
+        or external_product.image_front_small_url
     )
+
+    #
+    # MERGE
+    #
 
     incoming = ExternalProductData(
         source="openfoodfacts",
+
         name=product_name,
+
         brand_name=choose_brand(
             external_product
         ),
+
         barcode=(
             external_product.barcode
         ),
+
         category_id=category_id,
-        package_value=package_value,
-        package_unit=package_unit,
+
+        package_value=(
+            package_value
+        ),
+
+        package_unit=(
+            package_unit
+        ),
+
+        subtype=build_subtype(
+            external_product
+        ),
+
         description=build_description(
             external_product
         ),
+
         image_url=image_url,
+
         keywords=build_keywords(
             external_product
         ),
@@ -644,4 +1116,4 @@ async def import_openfoodfacts_product(
         session=session,
         incoming=incoming,
         commit=commit,
-    )
+                )
