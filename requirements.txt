@@ -6,3 +6,5 @@ pydantic-settings==2.6.1
 python-dotenv==1.0.1
 aiohttp==3.10.11
 uvloop==0.21.0; platform_system != "Windows"
+
+beautifulsoup4==4.12.3
