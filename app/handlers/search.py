@@ -11,6 +11,9 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 
 from app.database.session import async_session_maker
+from app.integrations.openfoodfacts_adapter import (
+    import_openfoodfacts_product,
+)
 from app.keyboards.decision_search import (
     get_decision_search_keyboard,
 )
@@ -33,6 +36,7 @@ from app.search.intent_state import (
 from app.search.search_pipeline import (
     SearchPipelineResult,
     SearchPipelineScreen,
+    is_possible_barcode,
     run_search_pipeline,
 )
 from app.services.price_service import (
@@ -68,6 +72,40 @@ UNKNOWN_BRAND_NAMES = {
 }
 
 
+GENERIC_PRODUCT_NAMES = {
+    "кофе",
+    "молоко",
+    "пицца",
+    "чай",
+    "вода",
+    "сыр",
+    "масло",
+    "йогурт",
+    "кефир",
+    "сельдь",
+    "сок",
+}
+
+
+def normalize_simple_text(
+    value: Any,
+) -> str:
+    """
+    Простая нормализация текста
+    для внутренних проверок.
+    """
+
+    return " ".join(
+        str(
+            value or ""
+        )
+        .strip()
+        .lower()
+        .replace("ё", "е")
+        .split()
+    )
+
+
 def format_number(
     value: Decimal | float | int | None,
 ) -> str:
@@ -75,6 +113,7 @@ def format_number(
     Убирает лишние нули у чисел.
 
     Примеры:
+
     245.000 -> 245
     0.450 -> 0.45
     1.500 -> 1.5
@@ -153,13 +192,128 @@ def is_real_brand(
     Проверяет, указан ли настоящий бренд.
     """
 
-    normalized_brand = str(
-        brand_name or ""
-    ).strip().lower()
+    normalized_brand = normalize_simple_text(
+        brand_name
+    )
 
     return (
         normalized_brand
         not in UNKNOWN_BRAND_NAMES
+    )
+
+
+def is_generic_product_name(
+    product_name: str | None,
+) -> bool:
+    """
+    Проверяет слишком общее название.
+
+    Например:
+
+    Кофе
+    Молоко
+    Пицца
+    """
+
+    return (
+        normalize_simple_text(
+            product_name
+        )
+        in GENERIC_PRODUCT_NAMES
+    )
+
+
+def should_enrich_barcode_product(
+    pipeline_result: SearchPipelineResult,
+) -> bool:
+    """
+    Решает, стоит ли обращаться к OpenFoodFacts
+    для уже существующего товара.
+
+    Если карточка уже хорошая, лишний HTTP-запрос
+    не делаем.
+
+    Обогащаем, когда товар найден по штрихкоду,
+    но карточка явно неполная.
+    """
+
+    if (
+        pipeline_result.screen
+        != SearchPipelineScreen.BARCODE_PRODUCT
+    ):
+        return False
+
+    item = pipeline_result.barcode_product
+
+    if item is None:
+        return False
+
+    product = item.product
+    brand = item.brand
+
+    missing_brand = not is_real_brand(
+        getattr(
+            brand,
+            "name",
+            None,
+        )
+    )
+
+    generic_name = is_generic_product_name(
+        getattr(
+            product,
+            "name",
+            None,
+        )
+    )
+
+    missing_image = not bool(
+        getattr(
+            product,
+            "image_url",
+            None,
+        )
+    )
+
+    missing_package = (
+        getattr(
+            product,
+            "package_value",
+            None,
+        )
+        is None
+        or not getattr(
+            product,
+            "package_unit",
+            None,
+        )
+    )
+
+    missing_description = not bool(
+        getattr(
+            product,
+            "description",
+            None,
+        )
+    )
+
+    missing_subtype = not bool(
+        getattr(
+            product,
+            "subtype",
+            None,
+        )
+    )
+
+    return any(
+        (
+            missing_brand,
+            generic_name,
+            missing_image,
+            missing_package,
+            missing_description,
+            missing_subtype,
+        )
     )
 
 
@@ -182,7 +336,9 @@ def build_product_title(
     if not is_real_brand(
         brand.name
     ):
-        return f"<b>{product_name}</b>"
+        return (
+            f"<b>{product_name}</b>"
+        )
 
     return (
         f"<b>{escape(str(brand.name))} — "
@@ -284,9 +440,6 @@ def format_trust_engine_text(
 ) -> str:
     """
     Формирует главный блок решения MarkaRadar.
-
-    Этот блок показывается раньше
-    технической информации о товаре.
     """
 
     lines = [
@@ -434,15 +587,6 @@ def build_product_card(
 ) -> str:
     """
     Формирует карточку товара.
-
-    Порядок:
-
-    1. решение MarkaRadar;
-    2. доверие и объяснение;
-    3. название товара;
-    4. цена;
-    5. техническая информация;
-    6. предложение поставить оценку.
     """
 
     title = build_product_title(
@@ -538,10 +682,8 @@ async def send_search_loader(
     message: Message,
 ) -> Message | None:
     """
-    Показывает пользователю, что поиск начался.
-
-    Если GIF отсутствует, отправляет
-    обычное текстовое сообщение.
+    Показывает пользователю,
+    что поиск начался.
     """
 
     with suppress(Exception):
@@ -592,8 +734,7 @@ async def remove_search_loader(
     loading_message: Message | None,
 ) -> None:
     """
-    Удаляет GIF или текст загрузки,
-    когда поиск завершён.
+    Удаляет сообщение загрузки.
     """
 
     if loading_message is None:
@@ -667,8 +808,9 @@ async def show_single_product(
     category,
 ) -> None:
     """
-    Загружает рейтинг и цены, запускает
-    Trust Engine и показывает карточку.
+    Загружает рейтинг и цены,
+    запускает Trust Engine
+    и показывает карточку.
     """
 
     rating = await get_full_product_rating(
@@ -707,9 +849,7 @@ async def show_single_product(
     trust_result = evaluate_product(
         average_rating=average_rating,
         votes_count=votes_count,
-        data_quality_score=(
-            data_quality_score
-        ),
+        data_quality_score=data_quality_score,
         popularity_score=0.0,
         relevance_score=100.0,
     )
@@ -728,7 +868,8 @@ def format_decision_product(
     item: DecisionProduct,
 ) -> str:
     """
-    Форматирует товар для первого экрана решения.
+    Форматирует товар
+    для первого экрана решения.
     """
 
     if item.brand_name:
@@ -747,7 +888,9 @@ def format_decision_product(
             f" · 👥 {item.votes_count}"
         )
     else:
-        rating_line = "⭐ Оценок пока нет"
+        rating_line = (
+            "⭐ Оценок пока нет"
+        )
 
     return (
         f"<b>{title}</b>\n"
@@ -763,7 +906,8 @@ def build_decision_screen_text(
     explanation: str | None,
 ) -> str:
     """
-    Формирует первый экран помощника выбора.
+    Формирует первый экран
+    помощника выбора.
     """
 
     lines = [
@@ -776,7 +920,10 @@ def build_decision_screen_text(
     if result.best_choice is not None:
         lines.extend(
             [
-                "🏆 <b>Лучший подтверждённый выбор</b>",
+                (
+                    "🏆 <b>Лучший "
+                    "подтверждённый выбор</b>"
+                ),
                 "",
                 format_decision_product(
                     result.best_choice
@@ -805,7 +952,10 @@ def build_decision_screen_text(
     else:
         lines.extend(
             [
-                "⚪ <b>Уверенного лидера пока нет</b>",
+                (
+                    "⚪ <b>Уверенного лидера "
+                    "пока нет</b>"
+                ),
                 "",
                 (
                     "Подходящие товары найдены, "
@@ -831,8 +981,10 @@ def build_decision_screen_text(
     if result.insufficient_data:
         lines.extend(
             [
-                "⚪ <b>Товары с небольшим "
-                "количеством оценок</b>",
+                (
+                    "⚪ <b>Товары с небольшим "
+                    "количеством оценок</b>"
+                ),
                 (
                     "Они подходят по запросу, "
                     "но их рейтинг пока нельзя "
@@ -864,11 +1016,8 @@ def build_decision_keyboard_result(
     result: DecisionSearchResult,
 ) -> DecisionSearchResult:
     """
-    Подготавливает Decision Search для клавиатуры.
-
-    Пока callback-пагинация Decision Search
-    не подключена, кнопка «Показать ещё»
-    не отображается.
+    Подготавливает Decision Search
+    для клавиатуры.
     """
 
     alternatives = list(
@@ -932,8 +1081,10 @@ async def show_decision_screen(
     )
 
     if has_buttons:
-        keyboard = get_decision_search_keyboard(
-            keyboard_result
+        keyboard = (
+            get_decision_search_keyboard(
+                keyboard_result
+            )
         )
     else:
         fallback_products = [
@@ -949,8 +1100,10 @@ async def show_decision_screen(
             in decision.other_products[:8]
         ]
 
-        keyboard = get_search_suggestions_keyboard(
-            fallback_products
+        keyboard = (
+            get_search_suggestions_keyboard(
+                fallback_products
+            )
         )
 
     text = build_decision_screen_text(
@@ -971,7 +1124,7 @@ async def show_intents_screen(
     pipeline_result: SearchPipelineResult,
 ) -> None:
     """
-    Показывает очищенные человеческие уточнения.
+    Показывает уточнения.
     """
 
     user = message.from_user
@@ -1019,7 +1172,7 @@ async def show_families_screen(
     pipeline_result: SearchPipelineResult,
 ) -> None:
     """
-    Показывает компактные виды товара.
+    Показывает виды продукта.
     """
 
     families = pipeline_result.families
@@ -1066,7 +1219,7 @@ async def show_not_found_screen(
     query: str,
 ) -> None:
     """
-    Показывает понятный экран отсутствия результатов.
+    Показывает экран отсутствия результатов.
     """
 
     await message.answer(
@@ -1081,6 +1234,169 @@ async def show_not_found_screen(
     )
 
 
+async def try_enrich_barcode_from_openfoodfacts(
+    *,
+    session,
+    barcode: str,
+) -> bool:
+    """
+    Пытается получить товар из OpenFoodFacts
+    и объединить данные с MarkaRadar.
+
+    Ошибка внешнего сервиса никогда не должна
+    ломать основной поиск.
+
+    Возвращает True, если OpenFoodFacts
+    вернул и обработал товар.
+    """
+
+    try:
+        merge_result = (
+            await import_openfoodfacts_product(
+                session=session,
+                barcode=barcode,
+                commit=False,
+            )
+        )
+
+        if merge_result is None:
+            logger.info(
+                "OpenFoodFacts: товар %s "
+                "не найден",
+                barcode,
+            )
+            return False
+
+        await session.commit()
+
+        logger.info(
+            "OpenFoodFacts merge: "
+            "barcode=%s, product_id=%s, "
+            "created=%s, match=%s, fields=%s",
+            barcode,
+            merge_result.product.id,
+            merge_result.created,
+            merge_result.match_type,
+            merge_result.updated_fields,
+        )
+
+        return True
+
+    except ValueError as error:
+        # Например, OFF нашёл новый товар,
+        # но Category Mapper пока не смог
+        # определить category_id.
+        await session.rollback()
+
+        logger.warning(
+            "OpenFoodFacts не удалось "
+            "импортировать товар %s: %s",
+            barcode,
+            error,
+        )
+
+        return False
+
+    except Exception:
+        await session.rollback()
+
+        logger.exception(
+            "Ошибка OpenFoodFacts "
+            "для штрихкода %s",
+            barcode,
+        )
+
+        return False
+
+
+async def run_pipeline_with_external_enrichment(
+    *,
+    session,
+    query: str,
+) -> SearchPipelineResult:
+    """
+    Выполняет Search Pipeline и при необходимости
+    подключает OpenFoodFacts.
+
+    Сценарии:
+
+    1. Обычный текстовый запрос:
+       работает только локальная база.
+
+    2. Штрихкод найден и карточка полная:
+       внешний запрос не выполняется.
+
+    3. Штрихкод найден, но карточка неполная:
+       OpenFoodFacts дополняет существующий товар,
+       затем Pipeline запускается повторно.
+
+    4. Штрихкод отсутствует в MarkaRadar:
+       пытаемся получить его из OpenFoodFacts,
+       сохранить и повторить Pipeline.
+    """
+
+    pipeline_result = await run_search_pipeline(
+        session=session,
+        query=query,
+        intent_limit=6,
+        family_limit=6,
+        decision_candidates_limit=20,
+    )
+
+    cleaned_query = " ".join(
+        query.strip().split()
+    )
+
+    if not is_possible_barcode(
+        cleaned_query
+    ):
+        return pipeline_result
+
+    should_try_external = False
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.NOT_FOUND
+    ):
+        should_try_external = True
+
+    elif should_enrich_barcode_product(
+        pipeline_result
+    ):
+        should_try_external = True
+
+    if not should_try_external:
+        return pipeline_result
+
+    logger.info(
+        "Пробуем OpenFoodFacts "
+        "для штрихкода %s",
+        cleaned_query,
+    )
+
+    enriched = (
+        await try_enrich_barcode_from_openfoodfacts(
+            session=session,
+            barcode=cleaned_query,
+        )
+    )
+
+    if not enriched:
+        return pipeline_result
+
+    # После commit объекты остаются доступными,
+    # потому что expire_on_commit=False,
+    # но нам нужен совершенно новый результат
+    # поиска уже с обновлёнными данными.
+    return await run_search_pipeline(
+        session=session,
+        query=cleaned_query,
+        intent_limit=6,
+        family_limit=6,
+        decision_candidates_limit=20,
+    )
+
+
 async def process_pipeline_result(
     *,
     message: Message,
@@ -1088,7 +1404,8 @@ async def process_pipeline_result(
     pipeline_result: SearchPipelineResult,
 ) -> None:
     """
-    Показывает экран, выбранный Search Pipeline.
+    Показывает экран,
+    выбранный Search Pipeline.
     """
 
     user = message.from_user
@@ -1172,9 +1489,19 @@ async def search_handler(
     """
     Главный обработчик поиска MarkaRadar.
 
-    Этот обработчик не принимает поисковых решений
-    самостоятельно. Он вызывает только единый
-    Search Pipeline.
+    Обычный поиск:
+        Search Pipeline -> результат.
+
+    Поиск по штрихкоду:
+        Search Pipeline
+             ↓
+        при необходимости OpenFoodFacts
+             ↓
+        Product Merge Engine
+             ↓
+        повторный Search Pipeline
+             ↓
+        результат пользователю.
     """
 
     if message.text is None:
@@ -1192,25 +1519,26 @@ async def search_handler(
     if query.startswith("/"):
         return
 
-    loading_message = await send_search_loader(
-        message
+    loading_message = (
+        await send_search_loader(
+            message
+        )
     )
 
     try:
         async with async_session_maker() as session:
             pipeline_result = (
-                await run_search_pipeline(
+                await run_pipeline_with_external_enrichment(
                     session=session,
                     query=query,
-                    intent_limit=6,
-                    family_limit=6,
-                    decision_candidates_limit=20,
                 )
             )
 
             logger.info(
-                "Search Pipeline: query=%r, screen=%s, "
-                "intents=%s, families=%s, candidates=%s",
+                "Search Pipeline: "
+                "query=%r, screen=%s, "
+                "intents=%s, families=%s, "
+                "candidates=%s",
                 query,
                 pipeline_result.screen,
                 len(
@@ -1250,4 +1578,4 @@ async def search_handler(
     finally:
         await remove_search_loader(
             loading_message
-    )
+        )
