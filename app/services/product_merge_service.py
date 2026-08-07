@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.brand import Brand
+from app.database.models.category import Category
 from app.database.models.product import Product
 from app.utils.text import normalize_text
 
@@ -37,6 +38,21 @@ GENERIC_PRODUCT_NAMES = {
 }
 
 
+GENERIC_CATEGORY_NAMES = {
+    "",
+    "продукты",
+    "продукт",
+    "еда",
+    "food",
+    "foods",
+    "products",
+    "product",
+    "прочее",
+    "другое",
+    "other",
+}
+
+
 class ProductMatchType(StrEnum):
     """
     Каким способом внешний товар
@@ -54,14 +70,6 @@ class ExternalProductData:
     """
     Универсальный формат товара
     из любого внешнего источника.
-
-    В будущем в него смогут преобразовываться:
-
-    - OpenFoodFacts;
-    - Яндекс Маркет;
-    - файлы поставщиков;
-    - каталоги производителей;
-    - другие разрешённые API.
     """
 
     source: str
@@ -111,7 +119,9 @@ def clean_text(
         return ""
 
     return " ".join(
-        str(value).strip().split()
+        str(value)
+        .strip()
+        .split()
     )
 
 
@@ -129,8 +139,14 @@ def normalized(
     if not cleaned:
         return ""
 
-    return normalize_text(
-        cleaned
+    return (
+        normalize_text(
+            cleaned
+        )
+        .replace(
+            "ё",
+            "е",
+        )
     )
 
 
@@ -139,8 +155,6 @@ def normalize_barcode(
 ) -> str | None:
     """
     Нормализует штрихкод.
-
-    Оставляем только цифры.
     """
 
     if not barcode:
@@ -152,11 +166,6 @@ def normalize_barcode(
         if char.isdigit()
     )
 
-    if not digits:
-        return None
-
-    # Не считаем слишком короткое число
-    # нормальным товарным штрихкодом.
     if len(digits) < 8:
         return None
 
@@ -168,7 +177,7 @@ def normalize_package_unit(
 ) -> str | None:
     """
     Приводит единицы упаковки
-    к более стабильному виду.
+    к единому виду.
     """
 
     clean_unit = normalized(
@@ -205,7 +214,9 @@ def normalize_package_unit(
 
     return aliases.get(
         clean_unit,
-        clean_text(unit).lower(),
+        clean_text(
+            unit
+        ).lower(),
     )
 
 
@@ -236,16 +247,46 @@ def is_unknown_brand(
     brand_name: str | None,
 ) -> bool:
     """
-    Проверяет служебные названия бренда.
+    Проверяет служебный бренд.
+    """
+
+    normalized_name = normalized(
+        brand_name
+    )
+
+    return (
+        not normalized_name
+        or normalized_name
+        in {
+            normalized(item)
+            for item in UNKNOWN_BRAND_NAMES
+        }
+    )
+
+
+def is_generic_category(
+    category_name: str | None,
+) -> bool:
+    """
+    Проверяет слишком общую категорию.
+
+    Например:
+
+        Продукты
+        Food
+        Другое
+
+    Такую категорию разрешается заменить
+    более конкретной.
     """
 
     return (
         normalized(
-            brand_name
+            category_name
         )
         in {
             normalized(item)
-            for item in UNKNOWN_BRAND_NAMES
+            for item in GENERIC_CATEGORY_NAMES
         }
     )
 
@@ -255,23 +296,12 @@ def is_generic_product_name(
 ) -> bool:
     """
     Определяет слишком общее название.
-
-    Например:
-
-        Кофе
-        Молоко
-        Пицца
-
-    Такое имя можно безопасно заменить
-    более информативным внешним названием.
     """
 
-    normalized_name = normalized(
-        name
-    )
-
     return (
-        normalized_name
+        normalized(
+            name
+        )
         in {
             normalized(item)
             for item in GENERIC_PRODUCT_NAMES
@@ -287,16 +317,13 @@ def is_better_name(
     """
     Решает, можно ли заменить название.
 
-    Главный принцип:
-    хорошие данные не портим.
-
-    Но:
+    Например:
 
         Кофе
 
     можно заменить на:
 
-        Кофе растворимый Carte Noire 95 г
+        Poetti Leggenda Original
     """
 
     current = clean_text(
@@ -313,21 +340,34 @@ def is_better_name(
     if not current:
         return True
 
-    if normalized(current) == normalized(incoming):
+    if (
+        normalized(current)
+        == normalized(incoming)
+    ):
         return False
 
     if (
-        is_generic_product_name(current)
+        is_generic_product_name(
+            current
+        )
+        and not is_generic_product_name(
+            incoming
+        )
+    ):
+        return True
+
+    if (
+        is_generic_product_name(
+            current
+        )
         and len(incoming) > len(current)
     ):
         return True
 
-    # Сильно более подробное имя
-    # также можно считать улучшением.
     if (
         len(current) <= 10
         and len(incoming)
-        >= len(current) + 8
+        >= len(current) + 5
     ):
         return True
 
@@ -339,15 +379,18 @@ def should_fill_text(
     incoming_value: Any,
 ) -> bool:
     """
-    Простое правило для дополнительного поля:
-
-    заполняем только если у MarkaRadar
-    сейчас ничего нет.
+    Заполняет пустое поле новыми данными.
     """
 
     return (
-        not clean_text(current_value)
-        and bool(clean_text(incoming_value))
+        not clean_text(
+            current_value
+        )
+        and bool(
+            clean_text(
+                incoming_value
+            )
+        )
     )
 
 
@@ -356,7 +399,8 @@ def combine_keywords(
     incoming_keywords: str | None,
 ) -> str | None:
     """
-    Аккуратно объединяет ключевые слова.
+    Объединяет ключевые слова
+    без повторений.
     """
 
     current = clean_text(
@@ -383,11 +427,10 @@ def combine_keywords(
         current,
         incoming,
     ):
-        # Поддерживаем как запятые,
-        # так и обычные строковые наборы.
         parts = [
             part.strip()
-            for part in text.replace(
+            for part
+            in text.replace(
                 ";",
                 ",",
             ).split(",")
@@ -427,16 +470,20 @@ def build_search_text(
     *,
     product: Product,
     brand: Brand,
+    category: Category | None = None,
 ) -> str:
     """
-    Перестраивает внутреннее поисковое поле товара.
-
-    Сюда входят только существующие данные.
+    Перестраивает внутренний поисковый текст.
     """
 
     parts = (
         product.name,
         brand.name,
+        (
+            category.name
+            if category is not None
+            else None
+        ),
         product.subtype,
         product.keywords,
         product.description,
@@ -446,7 +493,9 @@ def build_search_text(
     )
 
     normalized_parts = [
-        normalized(part)
+        normalized(
+            part
+        )
         for part in parts
         if part is not None
     ]
@@ -507,9 +556,6 @@ async def get_or_create_brand(
     """
     Возвращает существующий бренд
     или создаёт новый.
-
-    Для отсутствующего бренда используется
-    единая служебная запись.
     """
 
     clean_brand = clean_text(
@@ -518,9 +564,13 @@ async def get_or_create_brand(
 
     if (
         not clean_brand
-        or is_unknown_brand(clean_brand)
+        or is_unknown_brand(
+            clean_brand
+        )
     ):
-        clean_brand = "Бренд не указан"
+        clean_brand = (
+            "Бренд не указан"
+        )
 
     existing = await find_brand(
         session=session,
@@ -546,13 +596,65 @@ async def get_or_create_brand(
     return brand
 
 
+async def get_brand_by_id(
+    *,
+    session: AsyncSession,
+    brand_id: int,
+) -> Brand | None:
+    """
+    Загружает текущий бренд товара.
+    """
+
+    result = await session.execute(
+        select(
+            Brand
+        )
+        .where(
+            Brand.id == brand_id
+        )
+        .limit(
+            1
+        )
+    )
+
+    return result.scalar_one_or_none()
+
+
+async def get_category_by_id(
+    *,
+    session: AsyncSession,
+    category_id: int | None,
+) -> Category | None:
+    """
+    Загружает категорию по ID.
+    """
+
+    if category_id is None:
+        return None
+
+    result = await session.execute(
+        select(
+            Category
+        )
+        .where(
+            Category.id == category_id
+        )
+        .limit(
+            1
+        )
+    )
+
+    return result.scalar_one_or_none()
+
+
 async def find_product_by_barcode(
     *,
     session: AsyncSession,
     barcode: str | None,
 ) -> Product | None:
     """
-    Самый надёжный способ сопоставления товара.
+    Самое надёжное сопоставление:
+    точный штрихкод.
     """
 
     normalized_barcode = normalize_barcode(
@@ -585,14 +687,7 @@ async def find_product_by_brand_and_name(
     name: str,
 ) -> Product | None:
     """
-    Второй уровень сопоставления.
-
-    Используется только точное нормализованное
-    совпадение бренда и названия.
-
-    Намеренно не используем агрессивный fuzzy-match:
-    случайное объединение двух разных товаров
-    гораздо опаснее создания дубля.
+    Сопоставление по бренду и имени.
     """
 
     normalized_name = normalized(
@@ -629,13 +724,8 @@ async def find_safe_name_match(
     name: str,
 ) -> Product | None:
     """
-    Очень осторожный fallback.
-
-    По одному названию объединяем только тогда,
-    когда существует ровно один товар
-    с таким точным normalized_name.
-
-    Если найдено два товара — не угадываем.
+    По одному названию объединяем товар
+    только при единственном точном совпадении.
     """
 
     normalized_name = normalized(
@@ -681,21 +771,20 @@ async def find_matching_product(
     ProductMatchType | None,
 ]:
     """
-    Ищет канонический товар.
+    Ищет существующий товар.
 
     Приоритет:
 
-    1. штрихкод;
-    2. бренд + точное название;
-    3. уникальное точное название.
-
-    Никаких опасных автоматических
-    fuzzy-слияний на первом этапе.
+    1. barcode;
+    2. brand + name;
+    3. уникальное точное имя.
     """
 
-    barcode_match = await find_product_by_barcode(
-        session=session,
-        barcode=incoming.barcode,
+    barcode_match = (
+        await find_product_by_barcode(
+            session=session,
+            barcode=incoming.barcode,
+        )
     )
 
     if barcode_match is not None:
@@ -718,16 +807,14 @@ async def find_matching_product(
             ProductMatchType.BRAND_AND_NAME,
         )
 
-    # Если бренд не указан, по одному общему
-    # названию вроде «Кофе» не объединяем.
-    if (
-        not is_generic_product_name(
-            incoming.name
-        )
+    if not is_generic_product_name(
+        incoming.name
     ):
-        name_match = await find_safe_name_match(
-            session=session,
-            name=incoming.name,
+        name_match = (
+            await find_safe_name_match(
+                session=session,
+                name=incoming.name,
+            )
         )
 
         if name_match is not None:
@@ -739,22 +826,49 @@ async def find_matching_product(
     return None, None
 
 
-def merge_product_fields(
+async def merge_product_fields(
     *,
+    session: AsyncSession,
     product: Product,
-    brand: Brand,
+    incoming_brand: Brand,
     incoming: ExternalProductData,
-) -> list[str]:
+) -> tuple[
+    list[str],
+    Brand,
+    Category | None,
+]:
     """
-    Безопасно дополняет существующую карточку.
+    Дополняет существующий товар.
 
-    Ключевое правило:
+    Здесь разрешено исправлять:
 
-    внешний источник не должен превращать
-    хорошую карточку MarkaRadar в плохую.
+    - общее название;
+    - служебный бренд;
+    - общую категорию;
+    - пустую упаковку;
+    - пустое описание;
+    - пустую картинку;
+    - ключевые слова.
+
+    Рейтинги, отзывы и ID товара
+    не изменяются.
     """
 
     updated_fields: list[str] = []
+
+    current_brand = (
+        await get_brand_by_id(
+            session=session,
+            brand_id=product.brand_id,
+        )
+    )
+
+    current_category = (
+        await get_category_by_id(
+            session=session,
+            category_id=product.category_id,
+        )
+    )
 
     incoming_name = clean_text(
         incoming.name
@@ -765,23 +879,30 @@ def merge_product_fields(
         incoming_name=incoming_name,
     ):
         product.name = incoming_name
-        product.normalized_name = normalized(
-            incoming_name
+
+        product.normalized_name = (
+            normalized(
+                incoming_name
+            )
         )
 
         updated_fields.append(
             "name"
         )
 
-    normalized_barcode = normalize_barcode(
-        incoming.barcode
+    normalized_barcode = (
+        normalize_barcode(
+            incoming.barcode
+        )
     )
 
     if (
         not product.barcode
         and normalized_barcode
     ):
-        product.barcode = normalized_barcode
+        product.barcode = (
+            normalized_barcode
+        )
 
         updated_fields.append(
             "barcode"
@@ -801,7 +922,8 @@ def merge_product_fields(
 
     if (
         product.package_value is None
-        and incoming_package_value is not None
+        and incoming_package_value
+        is not None
     ):
         product.package_value = (
             incoming_package_value
@@ -827,8 +949,10 @@ def merge_product_fields(
         product.subtype,
         incoming.subtype,
     ):
-        product.subtype = clean_text(
-            incoming.subtype
+        product.subtype = (
+            clean_text(
+                incoming.subtype
+            )
         )
 
         updated_fields.append(
@@ -839,8 +963,10 @@ def merge_product_fields(
         product.description,
         incoming.description,
     ):
-        product.description = clean_text(
-            incoming.description
+        product.description = (
+            clean_text(
+                incoming.description
+            )
         )
 
         updated_fields.append(
@@ -851,8 +977,10 @@ def merge_product_fields(
         product.image_url,
         incoming.image_url,
     ):
-        product.image_url = clean_text(
-            incoming.image_url
+        product.image_url = (
+            clean_text(
+                incoming.image_url
+            )
         )
 
         updated_fields.append(
@@ -869,59 +997,125 @@ def merge_product_fields(
         and merged_keywords
         != product.keywords
     ):
-        product.keywords = merged_keywords
+        product.keywords = (
+            merged_keywords
+        )
 
         updated_fields.append(
             "keywords"
         )
 
-    # Если исходная карточка имела служебный бренд,
-    # а внешний источник дал настоящий —
-    # привязываем настоящий бренд.
+    #
+    # BRAND MERGE
+    #
+    # Служебный бренд можно заменить
+    # нормальным брендом OpenFoodFacts.
+    #
+
     current_brand_name = (
-        product.brand.name
-        if getattr(
-            product,
-            "brand",
-            None,
-        )
+        current_brand.name
+        if current_brand is not None
         else None
     )
 
     if (
-        brand.id != product.brand_id
-        and is_unknown_brand(
-            current_brand_name
+        not is_unknown_brand(
+            incoming_brand.name
         )
-        and not is_unknown_brand(
-            brand.name
+        and (
+            current_brand is None
+            or is_unknown_brand(
+                current_brand_name
+            )
         )
+        and product.brand_id
+        != incoming_brand.id
     ):
-        product.brand_id = brand.id
-        product.brand = brand
+        product.brand_id = (
+            incoming_brand.id
+        )
+
+        current_brand = (
+            incoming_brand
+        )
 
         updated_fields.append(
             "brand_id"
         )
 
-    # category_id автоматически не меняем.
     #
-    # Ошибка категории может сломать поиск
-    # гораздо сильнее, чем отсутствие категории.
+    # CATEGORY MERGE
     #
-    # На следующем этапе сделаем Category Mapper.
+    # Старую общую категорию "Продукты"
+    # разрешаем заменить на более точную.
+    #
 
-    product.search_text = build_search_text(
-        product=product,
-        brand=brand,
-    )
-
-    if "search_text" not in updated_fields:
-        updated_fields.append(
-            "search_text"
+    if incoming.category_id is not None:
+        incoming_category = (
+            await get_category_by_id(
+                session=session,
+                category_id=incoming.category_id,
+            )
         )
 
-    return updated_fields
+        if incoming_category is not None:
+            current_category_name = (
+                current_category.name
+                if current_category
+                is not None
+                else None
+            )
+
+            should_replace_category = (
+                current_category is None
+                or is_generic_category(
+                    current_category_name
+                )
+            )
+
+            if (
+                should_replace_category
+                and product.category_id
+                != incoming_category.id
+            ):
+                product.category_id = (
+                    incoming_category.id
+                )
+
+                current_category = (
+                    incoming_category
+                )
+
+                updated_fields.append(
+                    "category_id"
+                )
+
+    #
+    # SEARCH TEXT
+    #
+
+    actual_brand = (
+        current_brand
+        or incoming_brand
+    )
+
+    product.search_text = (
+        build_search_text(
+            product=product,
+            brand=actual_brand,
+            category=current_category,
+        )
+    )
+
+    updated_fields.append(
+        "search_text"
+    )
+
+    return (
+        updated_fields,
+        actual_brand,
+        current_category,
+    )
 
 
 async def create_product(
@@ -932,17 +1126,12 @@ async def create_product(
 ) -> Product:
     """
     Создаёт новый товар.
-
-    category_id обязателен для новой карточки,
-    потому что поле Product.category_id
-    в текущей модели nullable=False.
     """
 
     if incoming.category_id is None:
         raise ValueError(
             "Невозможно создать новый товар "
-            "без category_id. "
-            "Сначала требуется Category Mapper."
+            "без category_id."
         )
 
     product_name = clean_text(
@@ -966,11 +1155,15 @@ async def create_product(
         barcode=normalize_barcode(
             incoming.barcode
         ),
-        package_value=normalize_package_value(
-            incoming.package_value
+        package_value=(
+            normalize_package_value(
+                incoming.package_value
+            )
         ),
-        package_unit=normalize_package_unit(
-            incoming.package_unit
+        package_unit=(
+            normalize_package_unit(
+                incoming.package_unit
+            )
         ),
         subtype=(
             clean_text(
@@ -999,15 +1192,25 @@ async def create_product(
         is_active=True,
     )
 
-    product.brand = brand
-
-    product.search_text = build_search_text(
-        product=product,
-        brand=brand,
-    )
-
     session.add(
         product
+    )
+
+    await session.flush()
+
+    category = (
+        await get_category_by_id(
+            session=session,
+            category_id=product.category_id,
+        )
+    )
+
+    product.search_text = (
+        build_search_text(
+            product=product,
+            brand=brand,
+            category=category,
+        )
     )
 
     await session.flush()
@@ -1024,30 +1227,18 @@ async def merge_external_product(
     """
     Главная точка входа Product Merge Engine.
 
-    Пример:
+    Приоритет сопоставления:
 
-        result = await merge_external_product(
-            session=session,
-            incoming=ExternalProductData(
-                source="openfoodfacts",
-                barcode="4601234567890",
-                brand_name="Carte Noire",
-                name="Кофе растворимый 95 г",
-                category_id=12,
-            ),
-        )
+        barcode
+          ↓
+        brand + name
+          ↓
+        unique exact name
 
-    Алгоритм:
+    Если товар существует, сохраняется его ID,
+    рейтинги, отзывы и история.
 
-    1. нормализует бренд;
-    2. ищет товар по штрихкоду;
-    3. затем по brand + name;
-    4. осторожно проверяет уникальное имя;
-    5. дополняет существующую карточку;
-    6. либо создаёт новый товар.
-
-    Рейтинги, отзывы и пользовательские данные
-    эта функция вообще не изменяет.
+    Внешние данные только улучшают карточку.
     """
 
     if not clean_text(
@@ -1064,33 +1255,39 @@ async def merge_external_product(
             "Не указано название товара."
         )
 
-    brand = await get_or_create_brand(
-        session=session,
-        brand_name=incoming.brand_name,
+    incoming_brand = (
+        await get_or_create_brand(
+            session=session,
+            brand_name=incoming.brand_name,
+        )
     )
 
     product, match_type = (
         await find_matching_product(
             session=session,
             incoming=incoming,
-            brand=brand,
+            brand=incoming_brand,
         )
     )
 
     created = False
 
+    result_brand = (
+        incoming_brand
+    )
+
     if product is None:
         product = await create_product(
             session=session,
             incoming=incoming,
-            brand=brand,
+            brand=incoming_brand,
         )
+
+        created = True
 
         match_type = (
             ProductMatchType.CREATED
         )
-
-        created = True
 
         updated_fields = (
             "name",
@@ -1107,12 +1304,19 @@ async def merge_external_product(
         )
 
     else:
+        (
+            updated_list,
+            result_brand,
+            _category,
+        ) = await merge_product_fields(
+            session=session,
+            product=product,
+            incoming_brand=incoming_brand,
+            incoming=incoming,
+        )
+
         updated_fields = tuple(
-            merge_product_fields(
-                product=product,
-                brand=brand,
-                incoming=incoming,
-            )
+            updated_list
         )
 
     await session.flush()
@@ -1122,7 +1326,7 @@ async def merge_external_product(
 
     return ProductMergeResult(
         product=product,
-        brand=brand,
+        brand=result_brand,
         created=created,
         match_type=(
             match_type
@@ -1134,4 +1338,4 @@ async def merge_external_product(
         source=clean_text(
             incoming.source
         ),
-  )
+    )
