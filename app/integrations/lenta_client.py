@@ -16,14 +16,24 @@ logger = logging.getLogger(__name__)
 
 LENTA_BASE_URL = "https://lenta.com"
 LENTA_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
+    "Mozilla/5.0 (Linux; Android 13; Mobile) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 MarkaRadar/1.0"
+    "Chrome/124.0 Mobile Safari/537.36"
 )
-REQUEST_TIMEOUT_SECONDS = 15
+
+REQUEST_TIMEOUT_SECONDS = 12
 CACHE_TTL_SECONDS = 10 * 60
 MAX_CATEGORY_PAGES = 2
 MAX_CONCURRENT_DETAIL_REQUESTS = 4
+
+# Если Лента отвечает одним из этих кодов,
+# считаем источник временно недоступным и
+# не пытаемся долбить его повторно.
+BLOCKED_STATUSES = {
+    401,
+    403,
+    429,
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -89,85 +99,222 @@ CATEGORY_ROUTES: dict[str, tuple[str, ...]] = {
 }
 
 PACKAGE_PATTERN = re.compile(
-    r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(кг|kg|г|гр|g|л|l|мл|ml)(?!\w)",
+    r"(?<!\d)"
+    r"(\d+(?:[.,]\d+)?)"
+    r"\s*"
+    r"(кг|kg|г|гр|g|л|l|мл|ml)"
+    r"(?!\w)",
     re.IGNORECASE,
 )
 
-SUBTYPE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Молотый", ("молотый", "ground coffee")),
-    ("В зёрнах", ("зерновой", "в зернах", "в зёрнах", "coffee beans")),
-    ("Растворимый", ("растворимый", "instant coffee")),
-    ("В капсулах", ("капсульный", "в капсулах", "капсулы")),
-    ("Пастеризованное", ("пастеризованное", "пастеризованный")),
-    ("Ультрапастеризованное", ("ультрапастеризованное", "ультрапастеризованный")),
-    ("Безлактозное", ("безлактозное", "без лактозы")),
-    ("Слабосолёная", ("слабосоленая", "слабосолёная", "малосольная")),
-    ("Филе", ("филе", "филе-кусочки", "филе кусочки")),
+SUBTYPE_RULES: tuple[
+    tuple[str, tuple[str, ...]],
+    ...
+] = (
+    (
+        "Молотый",
+        (
+            "молотый",
+            "ground coffee",
+        ),
+    ),
+    (
+        "В зёрнах",
+        (
+            "зерновой",
+            "в зернах",
+            "в зёрнах",
+            "coffee beans",
+        ),
+    ),
+    (
+        "Растворимый",
+        (
+            "растворимый",
+            "instant coffee",
+        ),
+    ),
+    (
+        "В капсулах",
+        (
+            "капсульный",
+            "в капсулах",
+            "капсулы",
+        ),
+    ),
+    (
+        "Пастеризованное",
+        (
+            "пастеризованное",
+            "пастеризованный",
+        ),
+    ),
+    (
+        "Ультрапастеризованное",
+        (
+            "ультрапастеризованное",
+            "ультрапастеризованный",
+        ),
+    ),
+    (
+        "Безлактозное",
+        (
+            "безлактозное",
+            "без лактозы",
+        ),
+    ),
+    (
+        "Слабосолёная",
+        (
+            "слабосоленая",
+            "слабосолёная",
+            "малосольная",
+        ),
+    ),
+    (
+        "Филе",
+        (
+            "филе",
+            "филе-кусочки",
+            "филе кусочки",
+        ),
+    ),
 )
 
 
 class LentaClient:
-    """ Клиент публичного каталога lenta.com. Не использует скрытые мобильные API. Поиск строится через серверные HTML-страницы категорий, после чего наиболее релевантные карточки уточняются через публичные страницы /product/. """
+    """ Необязательный tolerant-парсер публичного каталога lenta.com. Важно: - источник не является критическим; - 401 / 403 / 429 не считаются ошибкой поиска; - при блокировке парсер просто возвращает []; - исключения Ленты не должны ломать MarkaRadar. """
 
     def __init__( self, *, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS, ) -> None:
         self.timeout_seconds = max(
             5,
-            min(timeout_seconds, 30),
+            min(
+                timeout_seconds,
+                30,
+            ),
         )
-        self._cache: dict[str, tuple[float, str]] = {}
+
+        self._cache: dict[
+            str,
+            tuple[
+                float,
+                str,
+            ],
+        ] = {}
+
+        self._blocked_until = 0.0
 
     @staticmethod
-    def _normalize(value: Any) -> str:
+    def _normalize( value: Any, ) -> str:
         return " ".join(
-            str(value or "")
+            str(
+                value
+                or ""
+            )
             .strip()
             .lower()
-            .replace("ё", "е")
+            .replace(
+                "ё",
+                "е",
+            )
             .split()
         )
 
     @classmethod
-    def _tokens(cls, value: str) -> list[str]:
+    def _tokens( cls, value: str, ) -> list[str]:
         return [
             token
             for token in re.findall(
                 r"[a-zа-я0-9]+",
-                cls._normalize(value),
+                cls._normalize(
+                    value
+                ),
             )
-            if len(token) >= 2
+            if len(
+                token
+            )
+            >= 2
         ]
 
-    def _detect_route( self, query: str, ) -> tuple[str, str] | None:
-        normalized_query = self._normalize(query)
-        query_tokens = set(self._tokens(query))
+    def _detect_route( self, query: str, ) -> tuple[
+        str,
+        str,
+    ] | None:
+        normalized_query = (
+            self._normalize(
+                query
+            )
+        )
 
-        best: tuple[int, str, str] | None = None
+        query_tokens = set(
+            self._tokens(
+                query
+            )
+        )
 
-        for category_name, values in CATEGORY_ROUTES.items():
+        best: tuple[
+            int,
+            str,
+            str,
+        ] | None = None
+
+        for (
+            category_name,
+            values,
+        ) in CATEGORY_ROUTES.items():
             route = values[0]
             aliases = values[1:]
 
             for alias in aliases:
-                normalized_alias = self._normalize(alias)
-                alias_tokens = set(self._tokens(alias))
+                normalized_alias = (
+                    self._normalize(
+                        alias
+                    )
+                )
+
+                alias_tokens = set(
+                    self._tokens(
+                        alias
+                    )
+                )
 
                 score = 0
 
-                if normalized_alias == normalized_query:
+                if (
+                    normalized_alias
+                    == normalized_query
+                ):
                     score = 100
-                elif normalized_alias in normalized_query:
-                    score = 50 + len(alias_tokens)
+
+                elif (
+                    normalized_alias
+                    in normalized_query
+                ):
+                    score = (
+                        50
+                        + len(
+                            alias_tokens
+                        )
+                    )
+
                 elif (
                     alias_tokens
-                    and alias_tokens <= query_tokens
+                    and alias_tokens
+                    <= query_tokens
                 ):
-                    score = 40 + len(alias_tokens)
+                    score = (
+                        40
+                        + len(
+                            alias_tokens
+                        )
+                    )
 
                 if (
                     score
                     and (
                         best is None
-                        or score > best[0]
+                        or score
+                        > best[0]
                     )
                 ):
                     best = (
@@ -184,59 +331,122 @@ class LentaClient:
             best[2],
         )
 
+    def _mark_temporarily_blocked( self, *, seconds: int = 300, ) -> None:
+        self._blocked_until = (
+            time.monotonic()
+            + max(
+                seconds,
+                30,
+            )
+        )
+
+    def _is_temporarily_blocked( self, ) -> bool:
+        return (
+            time.monotonic()
+            < self._blocked_until
+        )
+
     async def _fetch_text( self, *, session: aiohttp.ClientSession, url: str, ) -> str | None:
-        cached = self._cache.get(url)
+        if self._is_temporarily_blocked():
+            return None
+
+        cached = (
+            self._cache.get(
+                url
+            )
+        )
+
         now = time.monotonic()
 
         if (
             cached
-            and now - cached[0] <= CACHE_TTL_SECONDS
+            and (
+                now
+                - cached[0]
+                <= CACHE_TTL_SECONDS
+            )
         ):
             return cached[1]
 
-        for attempt in range(2):
-            try:
-                async with session.get(
-                    url,
-                    allow_redirects=True,
-                ) as response:
-                    if response.status == 404:
-                        return None
+        try:
+            async with session.get(
+                url,
+                allow_redirects=True,
+            ) as response:
+                if (
+                    response.status
+                    in BLOCKED_STATUSES
+                ):
+                    self._mark_temporarily_blocked()
 
-                    if (
-                        response.status == 429
-                        and attempt == 0
-                    ):
-                        await asyncio.sleep(0.8)
-                        continue
-
-                    response.raise_for_status()
-
-                    text = await response.text()
-
-                    self._cache[url] = (
-                        now,
-                        text,
+                    logger.info(
+                        "Lenta unavailable: "
+                        "status=%s url=%s",
+                        response.status,
+                        url,
                     )
 
-                    return text
+                    return None
 
-            except (
-                aiohttp.ClientError,
-                TimeoutError,
-            ):
-                if attempt == 0:
-                    await asyncio.sleep(0.3)
-                    continue
+                if (
+                    response.status
+                    == 404
+                ):
+                    return None
 
-                logger.exception(
-                    "Lenta request failed: %s",
-                    url,
+                if (
+                    response.status
+                    >= 500
+                ):
+                    logger.info(
+                        "Lenta temporary server error: "
+                        "status=%s url=%s",
+                        response.status,
+                        url,
+                    )
+
+                    return None
+
+                response.raise_for_status()
+
+                text = (
+                    await response.text()
                 )
 
-                return None
+        except asyncio.TimeoutError:
+            logger.info(
+                "Lenta timeout: %s",
+                url,
+            )
 
-        return None
+            return None
+
+        except aiohttp.ClientError as error:
+            logger.info(
+                "Lenta request skipped: "
+                "%s (%s)",
+                url,
+                error.__class__.__name__,
+            )
+
+            return None
+
+        except Exception as error:
+            logger.warning(
+                "Unexpected Lenta parser error: "
+                "%s (%r)",
+                url,
+                error,
+            )
+
+            return None
+
+        self._cache[url] = (
+            now,
+            text,
+        )
+
+        return text
 
     @staticmethod
     def _extract_source_id( url: str, ) -> str:
@@ -246,17 +456,29 @@ class LentaClient:
         )
 
         if match:
-            return match.group(1)
+            return (
+                match.group(
+                    1
+                )
+            )
 
         return (
             url.rstrip("/")
-            .rsplit("/", 1)[-1]
+            .rsplit(
+                "/",
+                1,
+            )[-1]
         )
 
     @classmethod
-    def _parse_package( cls, text: str, ) -> tuple[Decimal | None, str | None]:
+    def _parse_package( cls, text: str, ) -> tuple[
+        Decimal | None,
+        str | None,
+    ]:
         matches = list(
-            PACKAGE_PATTERN.finditer(text)
+            PACKAGE_PATTERN.finditer(
+                text
+            )
         )
 
         if not matches:
@@ -265,17 +487,26 @@ class LentaClient:
         match = matches[-1]
 
         raw_value = (
-            match.group(1)
-            .replace(",", ".")
+            match.group(
+                1
+            )
+            .replace(
+                ",",
+                ".",
+            )
         )
 
         raw_unit = (
-            match.group(2)
+            match.group(
+                2
+            )
             .lower()
         )
 
         try:
-            value = Decimal(raw_value)
+            value = Decimal(
+                raw_value
+            )
         except Exception:
             return None, None
 
@@ -293,16 +524,30 @@ class LentaClient:
 
         return (
             value,
-            unit_map.get(raw_unit),
+            unit_map.get(
+                raw_unit
+            ),
         )
 
     @classmethod
     def _detect_subtype( cls, text: str, ) -> str | None:
-        normalized = cls._normalize(text)
+        normalized = (
+            cls._normalize(
+                text
+            )
+        )
 
-        for title, terms in SUBTYPE_RULES:
+        for (
+            title,
+            terms,
+        ) in SUBTYPE_RULES:
             if any(
-                cls._normalize(term) in normalized
+                (
+                    cls._normalize(
+                        term
+                    )
+                    in normalized
+                )
                 for term in terms
             ):
                 return title
@@ -311,8 +556,17 @@ class LentaClient:
 
     @classmethod
     def _score_name( cls, *, query: str, name: str, ) -> float:
-        query_tokens = cls._tokens(query)
-        name_tokens = cls._tokens(name)
+        query_tokens = (
+            cls._tokens(
+                query
+            )
+        )
+
+        name_tokens = (
+            cls._tokens(
+                name
+            )
+        )
 
         if (
             not query_tokens
@@ -320,7 +574,9 @@ class LentaClient:
         ):
             return 0.0
 
-        name_set = set(name_tokens)
+        name_set = set(
+            name_tokens
+        )
 
         matched = sum(
             1
@@ -332,36 +588,184 @@ class LentaClient:
             1
             for token in query_tokens
             if (
-                token not in name_set
+                token
+                not in name_set
                 and any(
                     (
-                        token in name_token
-                        or name_token in token
+                        token
+                        in name_token
+                        or name_token
+                        in token
                     )
-                    for name_token in name_tokens
-                    if len(name_token) >= 4
+                    for name_token
+                    in name_tokens
+                    if len(
+                        name_token
+                    )
+                    >= 4
                 )
             )
         )
 
         coverage = (
             matched
-            + 0.5 * partial
-        ) / len(query_tokens)
+            + 0.5
+            * partial
+        ) / len(
+            query_tokens
+        )
 
         phrase_bonus = (
             0.25
             if (
-                cls._normalize(query)
-                in cls._normalize(name)
+                cls._normalize(
+                    query
+                )
+                in cls._normalize(
+                    name
+                )
             )
             else 0.0
         )
 
         return min(
             1.0,
-            coverage + phrase_bonus,
+            (
+                coverage
+                + phrase_bonus
+            ),
         )
+
+    @staticmethod
+    def _pick_image_candidate( value: Any, ) -> str | None:
+        if value is None:
+            return None
+
+        if isinstance(
+            value,
+            list,
+        ):
+            for item in value:
+                candidate = (
+                    LentaClient
+                    ._pick_image_candidate(
+                        item
+                    )
+                )
+
+                if candidate:
+                    return candidate
+
+            return None
+
+        if isinstance(
+            value,
+            dict,
+        ):
+            for key in (
+                "url",
+                "contentUrl",
+                "src",
+            ):
+                candidate = (
+                    LentaClient
+                    ._pick_image_candidate(
+                        value.get(
+                            key
+                        )
+                    )
+                )
+
+                if candidate:
+                    return candidate
+
+            return None
+
+        cleaned = str(
+            value
+        ).strip()
+
+        if not cleaned:
+            return None
+
+        if cleaned.startswith(
+            "data:"
+        ):
+            return None
+
+        if cleaned.lower().endswith(
+            ".svg"
+        ):
+            return None
+
+        return urljoin(
+            LENTA_BASE_URL,
+            cleaned,
+        )
+
+    @classmethod
+    def _extract_image_from_tag( cls, image, ) -> str | None:
+        if image is None:
+            return None
+
+        for attr in (
+            "data-original",
+            "data-src",
+            "src",
+        ):
+            value = image.get(
+                attr
+            )
+
+            candidate = (
+                cls._pick_image_candidate(
+                    value
+                )
+            )
+
+            if candidate:
+                return candidate
+
+        for attr in (
+            "data-srcset",
+            "srcset",
+        ):
+            raw = image.get(
+                attr
+            )
+
+            if not raw:
+                continue
+
+            candidates: list[str] = []
+
+            for part in str(
+                raw
+            ).split(","):
+                url_part = (
+                    part
+                    .strip()
+                    .split(
+                        " ",
+                        1,
+                    )[0]
+                )
+
+                candidate = (
+                    cls._pick_image_candidate(
+                        url_part
+                    )
+                )
+
+                if candidate:
+                    candidates.append(
+                        candidate
+                    )
+
+            if candidates:
+                return candidates[-1]
+
+        return None
 
     @classmethod
     def _extract_list_candidates( cls, *, html: str, query: str, category_name: str, ) -> list[
@@ -393,11 +797,16 @@ class LentaClient:
             href=True,
         ):
             href = str(
-                anchor.get("href")
+                anchor.get(
+                    "href"
+                )
                 or ""
             )
 
-            if "/product/" not in href:
+            if (
+                "/product/"
+                not in href
+            ):
                 continue
 
             url = urljoin(
@@ -412,31 +821,46 @@ class LentaClient:
                 anchor.stripped_strings
             ).strip()
 
-            image = anchor.find("img")
+            image = anchor.find(
+                "img"
+            )
 
             if (
                 not text
                 and image is not None
             ):
                 text = str(
-                    image.get("alt")
+                    image.get(
+                        "alt"
+                    )
                     or ""
                 ).strip()
 
-            if len(text) < 4:
-                parent = anchor.parent
+            if len(
+                text
+            ) < 4:
+                parent = (
+                    anchor.parent
+                )
+
                 hops = 0
 
                 while (
                     parent is not None
                     and hops < 4
-                    and len(text) < 4
+                    and len(
+                        text
+                    )
+                    < 4
                 ):
                     text = " ".join(
                         parent.stripped_strings
                     ).strip()
 
-                    parent = parent.parent
+                    parent = (
+                        parent.parent
+                    )
+
                     hops += 1
 
             text = re.split(
@@ -444,42 +868,38 @@ class LentaClient:
                     r"\s+Цена за 1"
                     r"|\s+С Картой"
                     r"|\s+В корзину"
-                    r"|\s+\d+[\s\u00a0]*руб"
+                    r"|\s+\d+"
+                    r"[\s\u00a0]*руб"
                 ),
                 text,
                 maxsplit=1,
                 flags=re.IGNORECASE,
             )[0].strip()
 
-            if len(text) < 4:
+            if len(
+                text
+            ) < 4:
                 continue
 
-            score = cls._score_name(
-                query=query,
-                name=text,
+            score = (
+                cls._score_name(
+                    query=query,
+                    name=text,
+                )
             )
 
             if score < 0.34:
                 continue
 
-            image_url: str | None = None
+            image_url = (
+                cls._extract_image_from_tag(
+                    image
+                )
+            )
 
-            if image is not None:
-                for attr in (
-                    "src",
-                    "data-src",
-                    "data-original",
-                ):
-                    value = image.get(attr)
-
-                    if value:
-                        image_url = urljoin(
-                            LENTA_BASE_URL,
-                            str(value),
-                        )
-                        break
-
-            seen_urls.add(url)
+            seen_urls.add(
+                url
+            )
 
             candidates.append(
                 (
@@ -493,7 +913,9 @@ class LentaClient:
         candidates.sort(
             key=lambda item: (
                 item[0],
-                len(item[1]),
+                len(
+                    item[1]
+                ),
             ),
             reverse=True,
         )
@@ -501,15 +923,25 @@ class LentaClient:
         return candidates
 
     @staticmethod
-    def _json_ld_products( soup: BeautifulSoup, ) -> list[dict[str, Any]]:
+    def _json_ld_products( soup: BeautifulSoup, ) -> list[
+        dict[
+            str,
+            Any,
+        ]
+    ]:
         result: list[
-            dict[str, Any]
+            dict[
+                str,
+                Any,
+            ]
         ] = []
 
         for script in soup.find_all(
             "script",
             attrs={
-                "type": "application/ld+json"
+                "type": (
+                    "application/ld+json"
+                )
             },
         ):
             raw = (
@@ -523,14 +955,21 @@ class LentaClient:
                 continue
 
             try:
-                data = json.loads(raw)
+                data = json.loads(
+                    raw
+                )
             except Exception:
                 continue
 
             values = (
                 data
-                if isinstance(data, list)
-                else [data]
+                if isinstance(
+                    data,
+                    list,
+                )
+                else [
+                    data
+                ]
             )
 
             for value in values:
@@ -541,12 +980,20 @@ class LentaClient:
                     continue
 
                 if (
-                    value.get("@type")
+                    value.get(
+                        "@type"
+                    )
                     == "Product"
                 ):
-                    result.append(value)
+                    result.append(
+                        value
+                    )
 
-                graph = value.get("@graph")
+                graph = (
+                    value.get(
+                        "@graph"
+                    )
+                )
 
                 if isinstance(
                     graph,
@@ -554,7 +1001,8 @@ class LentaClient:
                 ):
                     result.extend(
                         item
-                        for item in graph
+                        for item
+                        in graph
                         if (
                             isinstance(
                                 item,
@@ -571,15 +1019,20 @@ class LentaClient:
 
     @classmethod
     def _extract_label_value( cls, *, soup: BeautifulSoup, label: str, ) -> str | None:
-        normalized_label = cls._normalize(
-            label
+        normalized_label = (
+            cls._normalize(
+                label
+            )
         )
 
         strings = list(
             soup.stripped_strings
         )
 
-        for index, value in enumerate(
+        for (
+            index,
+            value,
+        ) in enumerate(
             strings
         ):
             normalized_value = (
@@ -591,27 +1044,44 @@ class LentaClient:
             if (
                 normalized_value
                 == normalized_label
-                and index + 1 < len(strings)
+                and (
+                    index + 1
+                    < len(
+                        strings
+                    )
+                )
             ):
                 candidate = (
-                    strings[index + 1]
-                    .strip()
+                    strings[
+                        index + 1
+                    ].strip()
                 )
 
                 if (
                     candidate
-                    and len(candidate) <= 160
+                    and len(
+                        candidate
+                    )
+                    <= 160
                 ):
                     return candidate
 
-            if normalized_value.startswith(
-                normalized_label + " "
+            if (
+                normalized_value
+                .startswith(
+                    normalized_label
+                    + " "
+                )
             ):
                 candidate = (
                     value[
-                        len(label):
+                        len(
+                            label
+                        ):
                     ]
-                    .strip(" :—-")
+                    .strip(
+                        " :—-"
+                    )
                 )
 
                 if candidate:
@@ -621,8 +1091,10 @@ class LentaClient:
 
     @classmethod
     def _extract_section( cls, *, soup: BeautifulSoup, heading: str, max_length: int = 1500, ) -> str | None:
-        normalized_heading = cls._normalize(
-            heading
+        normalized_heading = (
+            cls._normalize(
+                heading
+            )
         )
 
         for tag in soup.find_all(
@@ -643,13 +1115,17 @@ class LentaClient:
             ):
                 continue
 
-            texts: list[str] = []
+            texts: list[
+                str
+            ] = []
 
             node = (
                 tag.find_next_sibling()
             )
 
-            while node is not None:
+            while (
+                node is not None
+            ):
                 if (
                     getattr(
                         node,
@@ -675,8 +1151,11 @@ class LentaClient:
 
                 if (
                     sum(
-                        len(item)
-                        for item in texts
+                        len(
+                            item
+                        )
+                        for item
+                        in texts
                     )
                     >= max_length
                 ):
@@ -697,11 +1176,50 @@ class LentaClient:
 
         return None
 
+    @classmethod
+    def _extract_meta_image( cls, soup: BeautifulSoup, ) -> str | None:
+        for attrs in (
+            {
+                "property": "og:image"
+            },
+            {
+                "name": "twitter:image"
+            },
+            {
+                "property": "twitter:image"
+            },
+        ):
+            meta = soup.find(
+                "meta",
+                attrs=attrs,
+            )
+
+            if (
+                meta
+                and meta.get(
+                    "content"
+                )
+            ):
+                candidate = (
+                    cls._pick_image_candidate(
+                        meta.get(
+                            "content"
+                        )
+                    )
+                )
+
+                if candidate:
+                    return candidate
+
+        return None
+
     async def _load_detail( self, *, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, query: str, category_name: str, preliminary_name: str, url: str, preliminary_image: str | None, preliminary_score: float, ) -> LentaCatalogProduct | None:
         async with semaphore:
-            html = await self._fetch_text(
-                session=session,
-                url=url,
+            html = (
+                await self._fetch_text(
+                    session=session,
+                    url=url,
+                )
             )
 
         if not html:
@@ -712,32 +1230,42 @@ class LentaClient:
                 preliminary_name
             )
 
-            return LentaCatalogProduct(
-                source_id=(
-                    self._extract_source_id(
-                        url
-                    )
-                ),
-                name=preliminary_name,
-                url=url,
-                image_url=(
-                    preliminary_image
-                ),
-                brand=None,
-                category=category_name,
-                package_value=(
-                    package_value
-                ),
-                package_unit=(
-                    package_unit
-                ),
-                subtype=(
-                    self._detect_subtype(
+            return (
+                LentaCatalogProduct(
+                    source_id=(
+                        self
+                        ._extract_source_id(
+                            url
+                        )
+                    ),
+                    name=(
                         preliminary_name
-                    )
-                ),
-                description=None,
-                score=preliminary_score,
+                    ),
+                    url=url,
+                    image_url=(
+                        preliminary_image
+                    ),
+                    brand=None,
+                    category=(
+                        category_name
+                    ),
+                    package_value=(
+                        package_value
+                    ),
+                    package_unit=(
+                        package_unit
+                    ),
+                    subtype=(
+                        self
+                        ._detect_subtype(
+                            preliminary_name
+                        )
+                    ),
+                    description=None,
+                    score=(
+                        preliminary_score
+                    ),
+                )
             )
 
         soup = BeautifulSoup(
@@ -757,7 +1285,9 @@ class LentaClient:
             else {}
         )
 
-        h1 = soup.find("h1")
+        h1 = soup.find(
+            "h1"
+        )
 
         name = (
             str(
@@ -779,8 +1309,10 @@ class LentaClient:
 
         brand: str | None = None
 
-        raw_brand = product_ld.get(
-            "brand"
+        raw_brand = (
+            product_ld.get(
+                "brand"
+            )
         )
 
         if isinstance(
@@ -808,59 +1340,48 @@ class LentaClient:
 
         if not brand:
             brand = (
-                self._extract_label_value(
+                self
+                ._extract_label_value(
                     soup=soup,
                     label="Бренд",
                 )
             )
 
         image_url = (
-            preliminary_image
-        )
-
-        raw_image = product_ld.get(
-            "image"
-        )
-
-        if isinstance(
-            raw_image,
-            str,
-        ):
-            image_url = raw_image
-
-        elif (
-            isinstance(
-                raw_image,
-                list,
+            self
+            ._pick_image_candidate(
+                product_ld.get(
+                    "image"
+                )
             )
-            and raw_image
-        ):
-            image_url = str(
-                raw_image[0]
+        )
+
+        if not image_url:
+            image_url = (
+                self
+                ._extract_meta_image(
+                    soup
+                )
             )
 
         if not image_url:
-            meta = soup.find(
-                "meta",
-                attrs={
-                    "property": "og:image"
-                },
+            image_url = (
+                preliminary_image
             )
 
-            if (
-                meta
-                and meta.get(
-                    "content"
-                )
+        if not image_url:
+            for image in soup.find_all(
+                "img"
             ):
-                image_url = urljoin(
-                    LENTA_BASE_URL,
-                    str(
-                        meta.get(
-                            "content"
-                        )
-                    ),
+                image_url = (
+                    self
+                    ._extract_image_from_tag(
+                        image
+                    )
                 )
+
+                if image_url:
+                    break
 
         description = (
             str(
@@ -874,7 +1395,8 @@ class LentaClient:
 
         if not description:
             description = (
-                self._extract_section(
+                self
+                ._extract_section(
                     soup=soup,
                     heading="Описание",
                 )
@@ -883,15 +1405,21 @@ class LentaClient:
         (
             package_value,
             package_unit,
-        ) = self._parse_package(name)
-
-        subtype = self._detect_subtype(
+        ) = self._parse_package(
             name
         )
 
-        score = self._score_name(
-            query=query,
-            name=name,
+        subtype = (
+            self._detect_subtype(
+                name
+            )
+        )
+
+        score = (
+            self._score_name(
+                query=query,
+                name=name,
+            )
         )
 
         if (
@@ -910,30 +1438,64 @@ class LentaClient:
                 score + 0.12,
             )
 
-        return LentaCatalogProduct(
-            source_id=(
-                self._extract_source_id(
-                    url
-                )
-            ),
-            name=name,
-            url=url,
-            image_url=image_url,
-            brand=brand,
-            category=category_name,
-            package_value=package_value,
-            package_unit=package_unit,
-            subtype=subtype,
-            description=description,
-            score=max(
-                preliminary_score,
-                score,
-            ),
+        logger.info(
+            "Lenta parsed product: "
+            "name=%r brand=%r image=%r",
+            name,
+            brand,
+            image_url,
         )
 
-    async def search( self, query: str, *, limit: int = 8, ) -> list[LentaCatalogProduct]:
+        return (
+            LentaCatalogProduct(
+                source_id=(
+                    self
+                    ._extract_source_id(
+                        url
+                    )
+                ),
+                name=name,
+                url=url,
+                image_url=(
+                    image_url
+                ),
+                brand=brand,
+                category=(
+                    category_name
+                ),
+                package_value=(
+                    package_value
+                ),
+                package_unit=(
+                    package_unit
+                ),
+                subtype=subtype,
+                description=(
+                    description
+                ),
+                score=max(
+                    preliminary_score,
+                    score,
+                ),
+            )
+        )
+
+    async def search( self, query: str, *, limit: int = 8, ) -> list[
+        LentaCatalogProduct
+    ]:
+        if self._is_temporarily_blocked():
+            logger.info(
+                "Lenta parser skipped: "
+                "temporarily unavailable"
+            )
+
+            return []
+
         cleaned_query = " ".join(
-            str(query or "")
+            str(
+                query
+                or ""
+            )
             .strip()
             .split()
         )
@@ -941,8 +1503,10 @@ class LentaClient:
         if not cleaned_query:
             return []
 
-        route = self._detect_route(
-            cleaned_query
+        route = (
+            self._detect_route(
+                cleaned_query
+            )
         )
 
         if route is None:
@@ -951,6 +1515,7 @@ class LentaClient:
                 "for query=%r",
                 cleaned_query,
             )
+
             return []
 
         (
@@ -961,13 +1526,17 @@ class LentaClient:
         safe_limit = max(
             1,
             min(
-                int(limit),
+                int(
+                    limit
+                ),
                 12,
             ),
         )
 
         timeout = aiohttp.ClientTimeout(
-            total=self.timeout_seconds
+            total=(
+                self.timeout_seconds
+            )
         )
 
         headers = {
@@ -984,110 +1553,179 @@ class LentaClient:
                 "ru-RU,ru;q=0.9,"
                 "en;q=0.6"
             ),
+            "Referer": (
+                "https://lenta.com/"
+            ),
+            "Cache-Control": (
+                "no-cache"
+            ),
+            "Pragma": (
+                "no-cache"
+            ),
         }
 
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers=headers,
-        ) as session:
-            candidates: list[
-                tuple[
-                    float,
-                    str,
-                    str,
-                    str | None,
-                ]
-            ] = []
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers=headers,
+            ) as session:
+                candidates: list[
+                    tuple[
+                        float,
+                        str,
+                        str,
+                        str | None,
+                    ]
+                ] = []
 
-            seen: set[str] = set()
+                seen: set[
+                    str
+                ] = set()
 
-            for page in range(
-                1,
-                MAX_CATEGORY_PAGES + 1,
-            ):
-                page_url = urljoin(
-                    LENTA_BASE_URL,
-                    category_route,
-                )
+                for page in range(
+                    1,
+                    MAX_CATEGORY_PAGES
+                    + 1,
+                ):
+                    if (
+                        self
+                        ._is_temporarily_blocked()
+                    ):
+                        break
 
-                if page > 1:
                     page_url = (
-                        page_url.rstrip("/")
-                        + f"/page/{page}"
+                        urljoin(
+                            LENTA_BASE_URL,
+                            category_route,
+                        )
                     )
 
-                html = await self._fetch_text(
-                    session=session,
-                    url=page_url,
+                    if page > 1:
+                        page_url = (
+                            page_url.rstrip(
+                                "/"
+                            )
+                            + (
+                                f"/page/"
+                                f"{page}"
+                            )
+                        )
+
+                    html = (
+                        await self
+                        ._fetch_text(
+                            session=session,
+                            url=page_url,
+                        )
+                    )
+
+                    if not html:
+                        continue
+
+                    for candidate in (
+                        self
+                        ._extract_list_candidates(
+                            html=html,
+                            query=(
+                                cleaned_query
+                            ),
+                            category_name=(
+                                category_name
+                            ),
+                        )
+                    ):
+                        if (
+                            candidate[2]
+                            in seen
+                        ):
+                            continue
+
+                        seen.add(
+                            candidate[2]
+                        )
+
+                        candidates.append(
+                            candidate
+                        )
+
+                if not candidates:
+                    logger.info(
+                        "Lenta parser: "
+                        "no products for query=%r",
+                        cleaned_query,
+                    )
+
+                    return []
+
+                candidates.sort(
+                    key=lambda item: (
+                        item[0]
+                    ),
+                    reverse=True,
                 )
 
-                if not html:
-                    continue
+                detail_candidates = (
+                    candidates[
+                        :max(
+                            safe_limit * 2,
+                            safe_limit,
+                        )
+                    ]
+                )
 
-                for candidate in (
-                    self._extract_list_candidates(
-                        html=html,
-                        query=cleaned_query,
+                semaphore = (
+                    asyncio.Semaphore(
+                        MAX_CONCURRENT_DETAIL_REQUESTS
+                    )
+                )
+
+                tasks = [
+                    self._load_detail(
+                        session=session,
+                        semaphore=(
+                            semaphore
+                        ),
+                        query=(
+                            cleaned_query
+                        ),
                         category_name=(
                             category_name
                         ),
+                        preliminary_name=(
+                            name
+                        ),
+                        url=url,
+                        preliminary_image=(
+                            image
+                        ),
+                        preliminary_score=(
+                            score
+                        ),
                     )
-                ):
-                    if candidate[2] in seen:
-                        continue
+                    for (
+                        score,
+                        name,
+                        url,
+                        image,
+                    ) in detail_candidates
+                ]
 
-                    seen.add(
-                        candidate[2]
+                loaded = (
+                    await asyncio.gather(
+                        *tasks,
+                        return_exceptions=True,
                     )
-
-                    candidates.append(
-                        candidate
-                    )
-
-            if not candidates:
-                return []
-
-            candidates.sort(
-                key=lambda item: item[0],
-                reverse=True,
-            )
-
-            detail_candidates = candidates[
-                :max(
-                    safe_limit * 2,
-                    safe_limit,
                 )
-            ]
 
-            semaphore = asyncio.Semaphore(
-                MAX_CONCURRENT_DETAIL_REQUESTS
+        except Exception as error:
+            logger.warning(
+                "Lenta parser skipped "
+                "for query=%r: %r",
+                cleaned_query,
+                error,
             )
 
-            tasks = [
-                self._load_detail(
-                    session=session,
-                    semaphore=semaphore,
-                    query=cleaned_query,
-                    category_name=(
-                        category_name
-                    ),
-                    preliminary_name=name,
-                    url=url,
-                    preliminary_image=image,
-                    preliminary_score=score,
-                )
-                for (
-                    score,
-                    name,
-                    url,
-                    image,
-                ) in detail_candidates
-            ]
-
-            loaded = await asyncio.gather(
-                *tasks,
-                return_exceptions=True,
-            )
+            return []
 
         products: list[
             LentaCatalogProduct
@@ -1098,10 +1736,11 @@ class LentaClient:
                 item,
                 Exception,
             ):
-                logger.warning(
-                    "Lenta detail parse failed: %r",
+                logger.info(
+                    "Lenta detail skipped: %r",
                     item,
                 )
+
                 continue
 
             if item is None:
@@ -1117,11 +1756,33 @@ class LentaClient:
         products.sort(
             key=lambda item: (
                 item.score,
-                bool(item.image_url),
-                bool(item.brand),
-                len(item.name),
+                bool(
+                    item.image_url
+                ),
+                bool(
+                    item.brand
+                ),
+                len(
+                    item.name
+                ),
             ),
             reverse=True,
+        )
+
+        logger.info(
+            "Lenta parser result: "
+            "query=%r products=%s "
+            "with_images=%s",
+            cleaned_query,
+            len(
+                products
+            ),
+            sum(
+                1
+                for item
+                in products
+                if item.image_url
+            ),
         )
 
         return products[
