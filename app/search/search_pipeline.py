@@ -53,7 +53,7 @@ class SearchPipelineResult:
     Полный результат поискового конвейера.
 
     Обработчики Telegram должны смотреть
-    на поле screen и показывать выбранный экран.
+    только на поле screen.
     """
 
     screen: SearchPipelineScreen
@@ -111,11 +111,13 @@ def clean_pipeline_query(
     query: str,
 ) -> str:
     """
-    Выполняет безопасную первичную очистку запроса.
+    Безопасная первичная очистка запроса.
     """
 
     return " ".join(
-        query.strip().split()
+        str(query or "")
+        .strip()
+        .split()
     )
 
 
@@ -125,13 +127,16 @@ def is_possible_barcode(
     """
     Проверяет, похож ли запрос на штрихкод.
 
-    Поддерживаются распространённые длины:
-    EAN-8, UPC-A, EAN-13 и внутренние коды.
+    Поддерживаем длину 8-14 цифр.
     """
 
+    cleaned = clean_pipeline_query(
+        query
+    )
+
     return (
-        query.isdigit()
-        and 8 <= len(query) <= 14
+        cleaned.isdigit()
+        and 8 <= len(cleaned) <= 14
     )
 
 
@@ -139,17 +144,27 @@ def is_broad_query(
     query: str,
 ) -> bool:
     """
-    Определяет широкий запрос.
+    Определяет широкий пользовательский запрос.
 
     Примеры:
 
-    молоко
-    кофе
-    растворимый кофе
+        кофе
+        молоко
+        растворимый кофе
+
+    Более конкретные запросы должны быстрее
+    переходить непосредственно к товарам.
     """
 
+    cleaned = clean_pipeline_query(
+        query
+    )
+
+    if not cleaned:
+        return False
+
     return len(
-        query.split()
+        cleaned.split()
     ) <= 2
 
 
@@ -162,8 +177,11 @@ def should_show_facets(
     """
     Решает, нужно ли показывать фасеты.
 
-    Фасеты используются для широкого запроса,
-    когда нет подтверждённого лидера.
+    Они нужны только:
+
+    - для широкого запроса;
+    - когда есть минимум два полезных варианта;
+    - когда уже нет подтверждённого лидера.
     """
 
     if not is_broad_query(
@@ -171,7 +189,9 @@ def should_show_facets(
     ):
         return False
 
-    if len(facet_options) < 2:
+    if len(
+        facet_options
+    ) < 2:
         return False
 
     if decision.has_confirmed_choice:
@@ -182,9 +202,13 @@ def should_show_facets(
 
 def family_quality_key(
     family: dict[str, Any],
-) -> tuple[float, int, str]:
+) -> tuple[
+    float,
+    int,
+    str,
+]:
     """
-    Формирует ключ сортировки семейств.
+    Ключ сортировки семейств.
     """
 
     return (
@@ -193,12 +217,14 @@ def family_quality_key(
                 "score",
                 0.0,
             )
+            or 0.0
         ),
         int(
             family.get(
                 "products_count",
                 0,
             )
+            or 0
         ),
         str(
             family.get(
@@ -218,10 +244,13 @@ def normalize_family_name(
     """
 
     return " ".join(
-        value
+        str(value or "")
         .strip()
         .lower()
-        .replace("ё", "е")
+        .replace(
+            "ё",
+            "е",
+        )
         .split()
     )
 
@@ -232,17 +261,18 @@ def prepare_families(
     limit: int = 6,
 ) -> list[dict[str, Any]]:
     """
-    Удаляет пустые и повторяющиеся семейства.
+    Удаляет:
 
-    Семейства остаются только резервным
-    механизмом для категорий, которые пока
-    не поддерживаются Facet Engine.
+    - пустые семейства;
+    - семейства без товаров;
+    - дубли;
+    - слишком длинную выдачу.
     """
 
     safe_limit = max(
         1,
         min(
-            limit,
+            int(limit),
             8,
         ),
     )
@@ -265,10 +295,13 @@ def prepare_families(
                 "name",
                 "",
             )
+            or ""
         ).strip()
 
-        normalized_name = normalize_family_name(
-            family_name
+        normalized_name = (
+            normalize_family_name(
+                family_name
+            )
         )
 
         products_count = int(
@@ -276,6 +309,7 @@ def prepare_families(
                 "products_count",
                 0,
             )
+            or 0
         )
 
         if not normalized_name:
@@ -284,7 +318,10 @@ def prepare_families(
         if products_count <= 0:
             continue
 
-        if normalized_name in seen_names:
+        if (
+            normalized_name
+            in seen_names
+        ):
             continue
 
         seen_names.add(
@@ -295,7 +332,10 @@ def prepare_families(
             family
         )
 
-        if len(prepared) >= safe_limit:
+        if (
+            len(prepared)
+            >= safe_limit
+        ):
             break
 
     return prepared
@@ -309,11 +349,11 @@ def should_show_families(
     decision: DecisionSearchResult,
 ) -> bool:
     """
-    Решает, нужно ли показывать семейства.
+    Семейства — только резервный механизм.
 
-    Семейства используются только тогда,
-    когда Facet Engine не построил понятных
-    пользовательских уточнений.
+    Если Facet Engine уже дал нормальные
+    пользовательские уточнения, семейства
+    показывать не нужно.
     """
 
     if facet_options:
@@ -324,7 +364,9 @@ def should_show_families(
     ):
         return False
 
-    if len(families) < 2:
+    if len(
+        families
+    ) < 2:
         return False
 
     if decision.has_confirmed_choice:
@@ -339,7 +381,15 @@ async def find_barcode_product(
     barcode: str,
 ) -> SearchPipelineProduct | None:
     """
-    Ищет точный товар по штрихкоду.
+    Ищет точный товар по штрихкоду
+    только в локальной базе MarkaRadar.
+
+    Внешнее обогащение OpenFoodFacts
+    выполняется уровнем выше — в search.py.
+
+    Это намеренно:
+    Search Pipeline не должен выполнять
+    внешние HTTP-запросы.
     """
 
     rows = await search_products(
@@ -351,11 +401,15 @@ async def find_barcode_product(
     if not rows:
         return None
 
-    product, brand, category = rows[0]
+    product, brand, category = (
+        rows[0]
+    )
 
-    if str(
+    stored_barcode = str(
         product.barcode or ""
-    ) != barcode:
+    ).strip()
+
+    if stored_barcode != barcode:
         return None
 
     return SearchPipelineProduct(
@@ -370,11 +424,13 @@ def build_empty_result(
     original_query: str,
 ) -> SearchPipelineResult:
     """
-    Создаёт результат для пустого запроса.
+    Формирует результат пустого запроса.
     """
 
     return SearchPipelineResult(
-        screen=SearchPipelineScreen.EMPTY,
+        screen=(
+            SearchPipelineScreen.EMPTY
+        ),
         original_query=original_query,
         normalized_query="",
         barcode_product=None,
@@ -395,11 +451,13 @@ def build_not_found_result(
     explanation: str,
 ) -> SearchPipelineResult:
     """
-    Создаёт результат отсутствия товаров.
+    Формирует результат отсутствия товаров.
     """
 
     return SearchPipelineResult(
-        screen=SearchPipelineScreen.NOT_FOUND,
+        screen=(
+            SearchPipelineScreen.NOT_FOUND
+        ),
         original_query=original_query,
         normalized_query=normalized_query,
         barcode_product=None,
@@ -408,6 +466,36 @@ def build_not_found_result(
         decision=None,
         corrected_query=None,
         explanation=explanation,
+    )
+
+
+def build_barcode_result(
+    *,
+    original_query: str,
+    normalized_query: str,
+    barcode_product: SearchPipelineProduct,
+) -> SearchPipelineResult:
+    """
+    Формирует результат точного поиска
+    по штрихкоду.
+    """
+
+    return SearchPipelineResult(
+        screen=(
+            SearchPipelineScreen
+            .BARCODE_PRODUCT
+        ),
+        original_query=original_query,
+        normalized_query=normalized_query,
+        barcode_product=barcode_product,
+        intent_groups=[],
+        families=[],
+        decision=None,
+        corrected_query=None,
+        explanation=(
+            "Найден точный товар "
+            "по штрихкоду."
+        ),
     )
 
 
@@ -421,28 +509,38 @@ async def run_search_pipeline(
     allow_refinements: bool = True,
 ) -> SearchPipelineResult:
     """
-    Единственная точка входа поиска MarkaRadar.
+    Единый Search Pipeline MarkaRadar.
 
-    Порядок:
+    Последовательность:
 
-    1. очистка запроса;
-    2. точный поиск по штрихкоду;
-    3. Decision Search;
-    4. Facet Engine для широкого запроса;
-    5. семейства только как резерв;
-    6. выбор пользовательского экрана.
+    1. очищаем запрос;
+    2. проверяем локальный штрихкод;
+    3. запускаем Decision Search;
+    4. при необходимости запускаем Facet Engine;
+    5. если фасетов нет — Family Search;
+    6. выбираем пользовательский экран.
 
-    Оптимизация:
+    ВАЖНО:
 
-    - семейства не ищутся, если найдены фасеты;
-    - фасеты анализируют не более 30 кандидатов;
-    - после отключения уточнений не запускаются
-      ни Facet Engine, ни Family Search;
-    - тяжёлые этапы не выполняются без причины.
+    OpenFoodFacts здесь НЕ вызывается.
+
+    Внешнее обогащение находится в search.py:
+
+        run_pipeline_with_external_enrichment()
+
+    Благодаря этому:
+
+    - Search Pipeline остаётся чистым;
+    - нет двойных HTTP-запросов;
+    - обычный поиск не зависит от OFF;
+    - внешний сервис не может сломать поиск;
+    - Pipeline легко тестировать.
     """
 
-    cleaned_query = clean_pipeline_query(
-        query
+    cleaned_query = (
+        clean_pipeline_query(
+            query
+        )
     )
 
     if not cleaned_query:
@@ -450,7 +548,10 @@ async def run_search_pipeline(
             original_query=query,
         )
 
-    # Штрихкод имеет высший приоритет.
+    #
+    # 1. BARCODE
+    #
+
     if is_possible_barcode(
         cleaned_query
     ):
@@ -462,54 +563,56 @@ async def run_search_pipeline(
         )
 
         if barcode_product is not None:
-            return SearchPipelineResult(
-                screen=(
-                    SearchPipelineScreen
-                    .BARCODE_PRODUCT
-                ),
+            return build_barcode_result(
                 original_query=query,
-                normalized_query=cleaned_query,
-                barcode_product=barcode_product,
-                intent_groups=[],
-                families=[],
-                decision=None,
-                corrected_query=None,
-                explanation=(
-                    "Найден точный товар "
-                    "по штрихкоду."
+                normalized_query=(
+                    cleaned_query
+                ),
+                barcode_product=(
+                    barcode_product
                 ),
             )
+
+    #
+    # 2. DECISION SEARCH
+    #
 
     safe_decision_limit = max(
         5,
         min(
-            decision_candidates_limit,
+            int(
+                decision_candidates_limit
+            ),
             50,
         ),
     )
 
-    # Decision Search — главный источник
-    # товаров, оценок и уровня доверия.
     decision = await run_decision_search(
         session=session,
         query=cleaned_query,
-        candidates_limit=safe_decision_limit,
+        candidates_limit=(
+            safe_decision_limit
+        ),
         alternatives_limit=3,
         insufficient_limit=3,
         other_limit=8,
     )
 
-    # После выбранного пользователем уточнения
-    # можно сразу переходить к результатам.
     #
-    # В этом режиме Facet Engine и Family Search
-    # вообще не запускаются.
+    # 3. ПОСЛЕ УТОЧНЕНИЯ
+    #
+
     if not allow_refinements:
         if decision.has_results:
             return SearchPipelineResult(
-                screen=SearchPipelineScreen.DECISION,
+                screen=(
+                    SearchPipelineScreen
+                    .DECISION
+                ),
                 original_query=query,
-                normalized_query=cleaned_query,
+                normalized_query=(
+                    cleaned_query
+                ),
                 barcode_product=None,
                 intent_groups=[],
                 families=[],
@@ -525,31 +628,32 @@ async def run_search_pipeline(
 
         return build_not_found_result(
             original_query=query,
-            normalized_query=cleaned_query,
+            normalized_query=(
+                cleaned_query
+            ),
             explanation=(
                 "По выбранному уточнению "
                 "подходящих товаров не найдено."
             ),
         )
 
-    facet_options: list[
-        dict[str, Any]
-    ] = []
+    #
+    # 4. ПОДТВЕРЖДЁННЫЙ ЛИДЕР
+    #
 
-    families: list[
-        dict[str, Any]
-    ] = []
-
-    # Подтверждённый лидер можно показать сразу.
-    # Не выполняем дополнительный анализ фасетов.
     if (
         decision.has_results
         and decision.has_confirmed_choice
     ):
         return SearchPipelineResult(
-            screen=SearchPipelineScreen.DECISION,
+            screen=(
+                SearchPipelineScreen
+                .DECISION
+            ),
             original_query=query,
-            normalized_query=cleaned_query,
+            normalized_query=(
+                cleaned_query
+            ),
             barcode_product=None,
             intent_groups=[],
             families=[],
@@ -561,18 +665,24 @@ async def run_search_pipeline(
             ),
         )
 
-    # Для конкретного запроса дополнительные
-    # уровни уточнения чаще всего не нужны.
     #
-    # Исключение: запрос из двух слов может быть
-    # частью рекурсивного фасетного сценария,
-    # например «молоко ультрапастеризованное».
-    query_is_broad = is_broad_query(
-        cleaned_query
+    # 5. FACETS
+    #
+
+    facet_options: list[
+        dict[str, Any]
+    ] = []
+
+    families: list[
+        dict[str, Any]
+    ] = []
+
+    query_is_broad = (
+        is_broad_query(
+            cleaned_query
+        )
     )
 
-    # Facet Engine запускается только тогда,
-    # когда запрос ещё может требовать уточнения.
     if query_is_broad:
         facet_candidates_limit = max(
             safe_decision_limit,
@@ -584,24 +694,29 @@ async def run_search_pipeline(
             30,
         )
 
-        facet_result = await build_product_facets(
-            session=session,
-            query=cleaned_query,
-            candidates_limit=(
-                facet_candidates_limit
-            ),
-            group_limit=1,
-            option_limit=5,
+        facet_result = (
+            await build_product_facets(
+                session=session,
+                query=cleaned_query,
+                candidates_limit=(
+                    facet_candidates_limit
+                ),
+                group_limit=1,
+                option_limit=5,
+            )
         )
 
-        facet_options = flatten_facet_options(
-            facet_result,
-            limit=intent_limit,
+        facet_options = (
+            flatten_facet_options(
+                facet_result,
+                limit=intent_limit,
+            )
         )
 
-    # Семейства выполняют отдельный поиск,
-    # поэтому запускаем их только тогда,
-    # когда Facet Engine ничего не дал.
+    #
+    # 6. FAMILY SEARCH
+    #
+
     if (
         query_is_broad
         and not facet_options
@@ -622,31 +737,40 @@ async def run_search_pipeline(
             limit=family_limit,
         )
 
-    # Для широкого запроса без лидера
-    # показываем один следующий уровень фасетов.
+    #
+    # 7. ПОКАЗАТЬ FACETS
+    #
+
     if should_show_facets(
         query=cleaned_query,
         facet_options=facet_options,
         decision=decision,
     ):
         return SearchPipelineResult(
-            screen=SearchPipelineScreen.INTENTS,
+            screen=(
+                SearchPipelineScreen
+                .INTENTS
+            ),
             original_query=query,
-            normalized_query=cleaned_query,
+            normalized_query=(
+                cleaned_query
+            ),
             barcode_product=None,
             intent_groups=facet_options,
             families=[],
             decision=decision,
             corrected_query=None,
             explanation=(
-                "Запрос широкий. Выберите "
-                "следующий параметр, чтобы "
-                "точнее сравнить товары."
+                "Запрос широкий. "
+                "Выберите следующий параметр, "
+                "чтобы точнее сравнить товары."
             ),
         )
 
-    # Семейства используются только
-    # для пока неподдерживаемых категорий.
+    #
+    # 8. ПОКАЗАТЬ FAMILIES
+    #
+
     if should_show_families(
         query=cleaned_query,
         families=families,
@@ -654,9 +778,14 @@ async def run_search_pipeline(
         decision=decision,
     ):
         return SearchPipelineResult(
-            screen=SearchPipelineScreen.FAMILIES,
+            screen=(
+                SearchPipelineScreen
+                .FAMILIES
+            ),
             original_query=query,
-            normalized_query=cleaned_query,
+            normalized_query=(
+                cleaned_query
+            ),
             barcode_product=None,
             intent_groups=[],
             families=families,
@@ -668,15 +797,24 @@ async def run_search_pipeline(
             ),
         )
 
-    # Если товары найдены, показываем решение,
-    # даже когда оценок пока недостаточно.
+    #
+    # 9. ПОКАЗАТЬ DECISION
+    #
+
     if decision.has_results:
         return SearchPipelineResult(
-            screen=SearchPipelineScreen.DECISION,
+            screen=(
+                SearchPipelineScreen
+                .DECISION
+            ),
             original_query=query,
-            normalized_query=cleaned_query,
+            normalized_query=(
+                cleaned_query
+            ),
             barcode_product=None,
-            intent_groups=facet_options,
+            intent_groups=(
+                facet_options
+            ),
             families=families,
             decision=decision,
             corrected_query=None,
@@ -687,9 +825,15 @@ async def run_search_pipeline(
             ),
         )
 
+    #
+    # 10. NOT FOUND
+    #
+
     return build_not_found_result(
         original_query=query,
-        normalized_query=cleaned_query,
+        normalized_query=(
+            cleaned_query
+        ),
         explanation=(
             "Подходящих товаров не найдено."
         ),
