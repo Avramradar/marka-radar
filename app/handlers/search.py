@@ -11,8 +11,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 
 from app.database.session import async_session_maker
-from app.integrations.openfoodfacts_adapter import (
-    import_openfoodfacts_product,
+from app.services.external_product_enrichment_service import (
+    enrich_product_by_barcode,
 )
 from app.keyboards.decision_search import (
     get_decision_search_keyboard,
