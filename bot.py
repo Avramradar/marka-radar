@@ -17,6 +17,9 @@ from app.handlers.intent_callback import (
 from app.handlers.product_callback import (
     router as product_callback_router,
 )
+from app.handlers.product_photo import (
+    router as product_photo_router,
+)
 from app.handlers.rating import (
     router as rating_router,
 )
@@ -57,13 +60,14 @@ async def main() -> None:
 
     dispatcher = Dispatcher()
 
-    # Порядок подключения важен:
+    # Порядок подключения:
     # 1. команды;
     # 2. уточняющие группы;
     # 3. выбор семейства товара;
     # 4. выбор конкретного товара;
     # 5. рейтинг;
-    # 6. обычный текстовый поиск.
+    # 6. фотографии товаров;
+    # 7. обычный текстовый поиск.
     dispatcher.include_router(
         start_router
     )
@@ -82,6 +86,10 @@ async def main() -> None:
 
     dispatcher.include_router(
         rating_router
+    )
+
+    dispatcher.include_router(
+        product_photo_router
     )
 
     dispatcher.include_router(
