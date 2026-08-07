@@ -1123,12 +1123,22 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
             cleaned_query,
         )
 
-        # Провайдер мог выполнить flush/изменения,
-        # которые сервис не признал полезными.
-        # Не оставляем незавершённую транзакцию.
+        # rollback() истекает ORM-объекты даже при
+        # expire_on_commit=False. Поэтому нельзя
+        # возвращать старый pipeline_result: позднее
+        # обращение к product/brand/category может
+        # вызвать MissingGreenlet в AsyncSession.
         await session.rollback()
 
-        return pipeline_result
+        # Получаем полностью свежие ORM-объекты
+        # после rollback и только их отдаём UI.
+        return await run_search_pipeline(
+            session=session,
+            query=cleaned_query,
+            intent_limit=6,
+            family_limit=6,
+            decision_candidates_limit=20,
+        )
 
     await session.commit()
 
