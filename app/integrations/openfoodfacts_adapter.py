@@ -1,3 +1,4 @@
+import logging
 import re
 from decimal import Decimal
 from typing import Any, Iterable
@@ -16,6 +17,9 @@ from app.services.product_merge_service import (
     ProductMergeResult,
     merge_external_product,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 QUANTITY_PATTERN = re.compile(
@@ -153,7 +157,8 @@ def unique_values(
     values: Iterable[Any],
 ) -> list[str]:
     """
-    Удаляет пустые значения и дубли.
+    Убирает пустые значения и дубли,
+    сохраняя порядок.
     """
 
     result: list[str] = []
@@ -208,8 +213,15 @@ def is_real_brand(
     Проверяет, что бренд содержательный.
     """
 
+    normalized_value = normalized(
+        value
+    )
+
+    if not normalized_value:
+        return False
+
     return (
-        normalized(value)
+        normalized_value
         not in GENERIC_BRANDS
     )
 
@@ -236,15 +248,22 @@ def parse_quantity(
         return None, None
 
     match = QUANTITY_PATTERN.search(
-        clean_text(quantity)
+        clean_text(
+            quantity
+        )
     )
 
     if match is None:
         return None, None
 
     raw_value = (
-        match.group("value")
-        .replace(",", ".")
+        match.group(
+            "value"
+        )
+        .replace(
+            ",",
+            ".",
+        )
     )
 
     try:
@@ -254,8 +273,13 @@ def parse_quantity(
     except Exception:
         return None, None
 
+    if value <= 0:
+        return None, None
+
     raw_unit = (
-        match.group("unit")
+        match.group(
+            "unit"
+        )
         .lower()
         .strip()
     )
@@ -295,12 +319,14 @@ def parse_structured_quantity(
     str | None,
 ]:
     """
-    Сначала использует структурированные поля OFF:
+    Определяет упаковку.
 
-        product_quantity
-        product_quantity_unit
+    Приоритет:
 
-    И только потом старое поле quantity.
+    1. product_quantity +
+       product_quantity_unit;
+    2. quantity;
+    3. serving_size.
     """
 
     raw_value = clean_text(
@@ -326,9 +352,11 @@ def parse_structured_quantity(
             "g": "г",
             "gram": "г",
             "grams": "г",
+            "гр": "г",
             "г": "г",
 
             "kg": "кг",
+            "kgs": "кг",
             "kilogram": "кг",
             "kilograms": "кг",
             "кг": "кг",
@@ -339,6 +367,7 @@ def parse_structured_quantity(
             "мл": "мл",
 
             "l": "л",
+            "lt": "л",
             "liter": "л",
             "liters": "л",
             "л": "л",
@@ -361,7 +390,10 @@ def parse_structured_quantity(
         product.quantity
     )
 
-    if quantity_result[0] is not None:
+    if (
+        quantity_result[0]
+        is not None
+    ):
         return quantity_result
 
     return parse_quantity(
@@ -373,13 +405,12 @@ def choose_brand(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Приоритет бренда:
+    Выбирает бренд.
+
+    Приоритет:
 
     1. brands;
     2. brands_tags.
-
-    Это важно для карточек, где поле brands
-    пустое, но brands_tags заполнено.
     """
 
     brands = clean_text(
@@ -402,9 +433,7 @@ def choose_brand(
             ):
                 return candidate
 
-    for raw_tag in (
-        product.brands_tags
-    ):
+    for raw_tag in product.brands_tags:
         candidate = humanize_tag(
             raw_tag
         )
@@ -421,17 +450,8 @@ def get_raw_names(
     product: OpenFoodFactsProduct,
 ) -> list[str]:
     """
-    Собирает ВСЕ потенциальные названия
-    из raw OpenFoodFacts.
-
-    Это позволяет использовать, например:
-
-        product_name_it
-        product_name_fr
-        product_name_de
-
-    даже если мы заранее не добавляли
-    каждое поле в dataclass.
+    Собирает возможные названия товара
+    из нормализованных и сырых полей OFF.
     """
 
     values: list[Any] = [
@@ -462,11 +482,11 @@ def get_raw_names(
 
         for key in preferred_keys:
             values.append(
-                raw.get(key)
+                raw.get(
+                    key
+                )
             )
 
-        # Ищем дополнительные языковые варианты:
-        # product_name_it, product_name_de и т.д.
         for key, value in raw.items():
             if (
                 key.startswith(
@@ -489,11 +509,16 @@ def choose_specific_name(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Ищет наиболее содержательное название.
+    Выбирает наиболее содержательное
+    название товара.
 
-    Главное правило:
-    если есть "Leggenda Original",
-    оно лучше, чем просто "Кофе".
+    Например:
+
+        Leggenda Original
+
+    предпочтительнее, чем:
+
+        Кофе
     """
 
     names = get_raw_names(
@@ -514,12 +539,14 @@ def choose_specific_name(
     if not non_generic:
         return names[0]
 
-    # Предпочитаем более содержательное название,
-    # но не огромный состав или описание.
     non_generic.sort(
         key=lambda value: (
-            len(value.split()),
-            len(value),
+            len(
+                value.split()
+            ),
+            len(
+                value
+            ),
         ),
         reverse=True,
     )
@@ -531,8 +558,8 @@ def category_text(
     product: OpenFoodFactsProduct,
 ) -> str:
     """
-    Собирает все категории OFF
-    в одну строку для определения типа товара.
+    Собирает категории OFF
+    в одну нормализованную строку.
     """
 
     values = (
@@ -544,9 +571,13 @@ def category_text(
 
     return normalized(
         " ".join(
-            clean_text(value)
+            clean_text(
+                value
+            )
             for value in values
-            if clean_text(value)
+            if clean_text(
+                value
+            )
         )
     )
 
@@ -555,7 +586,7 @@ def choose_product_kind(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Определяет базовый тип продукта
+    Определяет базовый вид продукта
     по категориям.
     """
 
@@ -633,7 +664,7 @@ def format_package_for_name(
     unit: str | None,
 ) -> str | None:
     """
-    Готовит короткую упаковку
+    Формирует короткий размер упаковки
     для названия товара.
     """
 
@@ -648,7 +679,9 @@ def format_package_for_name(
         == value.to_integral()
     ):
         number = str(
-            int(value)
+            int(
+                value
+            )
         )
     else:
         number = format(
@@ -665,9 +698,9 @@ def build_informative_name(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Формирует итоговое человеческое название.
+    Формирует информативное имя.
 
-    Примеры:
+    Например:
 
         Кофе + Poetti
         ->
@@ -721,22 +754,14 @@ def build_informative_name(
 
     parts: list[str] = []
 
-    #
-    # Если имя уже не общее:
-    #
-    # Leggenda Original
-    #
-    # ставим бренд впереди:
-    #
-    # Poetti Leggenda Original
-    #
-
     if (
         brand
         and not is_generic_name(
             base_name
         )
-        and normalized(brand)
+        and normalized(
+            brand
+        )
         not in normalized(
             base_name
         )
@@ -749,19 +774,18 @@ def build_informative_name(
         base_name
     )
 
-    #
-    # Если название просто "Кофе",
-    # бренд добавляем после него.
-    #
-
     if (
         brand
         and is_generic_name(
             base_name
         )
-        and normalized(brand)
+        and normalized(
+            brand
+        )
         not in normalized(
-            " ".join(parts)
+            " ".join(
+                parts
+            )
         )
     ):
         parts.append(
@@ -774,7 +798,9 @@ def build_informative_name(
             package_text
         )
         not in normalized(
-            " ".join(parts)
+            " ".join(
+                parts
+            )
         )
     ):
         parts.append(
@@ -792,7 +818,8 @@ def choose_name(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Итоговое название для MarkaRadar.
+    Выбирает итоговое имя товара
+    для MarkaRadar.
     """
 
     informative = (
@@ -813,7 +840,7 @@ def build_keywords(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Собирает дополнительные поисковые признаки.
+    Собирает поисковые признаки.
     """
 
     values: list[str] = []
@@ -875,7 +902,7 @@ def build_description(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Выбирает дополнительное описание товара.
+    Выбирает описание.
     """
 
     candidates = (
@@ -905,13 +932,7 @@ def build_subtype(
     product: OpenFoodFactsProduct,
 ) -> str | None:
     """
-    Пытается получить полезный подтип.
-
-    Например для кофе:
-
-        растворимый
-        молотый
-        в зернах
+    Определяет полезный подтип товара.
     """
 
     text = category_text(
@@ -931,6 +952,7 @@ def build_subtype(
             "Молотый",
             (
                 "ground coffee",
+                "ground coffees",
                 "молот",
             ),
         ),
@@ -939,6 +961,7 @@ def build_subtype(
             (
                 "coffee beans",
                 "whole bean",
+                "whole beans",
                 "зернах",
                 "зёрнах",
             ),
@@ -978,6 +1001,82 @@ def build_subtype(
     return None
 
 
+def log_openfoodfacts_debug(
+    *,
+    product: OpenFoodFactsProduct,
+    chosen_name: str | None,
+    chosen_brand: str | None,
+    category_id: int | None,
+    package_value: Decimal | None,
+    package_unit: str | None,
+    subtype: str | None,
+    description: str | None,
+    image_url: str | None,
+) -> None:
+    """
+    Временная диагностика OpenFoodFacts.
+
+    После исправления импорта этот лог
+    можно удалить или перевести на DEBUG.
+    """
+
+    logger.warning(
+        "OFF DEBUG "
+        "barcode=%s | "
+        "product_name=%r | "
+        "product_name_ru=%r | "
+        "product_name_en=%r | "
+        "abbreviated=%r | "
+        "generic_name=%r | "
+        "generic_name_ru=%r | "
+        "generic_name_en=%r | "
+        "brands=%r | "
+        "brands_tags=%r | "
+        "quantity=%r | "
+        "product_quantity=%r | "
+        "product_quantity_unit=%r | "
+        "serving_size=%r | "
+        "categories=%r | "
+        "categories_tags=%r | "
+        "categories_tags_ru=%r | "
+        "categories_tags_en=%r | "
+        "chosen_name=%r | "
+        "chosen_brand=%r | "
+        "chosen_category_id=%r | "
+        "chosen_package_value=%r | "
+        "chosen_package_unit=%r | "
+        "chosen_subtype=%r | "
+        "chosen_description=%r | "
+        "image=%r",
+        product.barcode,
+        product.product_name,
+        product.product_name_ru,
+        product.product_name_en,
+        product.abbreviated_product_name,
+        product.generic_name,
+        product.generic_name_ru,
+        product.generic_name_en,
+        product.brands,
+        product.brands_tags,
+        product.quantity,
+        product.product_quantity,
+        product.product_quantity_unit,
+        product.serving_size,
+        product.categories,
+        product.categories_tags,
+        product.categories_tags_ru,
+        product.categories_tags_en,
+        chosen_name,
+        chosen_brand,
+        category_id,
+        package_value,
+        package_unit,
+        subtype,
+        description,
+        image_url,
+    )
+
+
 async def import_openfoodfacts_product(
     *,
     session: AsyncSession,
@@ -1009,6 +1108,12 @@ async def import_openfoodfacts_product(
     )
 
     if external_product is None:
+        logger.info(
+            "OpenFoodFacts не нашёл "
+            "штрихкод %s",
+            barcode,
+        )
+
         return None
 
     product_name = choose_name(
@@ -1016,20 +1121,32 @@ async def import_openfoodfacts_product(
     )
 
     if not product_name:
+        logger.warning(
+            "OFF DEBUG barcode=%s: "
+            "не удалось определить название",
+            barcode,
+        )
+
         return None
+
+    #
+    # BRAND
+    #
+
+    brand_name = choose_brand(
+        external_product
+    )
 
     #
     # CATEGORY
     #
 
-    category_values = (
-        unique_values(
-            (
-                *external_product.categories,
-                *external_product.categories_tags,
-                *external_product.categories_tags_ru,
-                *external_product.categories_tags_en,
-            )
+    category_values = unique_values(
+        (
+            *external_product.categories,
+            *external_product.categories_tags,
+            *external_product.categories_tags_ru,
+            *external_product.categories_tags_en,
         )
     )
 
@@ -1061,6 +1178,24 @@ async def import_openfoodfacts_product(
     )
 
     #
+    # SUBTYPE
+    #
+
+    subtype = build_subtype(
+        external_product
+    )
+
+    #
+    # DESCRIPTION
+    #
+
+    description = (
+        build_description(
+            external_product
+        )
+    )
+
+    #
     # IMAGE
     #
 
@@ -1071,49 +1206,77 @@ async def import_openfoodfacts_product(
     )
 
     #
+    # KEYWORDS
+    #
+
+    keywords = build_keywords(
+        external_product
+    )
+
+    #
+    # ДИАГНОСТИКА
+    #
+
+    log_openfoodfacts_debug(
+        product=external_product,
+        chosen_name=product_name,
+        chosen_brand=brand_name,
+        category_id=category_id,
+        package_value=package_value,
+        package_unit=package_unit,
+        subtype=subtype,
+        description=description,
+        image_url=image_url,
+    )
+
+    #
     # MERGE
     #
 
     incoming = ExternalProductData(
         source="openfoodfacts",
-
         name=product_name,
-
-        brand_name=choose_brand(
-            external_product
-        ),
-
-        barcode=(
-            external_product.barcode
-        ),
-
+        brand_name=brand_name,
+        barcode=external_product.barcode,
         category_id=category_id,
-
-        package_value=(
-            package_value
-        ),
-
-        package_unit=(
-            package_unit
-        ),
-
-        subtype=build_subtype(
-            external_product
-        ),
-
-        description=build_description(
-            external_product
-        ),
-
+        package_value=package_value,
+        package_unit=package_unit,
+        subtype=subtype,
+        description=description,
         image_url=image_url,
-
-        keywords=build_keywords(
-            external_product
-        ),
+        keywords=keywords,
     )
 
-    return await merge_external_product(
-        session=session,
-        incoming=incoming,
-        commit=commit,
-                )
+    merge_result = (
+        await merge_external_product(
+            session=session,
+            incoming=incoming,
+            commit=commit,
+        )
+    )
+
+    logger.warning(
+        "OFF MERGE DEBUG "
+        "barcode=%s | "
+        "product_id=%s | "
+        "created=%s | "
+        "match=%s | "
+        "updated_fields=%s | "
+        "final_name=%r | "
+        "final_brand=%r | "
+        "category_id=%r | "
+        "package_value=%r | "
+        "package_unit=%r",
+        external_product.barcode,
+        merge_result.product.id,
+        merge_result.created,
+        merge_result.match_type,
+        merge_result.updated_fields,
+        merge_result.product.name,
+        merge_result.brand.name,
+        merge_result.product.category_id,
+        merge_result.product.package_value,
+        merge_result.product.package_unit,
+    )
+
+    return merge_result
