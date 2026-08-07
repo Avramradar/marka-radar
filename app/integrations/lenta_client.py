@@ -116,7 +116,7 @@ class LentaClient:
         )
         self._cache: dict[str, tuple[float, str]] = {}
 
-@staticmethod
+    @staticmethod
     def _normalize(value: Any) -> str:
         return " ".join(
             str(value or "")
@@ -126,7 +126,7 @@ class LentaClient:
             .split()
         )
 
-@classmethod
+    @classmethod
     def _tokens(cls, value: str) -> list[str]:
         return [
             token
@@ -238,7 +238,7 @@ class LentaClient:
 
         return None
 
-@staticmethod
+    @staticmethod
     def _extract_source_id( url: str, ) -> str:
         match = re.search(
             r"-(\d+)/?$",
@@ -253,7 +253,7 @@ class LentaClient:
             .rsplit("/", 1)[-1]
         )
 
-@classmethod
+    @classmethod
     def _parse_package( cls, text: str, ) -> tuple[Decimal | None, str | None]:
         matches = list(
             PACKAGE_PATTERN.finditer(text)
@@ -296,7 +296,7 @@ class LentaClient:
             unit_map.get(raw_unit),
         )
 
-@classmethod
+    @classmethod
     def _detect_subtype( cls, text: str, ) -> str | None:
         normalized = cls._normalize(text)
 
@@ -309,7 +309,7 @@ class LentaClient:
 
         return None
 
-@classmethod
+    @classmethod
     def _score_name( cls, *, query: str, name: str, ) -> float:
         query_tokens = cls._tokens(query)
         name_tokens = cls._tokens(name)
@@ -363,7 +363,7 @@ class LentaClient:
             coverage + phrase_bonus,
         )
 
-@classmethod
+    @classmethod
     def _extract_list_candidates( cls, *, html: str, query: str, category_name: str, ) -> list[
         tuple[
             float,
@@ -500,7 +500,7 @@ class LentaClient:
 
         return candidates
 
-@staticmethod
+    @staticmethod
     def _json_ld_products( soup: BeautifulSoup, ) -> list[dict[str, Any]]:
         result: list[
             dict[str, Any]
@@ -569,7 +569,7 @@ class LentaClient:
 
         return result
 
-@classmethod
+    @classmethod
     def _extract_label_value( cls, *, soup: BeautifulSoup, label: str, ) -> str | None:
         normalized_label = cls._normalize(
             label
@@ -619,7 +619,7 @@ class LentaClient:
 
         return None
 
-@classmethod
+    @classmethod
     def _extract_section( cls, *, soup: BeautifulSoup, heading: str, max_length: int = 1500, ) -> str | None:
         normalized_heading = cls._normalize(
             heading
