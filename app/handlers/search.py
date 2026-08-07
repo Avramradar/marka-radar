@@ -1234,80 +1234,107 @@ async def show_not_found_screen(
     )
 
 
-async def try_enrich_barcode_from_openfoodfacts(
+
+async def run_pipeline_with_external_enrichment(
     *,
     session,
-    barcode: str,
-) -> bool:
+    query: str,
+) -> SearchPipelineResult:
     """
-    Пытается получить товар из OpenFoodFacts
-    и объединить данные с MarkaRadar.
+    Выполняет Search Pipeline и при необходимости
+    подключает внешнее обогащение товара.
 
-    Ошибка внешнего сервиса никогда не должна
-    ломать основной поиск.
+    Сейчас используется OpenFoodFacts через
+    единый сервис external_product_enrichment_service.
 
-    Возвращает True, если OpenFoodFacts
-    вернул и обработал товар.
+    В дальнейшем туда можно подключить любые
+    дополнительные каталоги без изменения
+    Search Pipeline.
     """
 
-    try:
-        merge_result = (
-            await import_openfoodfacts_product(
-                session=session,
-                barcode=barcode,
-                commit=False,
-            )
+    pipeline_result = await run_search_pipeline(
+        session=session,
+        query=query,
+        intent_limit=6,
+        family_limit=6,
+        decision_candidates_limit=20,
+    )
+
+    cleaned_query = " ".join(
+        query.strip().split()
+    )
+
+    if not is_possible_barcode(
+        cleaned_query
+    ):
+        return pipeline_result
+
+    should_try_external = False
+
+    if (
+        pipeline_result.screen
+        == SearchPipelineScreen.NOT_FOUND
+    ):
+        should_try_external = True
+
+    elif should_enrich_barcode_product(
+        pipeline_result
+    ):
+        should_try_external = True
+
+    if not should_try_external:
+        return pipeline_result
+
+    logger.info(
+        "Пробуем внешнее обогащение "
+        "для штрихкода %s",
+        cleaned_query,
+    )
+
+    barcode_item = (
+        pipeline_result.barcode_product
+    )
+
+    enrichment_result = (
+        await enrich_product_by_barcode(
+            session=session,
+            barcode=cleaned_query,
+            product=(
+                barcode_item.product
+                if barcode_item
+                else None
+            ),
+            brand=(
+                barcode_item.brand
+                if barcode_item
+                else None
+            ),
+            category=(
+                barcode_item.category
+                if barcode_item
+                else None
+            ),
         )
+    )
 
-        if merge_result is None:
-            logger.info(
-                "OpenFoodFacts: товар %s "
-                "не найден",
-                barcode,
-            )
-            return False
+    if not enrichment_result.enriched:
+        return pipeline_result
 
-        await session.commit()
+    await session.commit()
 
-        logger.info(
-            "OpenFoodFacts merge: "
-            "barcode=%s, product_id=%s, "
-            "created=%s, match=%s, fields=%s",
-            barcode,
-            merge_result.product.id,
-            merge_result.created,
-            merge_result.match_type,
-            merge_result.updated_fields,
-        )
+    logger.info(
+        "Внешнее обогащение выполнено "
+        "источником %s",
+        enrichment_result.provider,
+    )
 
-        return True
-
-    except ValueError as error:
-        # Например, OFF нашёл новый товар,
-        # но Category Mapper пока не смог
-        # определить category_id.
-        await session.rollback()
-
-        logger.warning(
-            "OpenFoodFacts не удалось "
-            "импортировать товар %s: %s",
-            barcode,
-            error,
-        )
-
-        return False
-
-    except Exception:
-        await session.rollback()
-
-        logger.exception(
-            "Ошибка OpenFoodFacts "
-            "для штрихкода %s",
-            barcode,
-        )
-
-        return False
-
+    return await run_search_pipeline(
+        session=session,
+        query=cleaned_query,
+        intent_limit=6,
+        family_limit=6,
+        decision_candidates_limit=20,
+    )
 
 async def run_pipeline_with_external_enrichment(
     *,
