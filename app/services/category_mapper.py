@@ -12,23 +12,6 @@ from app.utils.text import normalize_text
 
 @dataclass(slots=True, frozen=True)
 class CategoryMappingResult:
-    """
-    Результат определения категории.
-
-    category:
-        Найденная категория MarkaRadar.
-
-    matched_by:
-        Каким способом она была найдена.
-
-    confidence:
-        Условная уверенность 0..100.
-
-    source_value:
-        Исходная внешняя категория,
-        по которой произошло совпадение.
-    """
-
     category: Category | None
     matched_by: str
     confidence: float
@@ -36,6 +19,15 @@ class CategoryMappingResult:
 
 
 CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
+    "сметана": (
+        "сметана",
+        "sour cream",
+        "smetana",
+        "сметанный продукт",
+        "сметанный",
+        "кисломолочная сметана",
+    ),
+
     "молоко": (
         "milk",
         "milks",
@@ -144,13 +136,7 @@ CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
-def clean_category_text(
-    value: str | None,
-) -> str:
-    """
-    Убирает лишние пробелы.
-    """
-
+def clean_category_text( value: str | None, ) -> str:
     if not value:
         return ""
 
@@ -161,14 +147,7 @@ def clean_category_text(
     )
 
 
-def normalize_category_text(
-    value: str | None,
-) -> str:
-    """
-    Нормализует название категории
-    для сравнения.
-    """
-
+def normalize_category_text( value: str | None, ) -> str:
     cleaned = clean_category_text(
         value
     )
@@ -184,19 +163,19 @@ def normalize_category_text(
             "ё",
             "е",
         )
+        .replace(
+            "_",
+            " ",
+        )
+        .replace(
+            "-",
+            " ",
+        )
         .strip()
     )
 
 
-def normalize_external_categories(
-    categories: Iterable[str],
-) -> list[str]:
-    """
-    Очищает список внешних категорий.
-
-    Удаляет пустые значения и дубли.
-    """
-
+def normalize_external_categories( categories: Iterable[str], ) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
 
@@ -228,16 +207,7 @@ def normalize_external_categories(
     return result
 
 
-async def find_category_exact(
-    *,
-    session: AsyncSession,
-    value: str,
-) -> Category | None:
-    """
-    Ищет точное совпадение
-    по name или normalized_name.
-    """
-
+async def find_category_exact( *, session: AsyncSession, value: str, ) -> Category | None:
     normalized_value = (
         normalize_category_text(
             value
@@ -269,20 +239,7 @@ async def find_category_exact(
     return result.scalar_one_or_none()
 
 
-def detect_canonical_category_name(
-    value: str,
-) -> str | None:
-    """
-    Преобразует внешнее название
-    в канонический тип категории MarkaRadar.
-
-    Например:
-
-        instant coffee -> кофе
-        uht milk       -> молоко
-        frozen pizza   -> пицца
-    """
-
+def detect_canonical_category_name( value: str, ) -> str | None:
     normalized_value = (
         normalize_category_text(
             value
@@ -296,49 +253,25 @@ def detect_canonical_category_name(
         canonical_name,
         aliases,
     ) in CATEGORY_ALIASES.items():
-        canonical_normalized = (
-            normalize_category_text(
-                canonical_name
-            )
+        terms = (
+            canonical_name,
+            *aliases,
         )
 
-        if (
-            normalized_value
-            == canonical_normalized
-        ):
-            return canonical_name
-
-        for alias in aliases:
-            normalized_alias = (
-                normalize_category_text(
-                    alias
-                )
-            )
-
+        for term in terms:
             if (
                 normalized_value
-                == normalized_alias
+                == normalize_category_text(
+                    term
+                )
             ):
                 return canonical_name
 
     return None
 
 
-def detect_canonical_category_contains(
-    value: str,
-) -> str | None:
-    """
-    Более мягкий fallback.
-
-    Используется только после точных совпадений.
-
-    Например:
-
-        "en:instant-coffees"
-        "instant coffee beverages"
-
-    могут быть отнесены к кофе.
-    """
+def detect_canonical_category_contains( value: str, ) -> str | None:
+    """ Осторожный fallback для длинных внешних названий и названий самих товаров. Например: "Сметана Простоквашино 15% 260 г" -> сметана "Кофе Poetti Leggenda Original 250 г" -> кофе """
 
     normalized_value = (
         normalize_category_text(
@@ -349,8 +282,6 @@ def detect_canonical_category_contains(
     if not normalized_value:
         return None
 
-    # Некоторые API используют
-    # префиксы языков вроде en:, ru:.
     normalized_value = (
         normalized_value
         .replace(
@@ -361,10 +292,6 @@ def detect_canonical_category_contains(
             "ru:",
             "",
         )
-        .replace(
-            "-",
-            " ",
-        )
     )
 
     normalized_value = " ".join(
@@ -372,7 +299,10 @@ def detect_canonical_category_contains(
     )
 
     matches: list[
-        tuple[int, str]
+        tuple[
+            int,
+            str,
+        ]
     ] = []
 
     for (
@@ -394,9 +324,19 @@ def detect_canonical_category_contains(
             if not normalized_term:
                 continue
 
+            # Проверяем как отдельную фразу/слово,
+            # чтобы "чай" случайно не совпадал
+            # внутри другого слова.
+            padded_value = (
+                f" {normalized_value} "
+            )
+            padded_term = (
+                f" {normalized_term} "
+            )
+
             if (
-                normalized_term
-                in normalized_value
+                padded_term
+                in padded_value
             ):
                 matches.append(
                     (
@@ -410,8 +350,6 @@ def detect_canonical_category_contains(
     if not matches:
         return None
 
-    # Самое длинное совпадение
-    # обычно наиболее специфично.
     matches.sort(
         reverse=True
     )
@@ -419,19 +357,7 @@ def detect_canonical_category_contains(
     return matches[0][1]
 
 
-async def find_canonical_category(
-    *,
-    session: AsyncSession,
-    canonical_name: str,
-) -> Category | None:
-    """
-    Ищет реальную категорию MarkaRadar
-    по каноническому имени.
-
-    Важно:
-    Mapper не создаёт категории самостоятельно.
-    """
-
+async def find_canonical_category( *, session: AsyncSession, canonical_name: str, ) -> Category | None:
     normalized_name = (
         normalize_category_text(
             canonical_name
@@ -466,9 +392,6 @@ async def find_canonical_category(
     if category is not None:
         return category
 
-    # Fallback для старой базы,
-    # где normalized_name мог быть
-    # сформирован иначе.
     result = await session.execute(
         select(
             Category
@@ -490,28 +413,8 @@ async def find_canonical_category(
     return result.scalar_one_or_none()
 
 
-async def map_external_category(
-    *,
-    session: AsyncSession,
-    category_name: str | None = None,
-    categories: Iterable[str] | None = None,
-) -> CategoryMappingResult:
-    """
-    Главная функция Category Mapper.
-
-    Приоритет:
-
-    1. точное совпадение с категорией MarkaRadar;
-    2. точное совпадение через контролируемые aliases;
-    3. осторожное совпадение по содержимому;
-    4. ничего не угадываем.
-
-    Mapper намеренно НЕ создаёт новую категорию
-    автоматически.
-
-    Ошибочно объединённые категории опаснее,
-    чем временно неразобранный товар.
-    """
+async def map_external_category( *, session: AsyncSession, category_name: str | None = None, categories: Iterable[str] | None = None, ) -> CategoryMappingResult:
+    """ Приоритет: 1. точное совпадение с БД; 2. точный alias; 3. безопасное contains-совпадение; 4. None. В categories разрешено передавать не только внешние категории, но и дополнительные hints, например название товара. Это позволяет определить "сметана" из строки: "Сметана Простоквашино 15% 260 г". """
 
     incoming_values: list[str] = []
 
@@ -539,8 +442,6 @@ async def map_external_category(
             source_value=None,
         )
 
-    # 1. Сначала ищем прямое совпадение
-    # с уже существующей категорией.
     for value in incoming_values:
         category = await find_category_exact(
             session=session,
@@ -555,7 +456,6 @@ async def map_external_category(
                 source_value=value,
             )
 
-    # 2. Контролируемый словарь aliases.
     for value in incoming_values:
         canonical_name = (
             detect_canonical_category_name(
@@ -581,7 +481,6 @@ async def map_external_category(
                 source_value=value,
             )
 
-    # 3. Более мягкое совпадение.
     for value in incoming_values:
         canonical_name = (
             detect_canonical_category_contains(
@@ -603,7 +502,7 @@ async def map_external_category(
             return CategoryMappingResult(
                 category=category,
                 matched_by="contains",
-                confidence=80.0,
+                confidence=85.0,
                 source_value=value,
             )
 
@@ -619,18 +518,7 @@ async def map_external_category(
     )
 
 
-async def map_external_category_id(
-    *,
-    session: AsyncSession,
-    category_name: str | None = None,
-    categories: Iterable[str] | None = None,
-) -> int | None:
-    """
-    Удобная сокращённая функция.
-
-    Возвращает только category_id.
-    """
-
+async def map_external_category_id( *, session: AsyncSession, category_name: str | None = None, categories: Iterable[str] | None = None, ) -> int | None:
     result = await map_external_category(
         session=session,
         category_name=category_name,
@@ -642,4 +530,4 @@ async def map_external_category_id(
 
     return int(
         result.category.id
-  )
+    )
