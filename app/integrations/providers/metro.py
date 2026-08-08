@@ -100,14 +100,99 @@ SUBTYPE_RULES: tuple[
 )
 
 
+# Общие слова не должны сами по себе делать карточку
+# релевантной конкретному запросу.
+#
+# Например:
+#
+# "Сметана Чабан"
+#
+# слово "сметана" описывает тип продукта.
+# Главный уточняющий токен здесь — "чабан".
+#
+# Если METRO вернул "Сметана Простоквашино",
+# такой товар не должен импортироваться.
+GENERIC_QUERY_TOKENS = {
+    "кофе",
+    "чай",
+    "молоко",
+    "сметана",
+    "кефир",
+    "йогурт",
+    "сыр",
+    "масло",
+    "вода",
+    "сок",
+    "пицца",
+    "сельдь",
+    "рыба",
+    "мясо",
+    "колбаса",
+    "макароны",
+    "рис",
+    "гречка",
+    "мука",
+    "сахар",
+    "соль",
+    "хлеб",
+    "печенье",
+    "шоколад",
+    "конфеты",
+    "мороженое",
+    "пельмени",
+    "вареники",
+    "творог",
+    "сливки",
+    "яйца",
+    "яйцо",
+    "продукт",
+    "продукты",
+    "напиток",
+    "напитки",
+}
+
+
+GENERIC_MODIFIER_TOKENS = {
+    "растворимый",
+    "растворимое",
+    "молотый",
+    "молотое",
+    "зерновой",
+    "зерновое",
+    "зернах",
+    "зёрнах",
+    "черный",
+    "чёрный",
+    "зеленый",
+    "зелёный",
+    "питьевой",
+    "питьевое",
+    "пастеризованный",
+    "пастеризованное",
+    "ультрапастеризованный",
+    "ультрапастеризованное",
+    "безлактозный",
+    "безлактозное",
+    "замороженный",
+    "замороженная",
+    "замороженное",
+    "сливочный",
+    "сливочная",
+    "средний",
+    "средняя",
+    "жирности",
+    "гост",
+}
+
+
 class MetroProvider(
     ExternalCatalogProvider
 ):
-    """ Провайдер публичного каталога METRO. Использует обычные публичные HTML-страницы: /search?q=... /products/... Никакой закрытый мобильный API не требуется. Схема: поиск METRO ↓ ссылки /products/ ↓ карточки товара ↓ ExternalProduct """
+    """ Провайдер публичного каталога METRO. Схема: /search?q=... ↓ ссылки /products/... ↓ карточки товара ↓ проверка релевантности ↓ ExternalProduct Важное правило: конкретный запрос не должен превращаться в импорт любых товаров того же типа. Например: "Сметана Чабан" не должен импортировать: "Сметана Простоквашино" "Сметана Экомилк" "Сметана Parmalat" """
 
     provider_name = "metro"
 
-    def __init__( self, *, timeout_seconds: int = ( REQUEST_TIMEOUT_SECONDS ), ) -> None:
+    def __init__( self, *, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS, ) -> None:
         self.timeout_seconds = max(
             5,
             min(
@@ -142,6 +227,155 @@ class MetroProvider(
             )
             if len(token) >= 2
         ]
+
+    @staticmethod
+    def _token_matches( query_token: str, candidate_token: str, ) -> bool:
+        """ Безопасное совпадение одного токена. Точное совпадение всегда принимается. Частичное совпадение разрешаем только для слов длиной >= 4, чтобы поддерживать небольшие различия форм. """
+
+        if query_token == candidate_token:
+            return True
+
+        if (
+            len(query_token) < 4
+            or len(candidate_token) < 4
+        ):
+            return False
+
+        return (
+            query_token in candidate_token
+            or candidate_token in query_token
+        )
+
+    @classmethod
+    def _query_anchor_tokens( cls, query: str, ) -> list[str]:
+        """ Возвращает уточняющие токены запроса. Примеры: "сметана чабан" -> ["чабан"] "кофе poetti" -> ["poetti"] "poetti leggenda" -> ["poetti", "leggenda"] "растворимый кофе" -> [] Если anchor есть, карточка обязана содержать его. """
+
+        generic = {
+            cls._normalize(
+                token
+            )
+            for token in (
+                GENERIC_QUERY_TOKENS
+                | GENERIC_MODIFIER_TOKENS
+            )
+        }
+
+        result: list[str] = []
+
+        for token in cls._tokens(
+            query
+        ):
+            normalized_token = cls._normalize(
+                token
+            )
+
+            if normalized_token in generic:
+                continue
+
+            result.append(
+                normalized_token
+            )
+
+        return result
+
+    @classmethod
+    def _query_token_coverage( cls, *, query: str, candidate_text: str, ) -> float:
+        """ Доля значимых слов запроса, найденных в карточке. """
+
+        query_tokens = cls._tokens(
+            query
+        )
+
+        candidate_tokens = cls._tokens(
+            candidate_text
+        )
+
+        if (
+            not query_tokens
+            or not candidate_tokens
+        ):
+            return 0.0
+
+        matched = 0
+
+        for query_token in query_tokens:
+            if any(
+                cls._token_matches(
+                    query_token,
+                    candidate_token,
+                )
+                for candidate_token in candidate_tokens
+            ):
+                matched += 1
+
+        return (
+            matched
+            / len(query_tokens)
+        )
+
+    @classmethod
+    def _has_all_anchor_tokens( cls, *, query: str, candidate_text: str, ) -> bool:
+        """ Для конкретного запроса требует, чтобы все уточняющие слова присутствовали в карточке. Это главный фильтр от нерелевантного импорта. """
+
+        anchors = cls._query_anchor_tokens(
+            query
+        )
+
+        if not anchors:
+            return True
+
+        candidate_tokens = cls._tokens(
+            candidate_text
+        )
+
+        if not candidate_tokens:
+            return False
+
+        for anchor in anchors:
+            if not any(
+                cls._token_matches(
+                    anchor,
+                    candidate_token,
+                )
+                for candidate_token in candidate_tokens
+            ):
+                return False
+
+        return True
+
+    @classmethod
+    def _is_relevant_candidate( cls, *, query: str, candidate_text: str, ) -> bool:
+        """ Финальная проверка релевантности. Правила: 1. Все anchor-токены конкретного запроса обязаны присутствовать. 2. Для многословного запроса должно совпасть не меньше половины токенов. 3. Для широкого запроса без anchor достаточно обычного совпадения типа. """
+
+        if not cls._has_all_anchor_tokens(
+            query=query,
+            candidate_text=candidate_text,
+        ):
+            return False
+
+        query_tokens = cls._tokens(
+            query
+        )
+
+        if not query_tokens:
+            return False
+
+        coverage = cls._query_token_coverage(
+            query=query,
+            candidate_text=candidate_text,
+        )
+
+        anchors = cls._query_anchor_tokens(
+            query
+        )
+
+        if len(query_tokens) == 1:
+            return coverage >= 1.0
+
+        if anchors:
+            return coverage >= 0.50
+
+        return coverage >= 0.50
 
     @classmethod
     def _score_name( cls, *, query: str, name: str, ) -> float:
@@ -211,9 +445,24 @@ class MetroProvider(
             else 0.0
         )
 
+        anchor_bonus = 0.0
+
+        if cls._has_all_anchor_tokens(
+            query=query,
+            candidate_text=name,
+        ):
+            anchors = cls._query_anchor_tokens(
+                query
+            )
+
+            if anchors:
+                anchor_bonus = 0.20
+
         return min(
             1.0,
-            coverage + phrase_bonus,
+            coverage
+            + phrase_bonus
+            + anchor_bonus,
         )
 
     @staticmethod
@@ -312,7 +561,7 @@ class MetroProvider(
         return None
 
     async def _fetch_text( self, *, session: aiohttp.ClientSession, url: str, ) -> str | None:
-        """ Делает публичный HTML-запрос к METRO. 401/403/429 считаем временной недоступностью источника. """
+        """ Делает публичный HTML-запрос к METRO. 401/403/429/5xx считаются временной недоступностью источника. """
 
         for attempt in range(2):
             try:
@@ -366,6 +615,7 @@ class MetroProvider(
                     "METRO request failed: %s",
                     url,
                 )
+
                 return None
 
         return None
@@ -477,7 +727,7 @@ class MetroProvider(
             str,
         ]
     ]:
-        """ Извлекает уникальные ссылки /products/ из поисковой страницы. """
+        """ Извлекает уникальные ссылки /products/ из поисковой страницы. На этом раннем этапе фильтр мягкий: окончательная проверка выполняется после загрузки полной карточки. """
 
         soup = BeautifulSoup(
             html,
@@ -581,7 +831,11 @@ class MetroProvider(
                 name=text,
             )
 
-            if score < 0.30:
+            # Здесь оставляем более мягкий порог,
+            # потому что полная карточка может
+            # содержать бренд, которого нет в
+            # тексте ссылки поисковой выдачи.
+            if score < 0.20:
                 continue
 
             seen.add(
@@ -604,9 +858,12 @@ class MetroProvider(
             reverse=True,
         )
 
+        # Берём небольшой запас, чтобы после
+        # строгой проверки осталось до limit
+        # действительно релевантных карточек.
         return candidates[
             : max(
-                limit * 2,
+                limit * 3,
                 limit,
             )
         ]
@@ -845,6 +1102,17 @@ class MetroProvider(
             )
 
         if not html:
+            # Без полной страницы мы не можем
+            # надёжно проверить бренд конкретного
+            # запроса. Поэтому предварительную
+            # карточку принимаем только если
+            # сама строка выдачи уже релевантна.
+            if not self._is_relevant_candidate(
+                query=query,
+                candidate_text=preliminary_name,
+            ):
+                return None
+
             package_value, package_unit = (
                 self._parse_package(
                     preliminary_name
@@ -964,6 +1232,38 @@ class MetroProvider(
             )
         )
 
+        candidate_text = " ".join(
+            value
+            for value in (
+                brand_name,
+                name,
+                category_name,
+            )
+            if value
+        )
+
+        # КЛЮЧЕВОЙ ФИЛЬТР:
+        # конкретный запрос обязан совпадать
+        # с полной карточкой.
+        if not self._is_relevant_candidate(
+            query=query,
+            candidate_text=candidate_text,
+        ):
+            logger.info(
+                "METRO product rejected by relevance: "
+                "query=%r name=%r brand=%r "
+                "category=%r anchors=%r",
+                query,
+                name,
+                brand_name,
+                category_name,
+                self._query_anchor_tokens(
+                    query
+                ),
+            )
+
+            return None
+
         package_value, package_unit = (
             self._parse_package(
                 name
@@ -1078,10 +1378,7 @@ class MetroProvider(
 
         score = self._score_name(
             query=query,
-            name=(
-                f"{brand_name or ''} "
-                f"{name}"
-            ),
+            name=candidate_text,
         )
 
         product = ExternalProduct(
@@ -1111,7 +1408,9 @@ class MetroProvider(
                     keyword_values
                 )
             ),
-            raw={},
+            raw={
+                "relevance_score": score,
+            },
         )
 
         return (
@@ -1123,7 +1422,7 @@ class MetroProvider(
         )
 
     async def search( self, query: str, *, limit: int = 8, ) -> ExternalSearchResult:
-        """ Ищет товары в публичном каталоге METRO. """
+        """ Ищет товары в публичном каталоге METRO. После загрузки карточек применяется строгий relevance-фильтр. """
 
         cleaned_query = (
             clean_external_text(
@@ -1273,6 +1572,8 @@ class MetroProvider(
             ]
         ] = []
 
+        rejected_count = 0
+
         for item in loaded:
             if isinstance(
                 item,
@@ -1285,11 +1586,31 @@ class MetroProvider(
                 continue
 
             if item is None:
+                rejected_count += 1
                 continue
 
             score, product = item
 
+            candidate_text = " ".join(
+                value
+                for value in (
+                    product.brand_name,
+                    product.name,
+                    product.category_name,
+                )
+                if value
+            )
+
+            # Повторная защита перед импортом.
+            if not self._is_relevant_candidate(
+                query=cleaned_query,
+                candidate_text=candidate_text,
+            ):
+                rejected_count += 1
+                continue
+
             if score < 0.30:
+                rejected_count += 1
                 continue
 
             scored_products.append(
@@ -1348,13 +1669,20 @@ class MetroProvider(
 
         logger.info(
             "METRO search: query=%r "
-            "products=%s with_images=%s",
+            "candidates=%s rejected=%s "
+            "products=%s with_images=%s "
+            "anchors=%r",
             cleaned_query,
+            len(candidates),
+            rejected_count,
             len(products),
             sum(
                 1
                 for product in products
                 if product.image_url
+            ),
+            self._query_anchor_tokens(
+                cleaned_query
             ),
         )
 
@@ -1370,6 +1698,6 @@ class MetroProvider(
         )
 
     async def get_product( self, source_id: str, ) -> ExternalProduct | None:
-        """ source_id для METRO может быть slug или SKU. Пока прямой lookup не используется: основная цепочка работает через search(). """
+        """ Прямой lookup METRO пока не используется. Основная цепочка работает через search(). """
 
         return None
