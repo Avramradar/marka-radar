@@ -9,6 +9,9 @@ from app.integrations.providers.metro import (
 from app.integrations.providers.openfoodfacts import (
     OpenFoodFactsProvider,
 )
+from app.integrations.providers.pyaterochka import (
+    PyaterochkaProvider,
+)
 
 
 def build_default_providers(
@@ -16,11 +19,12 @@ def build_default_providers(
     ExternalCatalogProvider,
     ...
 ]:
-    """ Возвращает внешние каталоги MarkaRadar в порядке приоритета. Порядок сейчас такой: 1. OpenFoodFacts Хорош для структурированных данных и штрихкодов, но текстовый поиск иногда нестабилен. 2. METRO Используется как второй источник для текстового поиска и наполнения карточек товара. Если первый провайдер ничего не нашёл, ExternalCatalogService автоматически перейдёт к следующему. """
+    """ Возвращает внешние каталоги MarkaRadar в порядке приоритета. Сейчас: 1. OpenFoodFacts Хорош для структурированных данных и штрихкодов, но текстовый поиск может быть нестабильным. 2. METRO Публичный каталог с хорошими карточками и изображениями. 3. Пятёрочка Публичный каталог 5ka.ru. Используется как дополнительный источник российских товарных карточек. ExternalCatalogService проходит по ним последовательно и объединяет результаты. """
 
     return (
         OpenFoodFactsProvider(),
         MetroProvider(),
+        PyaterochkaProvider(),
     )
 
 
