@@ -3,6 +3,9 @@ from __future__ import annotations
 from app.integrations.providers.base import (
     ExternalCatalogProvider,
 )
+from app.integrations.providers.metro import (
+    MetroProvider,
+)
 from app.integrations.providers.openfoodfacts import (
     OpenFoodFactsProvider,
 )
@@ -13,10 +16,11 @@ def build_default_providers(
     ExternalCatalogProvider,
     ...
 ]:
-    """ Возвращает провайдеры MarkaRadar в порядке приоритета. Сейчас подключён только OpenFoodFacts. Позже сюда без изменения остальной архитектуры добавятся: LentaProvider() PerekrestokProvider() MetroProvider() Порядок важен: более стабильные и структурированные источники должны идти раньше. """
+    """ Возвращает внешние каталоги MarkaRadar в порядке приоритета. Порядок сейчас такой: 1. OpenFoodFacts Хорош для структурированных данных и штрихкодов, но текстовый поиск иногда нестабилен. 2. METRO Используется как второй источник для текстового поиска и наполнения карточек товара. Если первый провайдер ничего не нашёл, ExternalCatalogService автоматически перейдёт к следующему. """
 
     return (
         OpenFoodFactsProvider(),
+        MetroProvider(),
     )
 
 
