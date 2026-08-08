@@ -129,7 +129,7 @@ class MetroProvider(
             .split()
         )
 
-   @classmethod
+    @classmethod
     def _tokens( cls, value: Any, ) -> list[str]:
         return [
             token
