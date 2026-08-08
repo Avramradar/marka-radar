@@ -21,12 +21,7 @@ from app.search.family_search import (
 
 
 class SearchPipelineScreen(StrEnum):
-    """
-    Экран, который должен увидеть пользователь.
-
-    Search Pipeline возвращает не сырой список
-    товаров, а готовое решение для интерфейса.
-    """
+    """ Экран, который должен увидеть пользователь. Search Pipeline возвращает не сырой список товаров, а готовое решение для интерфейса. """
 
     EMPTY = "empty"
     BARCODE_PRODUCT = "barcode_product"
@@ -38,9 +33,7 @@ class SearchPipelineScreen(StrEnum):
 
 @dataclass(slots=True)
 class SearchPipelineProduct:
-    """
-    Конкретный товар, найденный по штрихкоду.
-    """
+    """ Конкретный товар, найденный по штрихкоду. """
 
     product: Any
     brand: Any
@@ -49,12 +42,7 @@ class SearchPipelineProduct:
 
 @dataclass(slots=True)
 class SearchPipelineResult:
-    """
-    Полный результат поискового конвейера.
-
-    Обработчики Telegram должны смотреть
-    только на поле screen.
-    """
+    """ Полный результат поискового конвейера. Обработчики Telegram должны смотреть только на поле screen. """
 
     screen: SearchPipelineScreen
 
@@ -71,35 +59,35 @@ class SearchPipelineResult:
     corrected_query: str | None
     explanation: str | None
 
-    @property
+@property
     def has_results(self) -> bool:
         return self.screen not in {
             SearchPipelineScreen.EMPTY,
             SearchPipelineScreen.NOT_FOUND,
         }
 
-    @property
+@property
     def is_barcode_result(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.BARCODE_PRODUCT
         )
 
-    @property
+@property
     def should_show_intents(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.INTENTS
         )
 
-    @property
+@property
     def should_show_families(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.FAMILIES
         )
 
-    @property
+@property
     def should_show_decision(self) -> bool:
         return (
             self.screen
@@ -107,12 +95,111 @@ class SearchPipelineResult:
         )
 
 
-def clean_pipeline_query(
-    query: str,
-) -> str:
-    """
-    Безопасная первичная очистка запроса.
-    """
+# ------------------------------------------------------------------
+# ЭВРИСТИКА "ШИРОКИЙ ИЛИ КОНКРЕТНЫЙ ЗАПРОС"
+# ------------------------------------------------------------------
+#
+# Раньше любое выражение из 1-2 слов считалось широким.
+# Поэтому:
+#
+# "Сметана Чабан"
+# "Кофе Poetti"
+#
+# ошибочно уходили в FAMILIES/INTENTS.
+#
+# Теперь:
+#
+# "сметана" -> широкий
+# "кофе" -> широкий
+# "растворимый кофе" -> широкий
+# "молотый кофе" -> широкий
+#
+# но:
+#
+# "сметана чабан" -> конкретный
+# "кофе poetti" -> конкретный
+# "poetti leggenda" -> конкретный
+# "простоквашино 15%" -> конкретный
+# ------------------------------------------------------------------
+
+BROAD_PRODUCT_WORDS = {
+    "кофе",
+    "чай",
+    "молоко",
+    "сметана",
+    "кефир",
+    "йогурт",
+    "сыр",
+    "масло",
+    "вода",
+    "сок",
+    "пицца",
+    "сельдь",
+    "рыба",
+    "мясо",
+    "колбаса",
+    "макароны",
+    "рис",
+    "гречка",
+    "мука",
+    "сахар",
+    "соль",
+    "хлеб",
+    "печенье",
+    "шоколад",
+    "конфеты",
+    "мороженое",
+    "пельмени",
+    "вареники",
+    "творог",
+    "сливки",
+    "яйца",
+    "яйцо",
+}
+
+BROAD_MODIFIER_WORDS = {
+    "растворимый",
+    "растворимое",
+    "молотый",
+    "молотое",
+    "зерновой",
+    "зерновое",
+    "зернах",
+    "зёрнах",
+    "черный",
+    "чёрный",
+    "зеленый",
+    "зелёный",
+    "питьевой",
+    "питьевое",
+    "пастеризованный",
+    "пастеризованное",
+    "ультрапастеризованный",
+    "ультрапастеризованное",
+    "безлактозный",
+    "безлактозное",
+    "замороженный",
+    "замороженная",
+    "замороженное",
+    "слабосоленый",
+    "слабосолёный",
+    "слабосоленая",
+    "слабосолёная",
+    "филе",
+    "минеральная",
+    "питьевая",
+    "газированная",
+    "негазированная",
+    "сливочное",
+    "сливочный",
+    "твердый",
+    "твёрдый",
+    "мягкий",
+}
+
+
+def clean_pipeline_query( query: str, ) -> str:
+    """ Безопасная первичная очистка запроса. """
 
     return " ".join(
         str(query or "")
@@ -121,14 +208,25 @@ def clean_pipeline_query(
     )
 
 
-def is_possible_barcode(
-    query: str,
-) -> bool:
-    """
-    Проверяет, похож ли запрос на штрихкод.
+def normalize_pipeline_token( value: str, ) -> str:
+    """ Лёгкая нормализация слова для эвристики широкого запроса. """
 
-    Поддерживаем длину 8-14 цифр.
-    """
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace(
+            "ё",
+            "е",
+        )
+        .strip(
+            ".,:;!?()[]{}\"'«»"
+        )
+    )
+
+
+def is_possible_barcode( query: str, ) -> bool:
+    """ Проверяет, похож ли запрос на штрихкод. Поддерживаем длину 8-14 цифр. """
 
     cleaned = clean_pipeline_query(
         query
@@ -140,21 +238,8 @@ def is_possible_barcode(
     )
 
 
-def is_broad_query(
-    query: str,
-) -> bool:
-    """
-    Определяет широкий пользовательский запрос.
-
-    Примеры:
-
-        кофе
-        молоко
-        растворимый кофе
-
-    Более конкретные запросы должны быстрее
-    переходить непосредственно к товарам.
-    """
+def is_broad_query( query: str, ) -> bool:
+    """ Определяет, действительно ли запрос широкий. Одно слово: кофе сметана молоко считаем широким. Два слова считаем широкими только тогда, когда это сочетание типа продукта и общей характеристики: растворимый кофе молотый кофе черный чай питьевое молоко Брендовые/конкретные запросы: Сметана Чабан Кофе Poetti Poetti Leggenda широкими НЕ считаются и сразу идут к конкретным товарам через Decision Search. """
 
     cleaned = clean_pipeline_query(
         query
@@ -163,26 +248,74 @@ def is_broad_query(
     if not cleaned:
         return False
 
-    return len(
-        cleaned.split()
-    ) <= 2
+    tokens = [
+        normalize_pipeline_token(
+            token
+        )
+        for token in cleaned.split()
+        if normalize_pipeline_token(
+            token
+        )
+    ]
+
+    if not tokens:
+        return False
+
+    if len(tokens) == 1:
+        return True
+
+    if len(tokens) > 2:
+        return False
+
+    first, second = tokens
+
+    product_words = {
+        word.replace(
+            "ё",
+            "е",
+        )
+        for word in BROAD_PRODUCT_WORDS
+    }
+
+    modifier_words = {
+        word.replace(
+            "ё",
+            "е",
+        )
+        for word in BROAD_MODIFIER_WORDS
+    }
+
+    # Тип + характеристика:
+    # "кофе растворимый"
+    if (
+        first in product_words
+        and second in modifier_words
+    ):
+        return True
+
+    # Характеристика + тип:
+    # "растворимый кофе"
+    if (
+        second in product_words
+        and first in modifier_words
+    ):
+        return True
+
+    # Два общих типа продукта тоже считаем
+    # широким/неоднозначным запросом.
+    if (
+        first in product_words
+        and second in product_words
+    ):
+        return True
+
+    # Всё остальное из двух слов считаем
+    # конкретным запросом.
+    return False
 
 
-def should_show_facets(
-    *,
-    query: str,
-    facet_options: list[dict[str, Any]],
-    decision: DecisionSearchResult,
-) -> bool:
-    """
-    Решает, нужно ли показывать фасеты.
-
-    Они нужны только:
-
-    - для широкого запроса;
-    - когда есть минимум два полезных варианта;
-    - когда уже нет подтверждённого лидера.
-    """
+def should_show_facets( *, query: str, facet_options: list[dict[str, Any]], decision: DecisionSearchResult, ) -> bool:
+    """ Решает, нужно ли показывать фасеты. Они нужны только: - для действительно широкого запроса; - когда есть минимум два полезных варианта; - когда уже нет подтверждённого лидера. """
 
     if not is_broad_query(
         query
@@ -200,16 +333,12 @@ def should_show_facets(
     return True
 
 
-def family_quality_key(
-    family: dict[str, Any],
-) -> tuple[
+def family_quality_key( family: dict[str, Any], ) -> tuple[
     float,
     int,
     str,
 ]:
-    """
-    Ключ сортировки семейств.
-    """
+    """ Ключ сортировки семейств. """
 
     return (
         float(
@@ -235,13 +364,8 @@ def family_quality_key(
     )
 
 
-def normalize_family_name(
-    value: str,
-) -> str:
-    """
-    Нормализует название семейства
-    для удаления дублей.
-    """
+def normalize_family_name( value: str, ) -> str:
+    """ Нормализует название семейства для удаления дублей. """
 
     return " ".join(
         str(value or "")
@@ -255,19 +379,8 @@ def normalize_family_name(
     )
 
 
-def prepare_families(
-    families: list[dict[str, Any]],
-    *,
-    limit: int = 6,
-) -> list[dict[str, Any]]:
-    """
-    Удаляет:
-
-    - пустые семейства;
-    - семейства без товаров;
-    - дубли;
-    - слишком длинную выдачу.
-    """
+def prepare_families( families: list[dict[str, Any]], *, limit: int = 6, ) -> list[dict[str, Any]]:
+    """ Удаляет: - пустые семейства; - семейства без товаров; - дубли; - слишком длинную выдачу. """
 
     safe_limit = max(
         1,
@@ -341,20 +454,8 @@ def prepare_families(
     return prepared
 
 
-def should_show_families(
-    *,
-    query: str,
-    families: list[dict[str, Any]],
-    facet_options: list[dict[str, Any]],
-    decision: DecisionSearchResult,
-) -> bool:
-    """
-    Семейства — только резервный механизм.
-
-    Если Facet Engine уже дал нормальные
-    пользовательские уточнения, семейства
-    показывать не нужно.
-    """
+def should_show_families( *, query: str, families: list[dict[str, Any]], facet_options: list[dict[str, Any]], decision: DecisionSearchResult, ) -> bool:
+    """ Семейства — только резервный механизм. Главное изменение: конкретный брендовый запрос вроде "Сметана Чабан" никогда не должен уходить в FAMILIES только из-за того, что в нём два слова. """
 
     if facet_options:
         return False
@@ -375,22 +476,8 @@ def should_show_families(
     return True
 
 
-async def find_barcode_product(
-    *,
-    session: AsyncSession,
-    barcode: str,
-) -> SearchPipelineProduct | None:
-    """
-    Ищет точный товар по штрихкоду
-    только в локальной базе MarkaRadar.
-
-    Внешнее обогащение OpenFoodFacts
-    выполняется уровнем выше — в search.py.
-
-    Это намеренно:
-    Search Pipeline не должен выполнять
-    внешние HTTP-запросы.
-    """
+async def find_barcode_product( *, session: AsyncSession, barcode: str, ) -> SearchPipelineProduct | None:
+    """ Ищет точный товар по штрихкоду только в локальной базе MarkaRadar. Внешнее обогащение OpenFoodFacts выполняется уровнем выше — в search.py. """
 
     rows = await search_products(
         session=session,
@@ -419,13 +506,8 @@ async def find_barcode_product(
     )
 
 
-def build_empty_result(
-    *,
-    original_query: str,
-) -> SearchPipelineResult:
-    """
-    Формирует результат пустого запроса.
-    """
+def build_empty_result( *, original_query: str, ) -> SearchPipelineResult:
+    """ Формирует результат пустого запроса. """
 
     return SearchPipelineResult(
         screen=(
@@ -444,15 +526,8 @@ def build_empty_result(
     )
 
 
-def build_not_found_result(
-    *,
-    original_query: str,
-    normalized_query: str,
-    explanation: str,
-) -> SearchPipelineResult:
-    """
-    Формирует результат отсутствия товаров.
-    """
+def build_not_found_result( *, original_query: str, normalized_query: str, explanation: str, ) -> SearchPipelineResult:
+    """ Формирует результат отсутствия товаров. """
 
     return SearchPipelineResult(
         screen=(
@@ -469,16 +544,8 @@ def build_not_found_result(
     )
 
 
-def build_barcode_result(
-    *,
-    original_query: str,
-    normalized_query: str,
-    barcode_product: SearchPipelineProduct,
-) -> SearchPipelineResult:
-    """
-    Формирует результат точного поиска
-    по штрихкоду.
-    """
+def build_barcode_result( *, original_query: str, normalized_query: str, barcode_product: SearchPipelineProduct, ) -> SearchPipelineResult:
+    """ Формирует результат точного поиска по штрихкоду. """
 
     return SearchPipelineResult(
         screen=(
@@ -499,43 +566,8 @@ def build_barcode_result(
     )
 
 
-async def run_search_pipeline(
-    *,
-    session: AsyncSession,
-    query: str,
-    intent_limit: int = 6,
-    family_limit: int = 6,
-    decision_candidates_limit: int = 20,
-    allow_refinements: bool = True,
-) -> SearchPipelineResult:
-    """
-    Единый Search Pipeline MarkaRadar.
-
-    Последовательность:
-
-    1. очищаем запрос;
-    2. проверяем локальный штрихкод;
-    3. запускаем Decision Search;
-    4. при необходимости запускаем Facet Engine;
-    5. если фасетов нет — Family Search;
-    6. выбираем пользовательский экран.
-
-    ВАЖНО:
-
-    OpenFoodFacts здесь НЕ вызывается.
-
-    Внешнее обогащение находится в search.py:
-
-        run_pipeline_with_external_enrichment()
-
-    Благодаря этому:
-
-    - Search Pipeline остаётся чистым;
-    - нет двойных HTTP-запросов;
-    - обычный поиск не зависит от OFF;
-    - внешний сервис не может сломать поиск;
-    - Pipeline легко тестировать.
-    """
+async def run_search_pipeline( *, session: AsyncSession, query: str, intent_limit: int = 6, family_limit: int = 6, decision_candidates_limit: int = 20, allow_refinements: bool = True, ) -> SearchPipelineResult:
+    """ Единый Search Pipeline MarkaRadar. Последовательность: 1. очищаем запрос; 2. проверяем локальный штрихкод; 3. запускаем Decision Search; 4. для действительно широкого запроса при необходимости запускаем Facet Engine; 5. если фасетов нет — Family Search; 6. конкретные брендовые запросы сразу переходят к Decision; 7. выбираем пользовательский экран. OpenFoodFacts/METRO здесь НЕ вызываются. Внешнее обогащение находится уровнем выше в search.py. """
 
     cleaned_query = (
         clean_pipeline_query(
@@ -666,7 +698,50 @@ async def run_search_pipeline(
         )
 
     #
-    # 5. FACETS
+    # 5. КОНКРЕТНЫЙ ЗАПРОС -> СРАЗУ DECISION
+    #
+    # Это главное исправление для:
+    #
+    # Сметана Чабан
+    # Кофе Poetti
+    # Poetti Leggenda
+    #
+    # Если Decision Search уже нашёл товары,
+    # не отправляем пользователя в семейства.
+    #
+
+    query_is_broad = (
+        is_broad_query(
+            cleaned_query
+        )
+    )
+
+    if (
+        decision.has_results
+        and not query_is_broad
+    ):
+        return SearchPipelineResult(
+            screen=(
+                SearchPipelineScreen
+                .DECISION
+            ),
+            original_query=query,
+            normalized_query=(
+                cleaned_query
+            ),
+            barcode_product=None,
+            intent_groups=[],
+            families=[],
+            decision=decision,
+            corrected_query=None,
+            explanation=(
+                "Найдены товары, наиболее "
+                "точно соответствующие запросу."
+            ),
+        )
+
+    #
+    # 6. FACETS
     #
 
     facet_options: list[
@@ -676,12 +751,6 @@ async def run_search_pipeline(
     families: list[
         dict[str, Any]
     ] = []
-
-    query_is_broad = (
-        is_broad_query(
-            cleaned_query
-        )
-    )
 
     if query_is_broad:
         facet_candidates_limit = max(
@@ -714,7 +783,7 @@ async def run_search_pipeline(
         )
 
     #
-    # 6. FAMILY SEARCH
+    # 7. FAMILY SEARCH
     #
 
     if (
@@ -738,7 +807,7 @@ async def run_search_pipeline(
         )
 
     #
-    # 7. ПОКАЗАТЬ FACETS
+    # 8. ПОКАЗАТЬ FACETS
     #
 
     if should_show_facets(
@@ -768,7 +837,7 @@ async def run_search_pipeline(
         )
 
     #
-    # 8. ПОКАЗАТЬ FAMILIES
+    # 9. ПОКАЗАТЬ FAMILIES
     #
 
     if should_show_families(
@@ -798,7 +867,7 @@ async def run_search_pipeline(
         )
 
     #
-    # 9. ПОКАЗАТЬ DECISION
+    # 10. ПОКАЗАТЬ DECISION
     #
 
     if decision.has_results:
@@ -826,7 +895,7 @@ async def run_search_pipeline(
         )
 
     #
-    # 10. NOT FOUND
+    # 11. NOT FOUND
     #
 
     return build_not_found_result(
@@ -837,4 +906,4 @@ async def run_search_pipeline(
         explanation=(
             "Подходящих товаров не найдено."
         ),
-    )
+        )
