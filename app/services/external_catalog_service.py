@@ -50,7 +50,7 @@ class ExternalCatalogServiceResult:
 
 
 class ExternalCatalogService:
-    """ Единая точка работы MarkaRadar со всеми внешними товарными каталогами. Search Pipeline и handlers не должны знать, как устроены OpenFoodFacts, Лента, Перекрёсток или Metro. Они вызывают только этот сервис. Алгоритм: query ↓ providers registry ↓ provider.search() ↓ Provider Import Service ↓ Product Merge Engine ↓ MarkaRadar DB """
+    """ Единая точка работы MarkaRadar со всеми внешними товарными каталогами. """
 
     def __init__( self, *, providers: tuple[ ExternalCatalogProvider, ... ] | None = None, ) -> None:
         self.providers = (
@@ -60,7 +60,7 @@ class ExternalCatalogService:
         )
 
     async def search_and_enrich( self, *, session: AsyncSession, query: str, limit_per_provider: int = 8, stop_after_success: bool = False, commit: bool = True, ) -> ExternalCatalogServiceResult:
-        """ Ищет товары по всем подключённым источникам и импортирует полезные карточки. stop_after_success=False: пройти по всем провайдерам. stop_after_success=True: остановиться после первого источника, который реально импортировал товары. Пока провайдер один, разницы нет. Позже этот флаг пригодится для управления нагрузкой на Ленту / Перекрёсток / Metro. """
+        """ Ищет товары по подключённым источникам и импортирует полезные карточки. """
 
         cleaned_query = " ".join(
             str(query or "")
@@ -130,28 +130,16 @@ class ExternalCatalogService:
                     provider.provider_name,
                     cleaned_query,
                 )
-
                 continue
 
             provider_results.append(
                 result
             )
 
-            total_found += (
-                result.found_count
-            )
-
-            total_imported += (
-                result.imported_count
-            )
-
-            total_skipped += (
-                result.skipped_count
-            )
-
-            total_failed += (
-                result.failed_count
-            )
+            total_found += result.found_count
+            total_imported += result.imported_count
+            total_skipped += result.skipped_count
+            total_failed += result.failed_count
 
             logger.info(
                 "External catalog provider done: "
@@ -214,7 +202,7 @@ _default_service: (
 
 def get_external_catalog_service(
 ) -> ExternalCatalogService:
-    """ Возвращает общий экземпляр сервиса. Это позволяет переиспользовать клиенты провайдеров и их локальные кэши между пользовательскими запросами. """
+    """ Возвращает общий экземпляр сервиса. """
 
     global _default_service
 
@@ -227,7 +215,7 @@ def get_external_catalog_service(
 
 
 async def enrich_catalog( *, session: AsyncSession, query: str, limit_per_provider: int = 8, stop_after_success: bool = False, commit: bool = True, ) -> ExternalCatalogServiceResult:
-    """ Удобная функциональная точка входа. В дальнейшем handlers смогут вызывать: result = await enrich_catalog( session=session, query=query, ) не импортируя конкретные провайдеры. """
+    """ Удобная функциональная точка входа. """
 
     service = (
         get_external_catalog_service()
