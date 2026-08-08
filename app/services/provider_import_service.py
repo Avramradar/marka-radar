@@ -73,17 +73,39 @@ def _keywords_to_text( values: tuple[str, ...], ) -> str | None:
 
 
 async def _resolve_category_id( *, session: AsyncSession, product: ExternalProduct, ) -> int | None:
-    """ Пытается сопоставить внешнюю категорию с категорией MarkaRadar. Использует все доступные значения категории, а category_name добавляет первым при наличии. """
+    """ Определяет category_id MarkaRadar для внешнего товара. Приоритет подсказок: 1. category_name провайдера; 2. дополнительные категории провайдера; 3. название товара; 4. keywords товара. Название и keywords особенно важны для ритейлеров вроде METRO: страница товара может не отдавать удобную категорию, но тип продукта обычно присутствует прямо в названии, например: Сметана Простоквашино 15% 260 г Кофе Poetti Leggenda Original 250 г """
 
     values: list[str] = []
 
+    #
+    # 1. Явная категория провайдера.
+    #
     if product.category_name:
         values.append(
             product.category_name
         )
 
+    #
+    # 2. Дополнительные категории/теги.
+    #
     values.extend(
         product.external_category_values
+    )
+
+    #
+    # 3. Название товара как fallback.
+    #
+    if product.name:
+        values.append(
+            product.name
+        )
+
+    #
+    # 4. Keywords также могут содержать
+    # тип продукта: "сметана", "кофе" и т.д.
+    #
+    values.extend(
+        product.keywords
     )
 
     unique_values: list[str] = []
@@ -120,6 +142,13 @@ async def _resolve_category_id( *, session: AsyncSession, product: ExternalProdu
         )
 
     if not unique_values:
+        logger.info(
+            "Category mapping: "
+            "provider=%s source_id=%s "
+            "no category hints",
+            product.provider,
+            product.source_id,
+        )
         return None
 
     mapping = await map_external_category(
@@ -128,11 +157,43 @@ async def _resolve_category_id( *, session: AsyncSession, product: ExternalProdu
     )
 
     if mapping.category is None:
+        logger.info(
+            "Category mapping failed: "
+            "provider=%s source_id=%s "
+            "name=%r category_name=%r "
+            "source_value=%r matched_by=%s "
+            "hints=%r",
+            product.provider,
+            product.source_id,
+            product.name,
+            product.category_name,
+            mapping.source_value,
+            mapping.matched_by,
+            unique_values,
+        )
         return None
 
-    return int(
+    category_id = int(
         mapping.category.id
     )
+
+    logger.info(
+        "Category mapping success: "
+        "provider=%s source_id=%s "
+        "name=%r category_id=%s "
+        "category=%r matched_by=%s "
+        "confidence=%.0f source_value=%r",
+        product.provider,
+        product.source_id,
+        product.name,
+        category_id,
+        mapping.category.name,
+        mapping.matched_by,
+        mapping.confidence,
+        mapping.source_value,
+    )
+
+    return category_id
 
 
 async def convert_external_product( *, session: AsyncSession, product: ExternalProduct, ) -> ExternalProductData:
@@ -161,7 +222,7 @@ async def convert_external_product( *, session: AsyncSession, product: ExternalP
 
 
 async def import_external_product( *, session: AsyncSession, product: ExternalProduct, commit: bool = False, ) -> ProviderImportItemResult:
-    """ Импортирует одну внешнюю карточку через Product Merge Engine. Важное поведение: - существующий товар может быть обогащён даже если Category Mapper ничего не нашёл; - новый товар без category_id Product Merge Engine корректно отклонит через ValueError; - один плохой внешний товар не должен ломать последующий массовый импорт. """
+    """ Импортирует одну внешнюю карточку через Product Merge Engine. Существующий товар можно обогащать даже при отсутствии category_id. Новый товар без category_id Merge Engine намеренно не создаёт, чтобы не засорять каноническую базу неправильными категориями. """
 
     try:
         incoming = await convert_external_product(
@@ -237,7 +298,7 @@ async def import_external_product( *, session: AsyncSession, product: ExternalPr
 
 
 async def import_search_result( *, session: AsyncSession, result: ExternalSearchResult, commit: bool = False, ) -> ProviderBatchImportResult:
-    """ Импортирует весь ExternalSearchResult. Использует SAVEPOINT для каждой карточки, поэтому ошибка одного товара не отменяет успешно обработанные товары. """
+    """ Импортирует весь ExternalSearchResult. Для каждой карточки используется SAVEPOINT, поэтому ошибка одного товара не отменяет импорт остальных. """
 
     item_results: list[
         ProviderImportItemResult
@@ -297,7 +358,7 @@ async def import_search_result( *, session: AsyncSession, result: ExternalSearch
 
 
 async def search_and_import_provider( *, session: AsyncSession, provider: ExternalCatalogProvider, query: str, limit: int = 8, commit: bool = False, ) -> ProviderBatchImportResult:
-    """ Полный универсальный сценарий: provider.search(query) ↓ ExternalSearchResult ↓ Product Merge Engine ↓ MarkaRadar DB Именно эту функцию в дальнейшем можно использовать для OpenFoodFacts, Ленты, Перекрёстка, Metro и других источников. """
+    """ Полный универсальный сценарий: provider.search(query) ↓ ExternalSearchResult ↓ Category Mapper ↓ Product Merge Engine ↓ MarkaRadar DB Используется для OpenFoodFacts, METRO и будущих внешних провайдеров. """
 
     result = await provider.search(
         query,
@@ -342,7 +403,7 @@ async def search_and_import_provider( *, session: AsyncSession, provider: Extern
 
 
 async def import_barcode_from_provider( *, session: AsyncSession, provider: ExternalCatalogProvider, barcode: str, commit: bool = False, ) -> ProviderImportItemResult | None:
-    """ Универсальный импорт товара по штрихкоду. Провайдеры, которые не поддерживают get_by_barcode(), просто вернут None. """
+    """ Универсальный импорт товара по штрихкоду. Провайдеры без поддержки get_by_barcode() возвращают None. """
 
     product = await provider.get_by_barcode(
         barcode
@@ -355,4 +416,4 @@ async def import_barcode_from_provider( *, session: AsyncSession, provider: Exte
         session=session,
         product=product,
         commit=commit,
-  )
+    )
