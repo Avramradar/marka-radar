@@ -36,9 +36,6 @@ from app.search.search_pipeline import (
     is_possible_barcode,
     run_search_pipeline,
 )
-from app.services.external_catalog_service import (
-    enrich_catalog,
-)
 from app.services.external_product_enrichment_service import (
     enrich_product_by_barcode,
 )
@@ -99,16 +96,13 @@ def normalize_simple_text( value: Any, ) -> str:
         )
         .strip()
         .lower()
-        .replace(
-            "ё",
-            "е",
-        )
+        .replace("ё", "е")
         .split()
     )
 
 
 def format_number( value: Decimal | float | int | None, ) -> str:
-    """ Убирает лишние нули у чисел. """
+    """ Убирает лишние нули у чисел. Примеры: 245.000 -> 245 0.450 -> 0.45 1.500 -> 1.5 """
 
     if value is None:
         return ""
@@ -274,162 +268,6 @@ def should_enrich_barcode_product( pipeline_result: SearchPipelineResult, ) -> b
     )
 
 
-def product_card_is_complete_enough( *, product, brand, ) -> bool:
-    """ Проверяет, достаточно ли заполнена локальная карточка, чтобы не обращаться к внешнему каталогу. """
-
-    checks = (
-        bool(
-            getattr(
-                product,
-                "name",
-                None,
-            )
-        ),
-        is_real_brand(
-            getattr(
-                brand,
-                "name",
-                None,
-            )
-        ),
-        bool(
-            getattr(
-                product,
-                "image_url",
-                None,
-            )
-        ),
-        (
-            getattr(
-                product,
-                "package_value",
-                None,
-            )
-            is not None
-            and bool(
-                getattr(
-                    product,
-                    "package_unit",
-                    None,
-                )
-            )
-        ),
-        bool(
-            getattr(
-                product,
-                "description",
-                None,
-            )
-        ),
-    )
-
-    return (
-        sum(
-            1
-            for value in checks
-            if value
-        )
-        >= 4
-    )
-
-
-def decision_has_complete_matching_card( *, query: str, decision: DecisionSearchResult | None, ) -> bool:
-    """ Проверяет, есть ли среди локальных результатов уже достаточно полная карточка, хорошо соответствующая запросу. """
-
-    if (
-        decision is None
-        or not decision.has_results
-    ):
-        return False
-
-    query_tokens = {
-        token
-        for token in normalize_simple_text(
-            query
-        ).split()
-        if len(token) >= 2
-    }
-
-    if not query_tokens:
-        return False
-
-    items = []
-
-    if decision.best_choice is not None:
-        items.append(
-            decision.best_choice
-        )
-
-    items.extend(
-        decision.alternatives
-    )
-    items.extend(
-        decision.insufficient_data
-    )
-    items.extend(
-        decision.other_products[:8]
-    )
-
-    for item in items:
-        product = item.product
-        brand = item.brand
-
-        candidate_text = normalize_simple_text(
-            f"{getattr(brand, 'name', '')} "
-            f"{getattr(product, 'name', '')}"
-        )
-
-        matched = sum(
-            1
-            for token in query_tokens
-            if token in candidate_text
-        )
-
-        coverage = (
-            matched
-            / len(query_tokens)
-        )
-
-        if (
-            coverage >= 0.75
-            and product_card_is_complete_enough(
-                product=product,
-                brand=brand,
-            )
-        ):
-            return True
-
-    return False
-
-
-def should_try_external_text_catalog( *, query: str, pipeline_result: SearchPipelineResult, ) -> bool:
-    """ Решает, нужно ли запускать новую систему внешних провайдеров для текстового запроса. Пока не запускаем её для одного широкого слова вроде "кофе", чтобы не импортировать случайные десятки карточек. Для конкретных запросов из 2+ слов внешний каталог используется, если локальная база ещё не имеет качественной карточки. """
-
-    cleaned = " ".join(
-        str(query or "")
-        .strip()
-        .split()
-    )
-
-    if not cleaned:
-        return False
-
-    if is_possible_barcode(
-        cleaned
-    ):
-        return False
-
-    if len(
-        cleaned.split()
-    ) < 2:
-        return False
-
-    return not decision_has_complete_matching_card(
-        query=cleaned,
-        decision=pipeline_result.decision,
-    )
-
-
 def build_product_title( *, product, brand, ) -> str:
     """ Формирует заголовок карточки. """
 
@@ -440,9 +278,7 @@ def build_product_title( *, product, brand, ) -> str:
     if not is_real_brand(
         brand.name
     ):
-        return (
-            f"<b>{product_name}</b>"
-        )
+        return f"<b>{product_name}</b>"
 
     return (
         f"<b>{escape(str(brand.name))} — "
@@ -639,7 +475,6 @@ def format_price_text( price_stats: dict[str, Any] | None, ) -> str:
             "Перед покупкой обязательно "
             "сравните магазины."
         )
-
     elif spread_percent >= 40:
         lines.append(
             "⚠️ <b>Заметный разброс цен.</b>\n"
@@ -778,7 +613,6 @@ async def send_search_loader( message: Message, ) -> Message | None:
                 "и надёжность результатов."
             ),
         )
-
     except Exception:
         logger.exception(
             "Не удалось отправить GIF поиска"
@@ -824,7 +658,6 @@ async def send_product_card( *, message: Message, product, brand, category, trus
                 reply_markup=keyboard,
             )
             return
-
         except TelegramBadRequest:
             logger.warning(
                 "Не удалось отправить "
@@ -832,7 +665,6 @@ async def send_product_card( *, message: Message, product, brand, category, trus
                 product.id,
                 exc_info=True,
             )
-
         except Exception:
             logger.exception(
                 "Ошибка отправки "
@@ -919,9 +751,7 @@ def format_decision_product( item: DecisionProduct, ) -> str:
             f" · 👥 {item.votes_count}"
         )
     else:
-        rating_line = (
-            "⭐ Оценок пока нет"
-        )
+        rating_line = "⭐ Оценок пока нет"
 
     return (
         f"<b>{title}</b>\n"
@@ -943,10 +773,7 @@ def build_decision_screen_text( *, result: DecisionSearchResult, query: str, exp
     if result.best_choice is not None:
         lines.extend(
             [
-                (
-                    "🏆 <b>Лучший "
-                    "подтверждённый выбор</b>"
-                ),
+                "🏆 <b>Лучший подтверждённый выбор</b>",
                 "",
                 format_decision_product(
                     result.best_choice
@@ -971,14 +798,10 @@ def build_decision_screen_text( *, result: DecisionSearchResult, query: str, exp
                     "",
                 ]
             )
-
     else:
         lines.extend(
             [
-                (
-                    "⚪ <b>Уверенного лидера "
-                    "пока нет</b>"
-                ),
+                "⚪ <b>Уверенного лидера пока нет</b>",
                 "",
                 (
                     "Подходящие товары найдены, "
@@ -1104,9 +927,7 @@ async def show_decision_screen( *, message: Message, pipeline_result: SearchPipe
                 "product_id": item.product_id,
                 "name": item.name,
                 "brand": item.brand_name,
-                "score": (
-                    item.recommendation_score
-                ),
+                "score": item.recommendation_score,
             }
             for item
             in decision.other_products[:8]
@@ -1229,81 +1050,24 @@ async def show_not_found_screen( *, message: Message, query: str, ) -> None:
 
 
 async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> SearchPipelineResult:
-    """ Главная поисковая цепочка MarkaRadar. Текст: локальный Search Pipeline ↓ если карточек недостаточно — ExternalCatalogService ↓ Provider Registry ↓ Product Merge Engine ↓ повторный Search Pipeline Штрихкод: оставляем существующий рабочий external_product_enrichment_service. """
-
-    cleaned_query = " ".join(
-        str(query or "")
-        .strip()
-        .split()
-    )
+    """ Выполняет Search Pipeline и при необходимости подключает единый сервис внешнего обогащения. Здесь намеренно нет прямого вызова OpenFoodFacts. Конкретными внешними источниками управляет external_product_enrichment_service. """
 
     pipeline_result = await run_search_pipeline(
         session=session,
-        query=cleaned_query,
+        query=query,
         intent_limit=6,
         family_limit=6,
         decision_candidates_limit=20,
     )
 
-    #
-    # ТЕКСТОВЫЙ ПОИСК
-    #
+    cleaned_query = " ".join(
+        query.strip().split()
+    )
 
     if not is_possible_barcode(
         cleaned_query
     ):
-        if not should_try_external_text_catalog(
-            query=cleaned_query,
-            pipeline_result=pipeline_result,
-        ):
-            return pipeline_result
-
-        logger.info(
-            "External Catalog Service: "
-            "query=%r",
-            cleaned_query,
-        )
-
-        catalog_result = await enrich_catalog(
-            session=session,
-            query=cleaned_query,
-            limit_per_provider=8,
-            stop_after_success=False,
-            commit=True,
-        )
-
-        logger.info(
-            "External Catalog Service result: "
-            "query=%r providers=%s "
-            "found=%s imported=%s "
-            "skipped=%s failed=%s",
-            cleaned_query,
-            catalog_result.providers_attempted,
-            catalog_result.total_found,
-            catalog_result.total_imported,
-            catalog_result.total_skipped,
-            catalog_result.total_failed,
-        )
-
-        # Даже если импортировано 0, повторный
-        # Pipeline не нужен: локальная БД не менялась.
-        if not catalog_result.enriched:
-            return pipeline_result
-
-        # После импорта обязательно выполняем
-        # свежий поиск, чтобы пользователь увидел
-        # только что созданные/обогащённые карточки.
-        return await run_search_pipeline(
-            session=session,
-            query=cleaned_query,
-            intent_limit=6,
-            family_limit=6,
-            decision_candidates_limit=20,
-        )
-
-    #
-    # ШТРИХКОД
-    #
+        return pipeline_result
 
     should_try_external = False
 
@@ -1312,7 +1076,6 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
         == SearchPipelineScreen.NOT_FOUND
     ):
         should_try_external = True
-
     elif should_enrich_barcode_product(
         pipeline_result
     ):
@@ -1360,15 +1123,12 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
             cleaned_query,
         )
 
+        # Провайдер мог выполнить flush/изменения,
+        # которые сервис не признал полезными.
+        # Не оставляем незавершённую транзакцию.
         await session.rollback()
 
-        return await run_search_pipeline(
-            session=session,
-            query=cleaned_query,
-            intent_limit=6,
-            family_limit=6,
-            decision_candidates_limit=20,
-        )
+        return pipeline_result
 
     await session.commit()
 
@@ -1378,6 +1138,8 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
         enrichment_result.provider,
     )
 
+    # Новый запуск Pipeline нужен, чтобы получить
+    # свежие Product/Brand/Category после commit.
     return await run_search_pipeline(
         session=session,
         query=cleaned_query,
@@ -1542,4 +1304,4 @@ async def search_handler( message: Message, ) -> None:
     finally:
         await remove_search_loader(
             loading_message
-    )
+        )
