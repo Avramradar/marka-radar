@@ -1,4 +1,5 @@
 import logging
+import re
 from contextlib import suppress
 from decimal import Decimal
 from html import escape
@@ -35,6 +36,9 @@ from app.search.search_pipeline import (
     SearchPipelineScreen,
     is_possible_barcode,
     run_search_pipeline,
+)
+from app.services.external_catalog_service import (
+    enrich_catalog,
 )
 from app.services.external_product_enrichment_service import (
     enrich_product_by_barcode,
@@ -84,16 +88,62 @@ GENERIC_PRODUCT_NAMES = {
     "кефир",
     "сельдь",
     "сок",
+    "сметана",
+    "майонез",
+    "колбаса",
+    "творог",
+    "сливки",
+    "паштет",
+    "козинаки",
+    "шоколад",
+    "печенье",
+    "сахар",
+    "мука",
+    "рис",
+    "гречка",
+    "макароны",
+    "хлеб",
+    "мороженое",
+    "пельмени",
+    "вареники",
+}
+
+
+GENERIC_QUERY_WORDS = (
+    GENERIC_PRODUCT_NAMES
+    | {
+        "продукт",
+        "продукты",
+        "товар",
+        "товары",
+        "гост",
+        "бзмж",
+    }
+)
+
+
+UNIT_ALIASES = {
+    "гр": "г",
+    "грамм": "г",
+    "грамма": "г",
+    "граммов": "г",
+    "g": "г",
+    "gram": "г",
+    "grams": "г",
+    "кг": "кг",
+    "kg": "кг",
+    "мл": "мл",
+    "ml": "мл",
+    "л": "л",
+    "l": "л",
 }
 
 
 def normalize_simple_text( value: Any, ) -> str:
-    """ Простая нормализация текста для внутренних проверок. """
+    """Простая нормализация текста для внутренних проверок."""
 
     return " ".join(
-        str(
-            value or ""
-        )
+        str(value or "")
         .strip()
         .lower()
         .replace("ё", "е")
@@ -101,8 +151,94 @@ def normalize_simple_text( value: Any, ) -> str:
     )
 
 
+def normalize_match_token( token: str, ) -> str:
+    """Нормализует отдельный токен поискового совпадения."""
+
+    normalized_token = (
+        normalize_simple_text(token)
+        .strip()
+    )
+
+    return UNIT_ALIASES.get(
+        normalized_token,
+        normalized_token,
+    )
+
+
+def extract_match_tokens( value: Any, ) -> list[str]:
+    """ Извлекает слова и числа отдельно. Поэтому: 500гр -> 500 + г 20% -> 20 0.5кг -> 0.5 + кг """
+
+    text = normalize_simple_text(value)
+
+    raw_tokens = re.findall(
+        r"\d+(?:[.,]\d+)?|[a-zа-я]+",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    result: list[str] = []
+
+    for raw_token in raw_tokens:
+        token = normalize_match_token(
+            raw_token.replace(",", ".")
+        )
+
+        if not token:
+            continue
+
+        result.append(token)
+
+    return result
+
+
+def query_required_tokens( query: str, ) -> list[str]:
+    """ Возвращает обязательные уточняющие токены. Общий тип продукта не считается достаточным доказательством локального совпадения. Пример: "Майонез Славолия 500гр" -> ["славолия", "500", "г"] """
+
+    tokens = extract_match_tokens(
+        query
+    )
+
+    required: list[str] = []
+
+    for token in tokens:
+        if (
+            token.isalpha()
+            and token in GENERIC_QUERY_WORDS
+        ):
+            continue
+
+        if token not in required:
+            required.append(
+                token
+            )
+
+    return required
+
+
+def token_matches_candidate( required_token: str, candidate_tokens: set[str], ) -> bool:
+    """Осторожное совпадение токена с локальной карточкой."""
+
+    if required_token in candidate_tokens:
+        return True
+
+    if (
+        required_token.replace(".", "", 1).isdigit()
+        or len(required_token) < 4
+    ):
+        return False
+
+    return any(
+        (
+            required_token in candidate_token
+            or candidate_token in required_token
+        )
+        for candidate_token in candidate_tokens
+        if len(candidate_token) >= 4
+    )
+
+
 def format_number( value: Decimal | float | int | None, ) -> str:
-    """ Убирает лишние нули у чисел. Примеры: 245.000 -> 245 0.450 -> 0.45 1.500 -> 1.5 """
+    """Убирает лишние нули у чисел."""
 
     if value is None:
         return ""
@@ -111,10 +247,7 @@ def format_number( value: Decimal | float | int | None, ) -> str:
         str(value)
     )
 
-    if (
-        decimal_value
-        == decimal_value.to_integral()
-    ):
+    if decimal_value == decimal_value.to_integral():
         return str(
             int(decimal_value)
         )
@@ -126,7 +259,7 @@ def format_number( value: Decimal | float | int | None, ) -> str:
 
 
 def format_package( package_value: Decimal | float | int | None, package_unit: str | None, ) -> str:
-    """ Форматирует вес или объём упаковки. """
+    """Форматирует вес или объём упаковки."""
 
     if (
         package_value is None
@@ -141,7 +274,7 @@ def format_package( package_value: Decimal | float | int | None, package_unit: s
 
 
 def format_subtype( subtype: str | None, ) -> str:
-    """ Форматирует подтип товара. """
+    """Форматирует подтип товара."""
 
     if not subtype:
         return "не указан"
@@ -162,7 +295,7 @@ def format_subtype( subtype: str | None, ) -> str:
 
 
 def is_real_brand( brand_name: str | None, ) -> bool:
-    """ Проверяет, указан ли настоящий бренд. """
+    """Проверяет, указан ли настоящий бренд."""
 
     normalized_brand = normalize_simple_text(
         brand_name
@@ -175,7 +308,7 @@ def is_real_brand( brand_name: str | None, ) -> bool:
 
 
 def is_generic_product_name( product_name: str | None, ) -> bool:
-    """ Проверяет слишком общее название. """
+    """Проверяет слишком общее название."""
 
     return (
         normalize_simple_text(
@@ -186,7 +319,7 @@ def is_generic_product_name( product_name: str | None, ) -> bool:
 
 
 def should_enrich_barcode_product( pipeline_result: SearchPipelineResult, ) -> bool:
-    """ Решает, нужно ли внешнее обогащение уже найденного по штрихкоду товара. """
+    """Решает, нужно ли внешнее обогащение найденного по штрихкоду товара."""
 
     if (
         pipeline_result.screen
@@ -268,8 +401,287 @@ def should_enrich_barcode_product( pipeline_result: SearchPipelineResult, ) -> b
     )
 
 
+def product_card_is_complete_enough( *, product, brand, ) -> bool:
+    """Проверяет общую полноту локальной карточки."""
+
+    checks = (
+        bool(
+            getattr(
+                product,
+                "name",
+                None,
+            )
+        ),
+        is_real_brand(
+            getattr(
+                brand,
+                "name",
+                None,
+            )
+        ),
+        bool(
+            getattr(
+                product,
+                "image_url",
+                None,
+            )
+        ),
+        (
+            getattr(
+                product,
+                "package_value",
+                None,
+            )
+            is not None
+            and bool(
+                getattr(
+                    product,
+                    "package_unit",
+                    None,
+                )
+            )
+        ),
+        bool(
+            getattr(
+                product,
+                "description",
+                None,
+            )
+        ),
+    )
+
+    return (
+        sum(
+            1
+            for value in checks
+            if value
+        )
+        >= 4
+    )
+
+
+def decision_items( decision: DecisionSearchResult, ) -> list[DecisionProduct]:
+    """Собирает уникальный набор локальных кандидатов для проверки."""
+
+    items: list[DecisionProduct] = []
+
+    if decision.best_choice is not None:
+        items.append(
+            decision.best_choice
+        )
+
+    items.extend(
+        decision.alternatives
+    )
+    items.extend(
+        decision.insufficient_data
+    )
+    items.extend(
+        decision.other_products[:8]
+    )
+
+    unique: list[DecisionProduct] = []
+    seen_ids: set[int] = set()
+
+    for item in items:
+        product_id = int(
+            item.product_id
+        )
+
+        if product_id in seen_ids:
+            continue
+
+        seen_ids.add(
+            product_id
+        )
+        unique.append(
+            item
+        )
+
+    return unique
+
+
+def decision_has_complete_matching_card( *, query: str, decision: DecisionSearchResult | None, ) -> bool:
+    """ Проверяет, есть ли локальная карточка именно запрошенного товара. Ключевое отличие от старой логики: общая похожесть больше не блокирует внешний каталог. Все специфические токены запроса должны присутствовать в ОДНОМ локальном кандидате. Поэтому наличие хорошего "Майонеза МЖК" не блокирует поиск "Майонез Славолия 500гр". """
+
+    if (
+        decision is None
+        or not decision.has_results
+    ):
+        return False
+
+    required_tokens = query_required_tokens(
+        query
+    )
+
+    # Одно широкое слово вроде "кофе" не должно
+    # запускать внешний импорт десятков товаров.
+    if not required_tokens:
+        return True
+
+    for item in decision_items(
+        decision
+    ):
+        product = item.product
+        brand = item.brand
+
+        candidate_text = " ".join(
+            [
+                str(
+                    getattr(
+                        brand,
+                        "name",
+                        "",
+                    )
+                    or ""
+                ),
+                str(
+                    getattr(
+                        product,
+                        "name",
+                        "",
+                    )
+                    or ""
+                ),
+                str(
+                    getattr(
+                        product,
+                        "subtype",
+                        "",
+                    )
+                    or ""
+                ),
+                str(
+                    getattr(
+                        product,
+                        "package_value",
+                        "",
+                    )
+                    or ""
+                ),
+                str(
+                    getattr(
+                        product,
+                        "package_unit",
+                        "",
+                    )
+                    or ""
+                ),
+            ]
+        )
+
+        candidate_tokens = set(
+            extract_match_tokens(
+                candidate_text
+            )
+        )
+
+        missing_tokens = [
+            token
+            for token in required_tokens
+            if not token_matches_candidate(
+                token,
+                candidate_tokens,
+            )
+        ]
+
+        logger.info(
+            "External gate candidate: "
+            "query=%r product_id=%s "
+            "required=%s candidate=%r "
+            "missing=%s complete=%s",
+            query,
+            getattr(
+                product,
+                "id",
+                None,
+            ),
+            required_tokens,
+            candidate_text,
+            missing_tokens,
+            product_card_is_complete_enough(
+                product=product,
+                brand=brand,
+            ),
+        )
+
+        if missing_tokens:
+            continue
+
+        if not product_card_is_complete_enough(
+            product=product,
+            brand=brand,
+        ):
+            continue
+
+        logger.info(
+            "External gate: exact local card accepted: "
+            "query=%r product_id=%s required=%s",
+            query,
+            getattr(
+                product,
+                "id",
+                None,
+            ),
+            required_tokens,
+        )
+
+        return True
+
+    logger.info(
+        "External gate: no exact complete local card: "
+        "query=%r required=%s",
+        query,
+        required_tokens,
+    )
+
+    return False
+
+
+def should_try_external_text_catalog( *, query: str, pipeline_result: SearchPipelineResult, ) -> bool:
+    """ Решает, нужен ли внешний каталог для текстового запроса. Правила: - штрихкоды идут отдельной цепочкой; - одно широкое слово не запускает импорт; - конкретный запрос 2+ слов запускает внешний каталог, если нет именно такого полного товара. """
+
+    cleaned = " ".join(
+        str(query or "")
+        .strip()
+        .split()
+    )
+
+    if not cleaned:
+        return False
+
+    if is_possible_barcode(
+        cleaned
+    ):
+        return False
+
+    if len(
+        cleaned.split()
+    ) < 2:
+        return False
+
+    has_matching_card = (
+        decision_has_complete_matching_card(
+            query=cleaned,
+            decision=pipeline_result.decision,
+        )
+    )
+
+    should_try = not has_matching_card
+
+    logger.info(
+        "External text gate: "
+        "query=%r should_try=%s screen=%s",
+        cleaned,
+        should_try,
+        pipeline_result.screen,
+    )
+
+    return should_try
+
+
 def build_product_title( *, product, brand, ) -> str:
-    """ Формирует заголовок карточки. """
+    """Формирует заголовок карточки."""
 
     product_name = escape(
         str(product.name)
@@ -287,7 +699,7 @@ def build_product_title( *, product, brand, ) -> str:
 
 
 def calculate_data_quality_score( *, product, brand, category, price_stats: dict[str, Any] | None, ) -> float:
-    """ Оценивает полноту карточки товара. """
+    """Оценивает полноту карточки товара."""
 
     score = 0.0
 
@@ -344,7 +756,7 @@ def calculate_data_quality_score( *, product, brand, category, price_stats: dict
 
 
 def format_explanation( trust_result: TrustEngineResult, ) -> str:
-    """ Форматирует объяснение Trust Engine. """
+    """Форматирует объяснение Trust Engine."""
 
     if not trust_result.explanation:
         return (
@@ -360,7 +772,7 @@ def format_explanation( trust_result: TrustEngineResult, ) -> str:
 
 
 def format_trust_engine_text( trust_result: TrustEngineResult, ) -> str:
-    """ Формирует главный блок решения MarkaRadar. """
+    """Формирует главный блок решения MarkaRadar."""
 
     lines = [
         (
@@ -418,7 +830,7 @@ def format_trust_engine_text( trust_result: TrustEngineResult, ) -> str:
 
 
 def format_price_text( price_stats: dict[str, Any] | None, ) -> str:
-    """ Форматирует статистику цен. """
+    """Форматирует статистику цен."""
 
     if price_stats is None:
         return (
@@ -488,7 +900,7 @@ def format_price_text( price_stats: dict[str, Any] | None, ) -> str:
 
 
 def build_product_card( *, product, brand, category, trust_result: TrustEngineResult, price_stats: dict[str, Any] | None, ) -> str:
-    """ Формирует карточку товара. """
+    """Формирует карточку товара."""
 
     title = build_product_title(
         product=product,
@@ -580,7 +992,7 @@ def build_product_card( *, product, brand, category, trust_result: TrustEngineRe
 
 
 async def send_search_loader( message: Message, ) -> Message | None:
-    """ Показывает пользователю, что поиск начался. """
+    """Показывает пользователю, что поиск начался."""
 
     with suppress(Exception):
         await message.bot.send_chat_action(
@@ -613,6 +1025,7 @@ async def send_search_loader( message: Message, ) -> Message | None:
                 "и надёжность результатов."
             ),
         )
+
     except Exception:
         logger.exception(
             "Не удалось отправить GIF поиска"
@@ -626,7 +1039,7 @@ async def send_search_loader( message: Message, ) -> Message | None:
 
 
 async def remove_search_loader( loading_message: Message | None, ) -> None:
-    """ Удаляет сообщение загрузки. """
+    """Удаляет сообщение загрузки."""
 
     if loading_message is None:
         return
@@ -636,7 +1049,7 @@ async def remove_search_loader( loading_message: Message | None, ) -> None:
 
 
 async def send_product_card( *, message: Message, product, brand, category, trust_result: TrustEngineResult, price_stats: dict[str, Any] | None, ) -> None:
-    """ Отправляет карточку товара. """
+    """ Отправляет карточку товара. Сломанная внешняя картинка не должна ломать карточку целиком. """
 
     card_text = build_product_card(
         product=product,
@@ -650,26 +1063,53 @@ async def send_product_card( *, message: Message, product, brand, category, trus
         product.id
     )
 
-    if product.image_url:
+    raw_image = getattr(
+        product,
+        "image_url",
+        None,
+    )
+
+    image_value = (
+        str(raw_image).strip()
+        if raw_image
+        else ""
+    )
+
+    if image_value:
         try:
             await message.answer_photo(
-                photo=product.image_url,
+                photo=image_value,
                 caption=card_text,
                 reply_markup=keyboard,
             )
-            return
-        except TelegramBadRequest:
-            logger.warning(
-                "Не удалось отправить "
-                "изображение товара %s",
+
+            logger.info(
+                "Product card sent with image: "
+                "product_id=%s image=%r",
                 product.id,
-                exc_info=True,
+                image_value[:200],
             )
-        except Exception:
-            logger.exception(
-                "Ошибка отправки "
-                "изображения товара %s",
+
+            return
+
+        except TelegramBadRequest as error:
+            logger.warning(
+                "Product image rejected by Telegram: "
+                "product_id=%s image=%r error=%s",
                 product.id,
+                image_value[:300],
+                error,
+            )
+
+        except Exception as error:
+            logger.warning(
+                "Product image send failed: "
+                "product_id=%s image=%r "
+                "error_type=%s error=%s",
+                product.id,
+                image_value[:300],
+                type(error).__name__,
+                error,
             )
 
     await message.answer(
@@ -677,9 +1117,16 @@ async def send_product_card( *, message: Message, product, brand, category, trus
         reply_markup=keyboard,
     )
 
+    logger.info(
+        "Product card sent without image: "
+        "product_id=%s had_image=%s",
+        product.id,
+        bool(image_value),
+    )
+
 
 async def show_single_product( *, message: Message, session, product, brand, category, ) -> None:
-    """ Загружает рейтинг и цены, запускает Trust Engine и показывает карточку. """
+    """Загружает рейтинг и цены, запускает Trust Engine и показывает карточку."""
 
     rating = await get_full_product_rating(
         session=session,
@@ -733,7 +1180,7 @@ async def show_single_product( *, message: Message, session, product, brand, cat
 
 
 def format_decision_product( item: DecisionProduct, ) -> str:
-    """ Форматирует товар для первого экрана решения. """
+    """Форматирует товар для первого экрана решения."""
 
     if item.brand_name:
         title = (
@@ -761,7 +1208,7 @@ def format_decision_product( item: DecisionProduct, ) -> str:
 
 
 def build_decision_screen_text( *, result: DecisionSearchResult, query: str, explanation: str | None, ) -> str:
-    """ Формирует первый экран помощника выбора. """
+    """Формирует первый экран помощника выбора."""
 
     lines = [
         "🎯 <b>Помощник выбора MarkaRadar</b>",
@@ -859,7 +1306,7 @@ def build_decision_screen_text( *, result: DecisionSearchResult, query: str, exp
 
 
 def build_decision_keyboard_result( result: DecisionSearchResult, ) -> DecisionSearchResult:
-    """ Подготавливает Decision Search для клавиатуры. """
+    """Подготавливает Decision Search для клавиатуры."""
 
     alternatives = list(
         result.alternatives
@@ -889,7 +1336,7 @@ def build_decision_keyboard_result( result: DecisionSearchResult, ) -> DecisionS
 
 
 async def show_decision_screen( *, message: Message, pipeline_result: SearchPipelineResult, ) -> None:
-    """ Показывает экран решения MarkaRadar. """
+    """Показывает экран решения MarkaRadar."""
 
     decision = pipeline_result.decision
 
@@ -952,7 +1399,7 @@ async def show_decision_screen( *, message: Message, pipeline_result: SearchPipe
 
 
 async def show_intents_screen( *, message: Message, pipeline_result: SearchPipelineResult, ) -> None:
-    """ Показывает уточнения. """
+    """Показывает уточнения."""
 
     user = message.from_user
     groups = pipeline_result.intent_groups
@@ -994,7 +1441,7 @@ async def show_intents_screen( *, message: Message, pipeline_result: SearchPipel
 
 
 async def show_families_screen( *, message: Message, pipeline_result: SearchPipelineResult, ) -> None:
-    """ Показывает виды продукта. """
+    """Показывает виды продукта."""
 
     families = pipeline_result.families
 
@@ -1035,7 +1482,7 @@ async def show_families_screen( *, message: Message, pipeline_result: SearchPipe
 
 
 async def show_not_found_screen( *, message: Message, query: str, ) -> None:
-    """ Показывает экран отсутствия результатов. """
+    """Показывает экран отсутствия результатов."""
 
     await message.answer(
         "🔍 <b>Подходящих товаров не найдено</b>\n\n"
@@ -1050,25 +1497,90 @@ async def show_not_found_screen( *, message: Message, query: str, ) -> None:
 
 
 async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> SearchPipelineResult:
-    """ Выполняет Search Pipeline и при необходимости подключает единый сервис внешнего обогащения. Здесь намеренно нет прямого вызова OpenFoodFacts. Конкретными внешними источниками управляет external_product_enrichment_service. """
+    """ Главная поисковая цепочка MarkaRadar. Текст: Local Search Pipeline -> ExternalCatalogService при необходимости -> Product Merge Engine -> повторный Search Pipeline. Штрихкод: существующий barcode enrichment flow. """
+
+    cleaned_query = " ".join(
+        str(query or "")
+        .strip()
+        .split()
+    )
 
     pipeline_result = await run_search_pipeline(
         session=session,
-        query=query,
+        query=cleaned_query,
         intent_limit=6,
         family_limit=6,
         decision_candidates_limit=20,
     )
 
-    cleaned_query = " ".join(
-        query.strip().split()
-    )
-
+    # Текстовый поиск.
     if not is_possible_barcode(
         cleaned_query
     ):
-        return pipeline_result
+        should_try_external = (
+            should_try_external_text_catalog(
+                query=cleaned_query,
+                pipeline_result=pipeline_result,
+            )
+        )
 
+        logger.info(
+            "External text gate: "
+            "query=%r screen=%s should_try=%s",
+            cleaned_query,
+            pipeline_result.screen,
+            should_try_external,
+        )
+
+        if not should_try_external:
+            return pipeline_result
+
+        logger.info(
+            "External Catalog Service: query=%r",
+            cleaned_query,
+        )
+
+        try:
+            catalog_result = await enrich_catalog(
+                session=session,
+                query=cleaned_query,
+                limit_per_provider=8,
+                stop_after_success=False,
+                commit=True,
+            )
+        except Exception:
+            logger.exception(
+                "External Catalog Service failed: query=%r",
+                cleaned_query,
+            )
+            with suppress(Exception):
+                await session.rollback()
+            return pipeline_result
+
+        logger.info(
+            "External Catalog Service result: "
+            "query=%r providers=%s found=%s "
+            "imported=%s skipped=%s failed=%s",
+            cleaned_query,
+            catalog_result.providers_attempted,
+            catalog_result.total_found,
+            catalog_result.total_imported,
+            catalog_result.total_skipped,
+            catalog_result.total_failed,
+        )
+
+        if not catalog_result.enriched:
+            return pipeline_result
+
+        return await run_search_pipeline(
+            session=session,
+            query=cleaned_query,
+            intent_limit=6,
+            family_limit=6,
+            decision_candidates_limit=20,
+        )
+
+    # Поиск по штрихкоду.
     should_try_external = False
 
     if (
@@ -1090,30 +1602,26 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
         cleaned_query,
     )
 
-    barcode_item = (
-        pipeline_result.barcode_product
-    )
+    barcode_item = pipeline_result.barcode_product
 
-    enrichment_result = (
-        await enrich_product_by_barcode(
-            session=session,
-            barcode=cleaned_query,
-            product=(
-                barcode_item.product
-                if barcode_item is not None
-                else None
-            ),
-            brand=(
-                barcode_item.brand
-                if barcode_item is not None
-                else None
-            ),
-            category=(
-                barcode_item.category
-                if barcode_item is not None
-                else None
-            ),
-        )
+    enrichment_result = await enrich_product_by_barcode(
+        session=session,
+        barcode=cleaned_query,
+        product=(
+            barcode_item.product
+            if barcode_item is not None
+            else None
+        ),
+        brand=(
+            barcode_item.brand
+            if barcode_item is not None
+            else None
+        ),
+        category=(
+            barcode_item.category
+            if barcode_item is not None
+            else None
+        ),
     )
 
     if not enrichment_result.enriched:
@@ -1123,12 +1631,15 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
             cleaned_query,
         )
 
-        # Провайдер мог выполнить flush/изменения,
-        # которые сервис не признал полезными.
-        # Не оставляем незавершённую транзакцию.
         await session.rollback()
 
-        return pipeline_result
+        return await run_search_pipeline(
+            session=session,
+            query=cleaned_query,
+            intent_limit=6,
+            family_limit=6,
+            decision_candidates_limit=20,
+        )
 
     await session.commit()
 
@@ -1138,8 +1649,6 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
         enrichment_result.provider,
     )
 
-    # Новый запуск Pipeline нужен, чтобы получить
-    # свежие Product/Brand/Category после commit.
     return await run_search_pipeline(
         session=session,
         query=cleaned_query,
@@ -1150,7 +1659,7 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
 
 
 async def process_pipeline_result( *, message: Message, session, pipeline_result: SearchPipelineResult, ) -> None:
-    """ Показывает экран, выбранный Search Pipeline. """
+    """Показывает экран, выбранный Search Pipeline."""
 
     user = message.from_user
 
@@ -1168,16 +1677,12 @@ async def process_pipeline_result( *, message: Message, session, pipeline_result
         pipeline_result.screen
         == SearchPipelineScreen.BARCODE_PRODUCT
     ):
-        barcode_product = (
-            pipeline_result.barcode_product
-        )
+        barcode_product = pipeline_result.barcode_product
 
         if barcode_product is None:
             await show_not_found_screen(
                 message=message,
-                query=(
-                    pipeline_result.normalized_query
-                ),
+                query=pipeline_result.normalized_query,
             )
             return
 
@@ -1228,7 +1733,7 @@ async def process_pipeline_result( *, message: Message, session, pipeline_result
 
 @router.message(F.text)
 async def search_handler( message: Message, ) -> None:
-    """ Главный обработчик поиска MarkaRadar. """
+    """Главный обработчик поиска MarkaRadar."""
 
     if message.text is None:
         return
@@ -1245,10 +1750,8 @@ async def search_handler( message: Message, ) -> None:
     if query.startswith("/"):
         return
 
-    loading_message = (
-        await send_search_loader(
-            message
-        )
+    loading_message = await send_search_loader(
+        message
     )
 
     try:
