@@ -45,7 +45,6 @@ def build_default_providers(
         OpenFoodFactsProvider(),
         MetroProvider(),
         PyaterochkaProvider(),
-        DixyProvider(),
     )
 
 
