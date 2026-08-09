@@ -3,6 +3,9 @@ from __future__ import annotations
 from app.integrations.providers.base import (
     ExternalCatalogProvider,
 )
+from app.integrations.providers.dixy import (
+    DixyProvider,
+)
 from app.integrations.providers.metro import (
     MetroProvider,
 )
@@ -19,20 +22,45 @@ def build_default_providers(
     ExternalCatalogProvider,
     ...
 ]:
-    """ Возвращает внешние каталоги MarkaRadar в порядке приоритета. Сейчас: 1. OpenFoodFacts Хорош для структурированных данных и штрихкодов, но текстовый поиск может быть нестабильным. 2. METRO Публичный каталог с хорошими карточками и изображениями. 3. Пятёрочка Публичный каталог 5ka.ru. Используется как дополнительный источник российских товарных карточек. ExternalCatalogService проходит по ним последовательно и объединяет результаты. """
+    """
+    Возвращает внешние каталоги MarkaRadar
+    в порядке приоритета.
+
+    Сейчас:
+
+    1. OpenFoodFacts
+       Структурированные данные и штрихкоды.
+
+    2. METRO
+       Публичный каталог с хорошими карточками.
+
+    3. Пятёрочка
+       Дополнительный источник российских товаров.
+
+    4. Дикси
+       Новый источник товарных карточек.
+    """
 
     return (
         OpenFoodFactsProvider(),
         MetroProvider(),
         PyaterochkaProvider(),
+        DixyProvider(),
     )
 
 
-def get_provider_names( providers: tuple[ ExternalCatalogProvider, ... ], ) -> tuple[
+def get_provider_names(
+    providers: tuple[
+        ExternalCatalogProvider,
+        ...
+    ],
+) -> tuple[
     str,
     ...
 ]:
-    """ Возвращает имена подключённых провайдеров. """
+    """
+    Возвращает имена подключённых провайдеров.
+    """
 
     return tuple(
         provider.provider_name
@@ -40,8 +68,16 @@ def get_provider_names( providers: tuple[ ExternalCatalogProvider, ... ], ) -> t
     )
 
 
-def get_provider_by_name( providers: tuple[ ExternalCatalogProvider, ... ], provider_name: str, ) -> ExternalCatalogProvider | None:
-    """ Ищет конкретный провайдер по имени. """
+def get_provider_by_name(
+    providers: tuple[
+        ExternalCatalogProvider,
+        ...
+    ],
+    provider_name: str,
+) -> ExternalCatalogProvider | None:
+    """
+    Ищет конкретный провайдер по имени.
+    """
 
     normalized_name = (
         str(provider_name or "")
