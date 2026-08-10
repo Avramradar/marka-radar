@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
 from collections import Counter
+from collections import defaultdict
+from dataclasses import asdict
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timezone
 from decimal import Decimal
 from enum import StrEnum
+from pathlib import Path
 from typing import Iterable
 
 from sqlalchemy import select
@@ -27,49 +33,62 @@ from app.services.product_merge_service import (
 
 
 #
-# MarkaRadar Duplicate Candidate Verifier v2
+# MarkaRadar Duplicate Candidate Verifier v3
 #
-# Что исправлено относительно v1:
+# Главное изменение относительно v2:
 #
-# 1. Значимые SKU-варианты больше не теряются.
-# Примеры:
-# "Сервелат финский" != "Сервелат"
-# "Сливушка с индейкой" != "Сливушка"
+# - ручного списка CANDIDATE_PAIRS больше нет;
+# - verifier читает duplicate_candidates.json,
+# который создаёт scan_product_duplicates.py v11;
+# - автоматически проверяются ВСЕ кандидаты классов:
+# AUTO_SAFE
+# REVIEW
+# BARCODE_CONFLICT_REVIEW
+# - результаты сохраняются в:
+# duplicate_verification_results.json
+# - БД НЕ изменяется;
+# - автоматический merge НЕ выполняется.
 #
-# Односторонний variant-token не позволяет подтвердить SAME_SKU
-# без независимого доказательства.
+# Важный принцип:
 #
-# 2. Используются эквивалентные категории.
-# Например:
-# "Smetana" ~= "Молочная продукция"
+# Даже если scanner назвал пару AUTO_SAFE, verifier
+# не обязан подтверждать её как SAME_SKU.
+# Второй слой проверки остаётся независимым и
+# консервативным.
 #
-# Разные технические названия совместимых категорий больше
-# не считаются автоматическим доказательством разных SKU.
-#
-# 3. Barcode только на одной стороне не является отрицательным
-# доказательством.
-#
-# 4. Разные известные barcode никогда не дают автоматическое
-# CONFIRMED_SAME_SKU.
-#
-# 5. Для CONFIRMED_SAME_SKU теперь обязательно нужно независимое
-# подтверждение:
-# - одинаковый barcode; ИЛИ
-# - одинаковый provider+source_id; ИЛИ
-# - две независимые внешние карточки разных providers
-# при точном совпадении core identity.
-#
-# 6. Без такого независимого подтверждения даже очень похожая
-# пара остаётся NEEDS_MANUAL_REVIEW.
-#
-# 7. База данных НЕ изменяется.
-#
+
+
+CANDIDATE_JSON_PATH = Path(
+    "duplicate_candidates.json"
+)
+
+VERIFICATION_JSON_PATH = Path(
+    "duplicate_verification_results.json"
+)
+
+ALLOWED_SCANNER_CLASSES = {
+    "AUTO_SAFE",
+    "REVIEW",
+    "BARCODE_CONFLICT_REVIEW",
+}
+
+MAX_RESULT_OUTPUT_PER_CLASS = 50
+FINAL_TOP_IDS = 30
 
 
 class VerificationClass(StrEnum):
     CONFIRMED_SAME_SKU = "CONFIRMED_SAME_SKU"
     NEEDS_MANUAL_REVIEW = "NEEDS_MANUAL_REVIEW"
     CONFIRMED_DIFFERENT_SKU = "CONFIRMED_DIFFERENT_SKU"
+
+
+@dataclass(slots=True, frozen=True)
+class ScannerCandidate:
+    classification: str
+    reason: str
+    score: float
+    left_id: int
+    right_id: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -135,6 +154,10 @@ class PairEvidence:
 
 @dataclass(slots=True, frozen=True)
 class VerificationResult:
+    scanner_classification: str
+    scanner_reason: str
+    scanner_score: float
+
     classification: VerificationClass
     reason: str
     confidence: float
@@ -175,26 +198,6 @@ class VerificationResult:
     negative_evidence: tuple[str, ...]
 
 
-#
-# Первый тестовый набор.
-#
-# Пока сознательно проверяем те же 3 пары,
-# чтобы сравнить результат v2 с v1.
-#
-CANDIDATE_PAIRS: tuple[
-    tuple[int, int],
-    ...
-] = (
-    (9066, 31627),
-    (31654, 31657),
-    (31645, 31650),
-)
-
-
-MAX_RESULTS_OUTPUT = 100
-FINAL_TOP_IDS = 50
-
-
 PERCENT_PATTERN = re.compile(
     r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*%",
     flags=re.IGNORECASE,
@@ -213,9 +216,9 @@ PACKAGE_IN_NAME_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
-WORD_PATTERN = re.compile(
-    r"[a-zа-я0-9]+",
-    flags=re.IGNORECASE,
+UNICODE_WORD_PATTERN = re.compile(
+    r"[^\W_]+",
+    flags=re.UNICODE,
 )
 
 PACKAGE_TOKEN_PATTERN = re.compile(
@@ -380,6 +383,19 @@ def normalized_clean( value: object, ) -> str:
     )
 
 
+def comparable_text( value: object, ) -> str:
+    return (
+        clean_html_text(
+            value
+        )
+        .casefold()
+        .replace(
+            "ё",
+            "е",
+        )
+    )
+
+
 def decimal_text( value: str, ) -> str:
     try:
         number = Decimal(
@@ -419,11 +435,8 @@ def package_text( product: Product, ) -> str:
 
 
 def extract_percentages( value: str | None, ) -> tuple[str, ...]:
-    text = clean_html_text(
+    text = comparable_text(
         value
-    ).lower().replace(
-        "ё",
-        "е",
     )
 
     return tuple(
@@ -442,11 +455,8 @@ def extract_percentages( value: str | None, ) -> tuple[str, ...]:
 
 
 def extract_counts( value: str | None, ) -> tuple[str, ...]:
-    text = clean_html_text(
+    text = comparable_text(
         value
-    ).lower().replace(
-        "ё",
-        "е",
     )
 
     values: set[str] = set()
@@ -456,7 +466,7 @@ def extract_counts( value: str | None, ) -> tuple[str, ...]:
     ):
         values.add(
             f"{match.group(1)}:"
-            f"{match.group(2).lower().replace('ё', 'е')}"
+            f"{match.group(2).casefold().replace('ё', 'е')}"
         )
 
     return tuple(
@@ -467,11 +477,8 @@ def extract_counts( value: str | None, ) -> tuple[str, ...]:
 
 
 def extract_name_packages( value: str | None, ) -> tuple[str, ...]:
-    text = clean_html_text(
+    text = comparable_text(
         value
-    ).lower().replace(
-        "ё",
-        "е",
     )
 
     values: set[str] = set()
@@ -514,32 +521,41 @@ def values_conflict( left_values: Iterable[str], right_values: Iterable[str], ) 
     )
 
 
+def unicode_tokens( value: str | None, ) -> list[str]:
+    text = comparable_text(
+        value
+    )
+
+    return [
+        token
+        for token
+        in UNICODE_WORD_PATTERN.findall(
+            text
+        )
+        if token
+    ]
+
+
 def tokenize_brand( brand_name: str | None, ) -> set[str]:
     return {
         token
         for token
-        in WORD_PATTERN.findall(
-            normalized_clean(
-                brand_name
-            )
+        in unicode_tokens(
+            brand_name
         )
         if len(token) >= 3
     }
 
 
 def variant_tokens( value: str | None, *, brand_name: str | None, ) -> set[str]:
-    text = normalized_clean(
-        value
-    )
-
     brand_tokens = tokenize_brand(
         brand_name
     )
 
     result: set[str] = set()
 
-    for token in WORD_PATTERN.findall(
-        text
+    for token in unicode_tokens(
+        value
     ):
         if len(token) < 3:
             continue
@@ -629,10 +645,6 @@ def categories_compatible( left: Category, right: Category, ) -> bool:
     ):
         return True
 
-    #
-    # Общая категория "Продукты" не является
-    # конфликтом, но и не даёт сильного подтверждения.
-    #
     if (
         is_generic_category_name(
             left.name
@@ -839,83 +851,256 @@ def choose_canonical_product( *, left: ProductBundle, right: ProductBundle, ) ->
     )
 
 
-async def load_bundle( *, session, product_id: int, ) -> ProductBundle | None:
-    result = await session.execute(
-        select(
-            Product,
-            Brand,
-            Category,
-            ProductFamily,
+def pair_key( left_id: int, right_id: int, ) -> tuple[int, int]:
+    return (
+        min(
+            int(left_id),
+            int(right_id),
+        ),
+        max(
+            int(left_id),
+            int(right_id),
+        ),
+    )
+
+
+def load_scanner_candidates() -> list[
+    ScannerCandidate
+]:
+    if not CANDIDATE_JSON_PATH.exists():
+        raise FileNotFoundError(
+            "duplicate_candidates.json not found. "
+            "Run scan_product_duplicates.py v11 first."
         )
-        .join(
-            Brand,
-            Brand.id
-            == Product.brand_id,
+
+    payload = json.loads(
+        CANDIDATE_JSON_PATH.read_text(
+            encoding="utf-8"
         )
-        .join(
-            Category,
-            Category.id
-            == Product.category_id,
+    )
+
+    raw_candidates = payload.get(
+        "candidates",
+        []
+    )
+
+    if not isinstance(
+        raw_candidates,
+        list,
+    ):
+        raise ValueError(
+            "Invalid duplicate_candidates.json: "
+            "'candidates' must be a list."
         )
-        .outerjoin(
-            ProductFamily,
-            ProductFamily.id
-            == Product.family_id,
-        )
-        .where(
-            Product.id
-            == int(
-                product_id
+
+    deduplicated: dict[
+        tuple[int, int],
+        ScannerCandidate,
+    ] = {}
+
+    for raw in raw_candidates:
+        if not isinstance(
+            raw,
+            dict,
+        ):
+            continue
+
+        classification = clean_text(
+            raw.get(
+                "classification"
             )
         )
-        .limit(
-            1
+
+        if (
+            classification
+            not in ALLOWED_SCANNER_CLASSES
+        ):
+            continue
+
+        try:
+            left_id = int(
+                raw[
+                    "left_id"
+                ]
+            )
+
+            right_id = int(
+                raw[
+                    "right_id"
+                ]
+            )
+
+            score = float(
+                raw.get(
+                    "score",
+                    0.0,
+                )
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        key = pair_key(
+            left_id,
+            right_id,
         )
+
+        candidate = ScannerCandidate(
+            classification=classification,
+            reason=clean_text(
+                raw.get(
+                    "reason"
+                )
+            ),
+            score=score,
+            left_id=key[0],
+            right_id=key[1],
+        )
+
+        previous = deduplicated.get(
+            key
+        )
+
+        if (
+            previous is None
+            or candidate.score
+            > previous.score
+        ):
+            deduplicated[
+                key
+            ] = candidate
+
+    return sorted(
+        deduplicated.values(),
+        key=lambda item: (
+            item.classification,
+            -item.score,
+            item.left_id,
+            item.right_id,
+        ),
     )
 
-    row = result.first()
 
-    if row is None:
-        return None
+async def load_bundles( *, product_ids: set[int], ) -> dict[
+    int,
+    ProductBundle
+]:
+    if not product_ids:
+        return {}
 
-    (
-        product,
-        brand,
-        category,
-        family,
-    ) = row
-
-    sources_result = await session.execute(
-        select(
-            ProductSource
+    async with (
+        async_session_maker()
+        as session
+    ):
+        product_result = await session.execute(
+            select(
+                Product,
+                Brand,
+                Category,
+                ProductFamily,
+            )
+            .join(
+                Brand,
+                Brand.id
+                == Product.brand_id,
+            )
+            .join(
+                Category,
+                Category.id
+                == Product.category_id,
+            )
+            .outerjoin(
+                ProductFamily,
+                ProductFamily.id
+                == Product.family_id,
+            )
+            .where(
+                Product.id.in_(
+                    sorted(
+                        product_ids
+                    )
+                )
+            )
         )
-        .where(
-            ProductSource.product_id
-            == product.id
-        )
-        .order_by(
-            ProductSource.provider.asc(),
-            ProductSource.source_id.asc(),
-        )
-    )
 
-    sources = tuple(
-        SourceInfo(
-            provider=source.provider,
-            source_id=source.source_id,
-            source_url=source.source_url,
+        product_rows = (
+            product_result.all()
         )
-        for source
-        in sources_result.scalars().all()
-    )
 
-    return ProductBundle(
-        product=product,
-        brand=brand,
-        category=category,
-        family=family,
-        sources=sources,
-    )
+        source_result = await session.execute(
+            select(
+                ProductSource
+            )
+            .where(
+                ProductSource.product_id.in_(
+                    sorted(
+                        product_ids
+                    )
+                )
+            )
+            .order_by(
+                ProductSource.product_id.asc(),
+                ProductSource.provider.asc(),
+                ProductSource.source_id.asc(),
+            )
+        )
+
+        sources_by_product: dict[
+            int,
+            list[SourceInfo],
+        ] = defaultdict(
+            list
+        )
+
+        for source in (
+            source_result.scalars().all()
+        ):
+            sources_by_product[
+                source.product_id
+            ].append(
+                SourceInfo(
+                    provider=(
+                        source.provider
+                    ),
+                    source_id=(
+                        source.source_id
+                    ),
+                    source_url=(
+                        source.source_url
+                    ),
+                )
+            )
+
+        bundles: dict[
+            int,
+            ProductBundle,
+        ] = {}
+
+        for (
+            product,
+            brand,
+            category,
+            family,
+        ) in product_rows:
+            bundles[
+                product.id
+            ] = ProductBundle(
+                product=product,
+                brand=brand,
+                category=category,
+                family=family,
+                sources=tuple(
+                    sources_by_product.get(
+                        product.id,
+                        [],
+                    )
+                ),
+            )
+
+        return bundles
 
 
 def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvidence:
@@ -925,9 +1110,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
     left_product = left.product
     right_product = right.product
 
-    #
-    # BRAND
-    #
     same_brand = (
         normalized_clean(
             left.brand.name
@@ -946,9 +1128,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "different_brand"
         )
 
-    #
-    # NAME
-    #
     same_name = (
         normalized_clean(
             left_product.name
@@ -1003,9 +1182,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "weak_name_similarity"
         )
 
-    #
-    # CATEGORY
-    #
     category_compatible = (
         categories_compatible(
             left.category,
@@ -1022,9 +1198,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "different_category"
         )
 
-    #
-    # BARCODE
-    #
     left_barcode = normalize_barcode(
         left_product.barcode
     )
@@ -1067,17 +1240,10 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
         )
 
     elif one_barcode_only:
-        #
-        # Не плюс и не минус для identity.
-        # Просто фиксируем факт.
-        #
         positive.append(
             "barcode_known_on_one_side"
         )
 
-    #
-    # PACKAGE
-    #
     package_compatibility = (
         package_values_compatible(
             current_value=(
@@ -1105,9 +1271,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "different_package"
         )
 
-    #
-    # PERCENTAGE / COUNT / PACKAGE INSIDE NAME
-    #
     left_percentages = extract_percentages(
         left_product.name
     )
@@ -1124,12 +1287,16 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
         right_product.name
     )
 
-    left_name_packages = extract_name_packages(
-        left_product.name
+    left_name_packages = (
+        extract_name_packages(
+            left_product.name
+        )
     )
 
-    right_name_packages = extract_name_packages(
-        right_product.name
+    right_name_packages = (
+        extract_name_packages(
+            right_product.name
+        )
     )
 
     if values_conflict(
@@ -1183,9 +1350,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "same_name_package"
         )
 
-    #
-    # SKU VARIANTS
-    #
     left_variants_set = variant_tokens(
         left_product.name,
         brand_name=left.brand.name,
@@ -1235,9 +1399,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "same_variant_tokens"
         )
 
-    #
-    # SUBTYPE
-    #
     subtype_equal = same_optional_text(
         left_product.subtype,
         right_product.subtype,
@@ -1253,9 +1414,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
             "different_subtype"
         )
 
-    #
-    # FAMILY
-    #
     same_family: bool | None = None
 
     if (
@@ -1276,9 +1434,6 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
                 "different_family"
             )
 
-    #
-    # SOURCES
-    #
     left_source_ids = (
         source_identity_set(
             left
@@ -1362,8 +1517,12 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
         right_percentages=(
             right_percentages
         ),
-        left_counts=left_counts,
-        right_counts=right_counts,
+        left_counts=(
+            left_counts
+        ),
+        right_counts=(
+            right_counts
+        ),
         left_name_packages=(
             left_name_packages
         ),
@@ -1410,8 +1569,17 @@ def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvide
     )
 
 
-def make_result( *, classification: VerificationClass, reason: str, confidence: float, left: ProductBundle, right: ProductBundle, evidence: PairEvidence, canonical_product_id: int | None, ) -> VerificationResult:
+def make_result( *, scanner: ScannerCandidate, classification: VerificationClass, reason: str, confidence: float, left: ProductBundle, right: ProductBundle, evidence: PairEvidence, canonical_product_id: int | None, ) -> VerificationResult:
     return VerificationResult(
+        scanner_classification=(
+            scanner.classification
+        ),
+        scanner_reason=(
+            scanner.reason
+        ),
+        scanner_score=(
+            scanner.score
+        ),
         classification=classification,
         reason=reason,
         confidence=confidence,
@@ -1475,7 +1643,7 @@ def make_result( *, classification: VerificationClass, reason: str, confidence: 
     )
 
 
-def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> VerificationResult:
+def verify_pair( *, scanner: ScannerCandidate, left: ProductBundle, right: ProductBundle, ) -> VerificationResult:
     evidence = build_evidence(
         left=left,
         right=right,
@@ -1489,12 +1657,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         evidence.positive_evidence
     )
 
-    #
-    # ЖЁСТКИЕ ДОКАЗАТЕЛЬСТВА РАЗНЫХ SKU.
-    #
-    # Здесь только признаки, которые достаточно
-    # надёжны, чтобы не отправлять пару дальше.
-    #
     hard_different = {
         "different_brand",
         "different_package",
@@ -1509,6 +1671,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         & negative
     ):
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.CONFIRMED_DIFFERENT_SKU
             ),
@@ -1522,10 +1685,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             canonical_product_id=None,
         )
 
-    #
-    # Разные известные barcode + variant difference
-    # считаем достаточным подтверждением разных SKU.
-    #
     if (
         evidence.different_known_barcodes
         and (
@@ -1536,6 +1695,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
     ):
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.CONFIRMED_DIFFERENT_SKU
             ),
@@ -1550,11 +1710,12 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
 
     #
-    # Разные известные barcode без сильного variant-conflict:
-    # только manual review.
+    # Два разных известных barcode НИКОГДА
+    # автоматически не подтверждают SAME_SKU.
     #
     if evidence.different_known_barcodes:
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.NEEDS_MANUAL_REVIEW
             ),
@@ -1568,19 +1729,12 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             canonical_product_id=None,
         )
 
-    #
-    # Односторонний variant-token:
-    # "финский" vs без "финский"
-    # "с индейкой" vs без "с индейкой"
-    #
-    # Без независимого подтверждения это нельзя
-    # автоматически признать одним SKU.
-    #
     if (
         "one_sided_variant_tokens"
         in negative
     ):
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.NEEDS_MANUAL_REVIEW
             ),
@@ -1594,15 +1748,12 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             canonical_product_id=None,
         )
 
-    #
-    # Разный subtype сам по себе тоже пока manual:
-    # subtype может быть заполнен неодинаково разными источниками.
-    #
     if (
         "different_subtype"
         in negative
     ):
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.NEEDS_MANUAL_REVIEW
             ),
@@ -1616,9 +1767,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             canonical_product_id=None,
         )
 
-    #
-    # CORE IDENTITY.
-    #
     strong_name = bool(
         evidence.same_name
         or (
@@ -1635,12 +1783,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         and evidence.package_compatible is True
     )
 
-    #
-    # НЕЗАВИСИМОЕ ПОДТВЕРЖДЕНИЕ.
-    #
-    # SAME SKU разрешён только если есть хотя бы
-    # один из этих независимых сигналов.
-    #
     exact_external_identity = bool(
         evidence.shared_source_identity
     )
@@ -1649,13 +1791,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         evidence.same_barcode
     )
 
-    #
-    # Две независимые внешние карточки разных providers
-    # можно использовать как подтверждение ТОЛЬКО
-    # при очень строгом core identity:
-    # точное имя + бренд + package + категория,
-    # без variant/subtype/barcode конфликтов.
-    #
     independent_source_confirmation = bool(
         evidence.independent_external_sources
         and evidence.same_name
@@ -1709,6 +1844,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             )
 
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.CONFIRMED_SAME_SKU
             ),
@@ -1722,12 +1858,9 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             ),
         )
 
-    #
-    # Точное/сильное совпадение без независимого
-    # подтверждения — ручная проверка.
-    #
     if core_identity:
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.NEEDS_MANUAL_REVIEW
             ),
@@ -1741,9 +1874,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             canonical_product_id=None,
         )
 
-    #
-    # Более слабая пара, но есть существенные совпадения.
-    #
     related_identity = bool(
         evidence.same_brand
         and evidence.category_compatible
@@ -1760,6 +1890,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
 
     if related_identity:
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.NEEDS_MANUAL_REVIEW
             ),
@@ -1773,11 +1904,6 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             canonical_product_id=None,
         )
 
-    #
-    # Разные несовместимые категории сами по себе
-    # не превращают пару в DIFFERENT, но в сочетании
-    # со слабым названием дают достаточно оснований.
-    #
     if (
         "different_category"
         in negative
@@ -1785,6 +1911,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         in negative
     ):
         return make_result(
+            scanner=scanner,
             classification=(
                 VerificationClass.CONFIRMED_DIFFERENT_SKU
             ),
@@ -1799,6 +1926,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
 
     return make_result(
+        scanner=scanner,
         classification=(
             VerificationClass.NEEDS_MANUAL_REVIEW
         ),
@@ -1845,6 +1973,15 @@ def print_result( *, index: int, item: VerificationResult, ) -> None:
         f"class={item.classification.value} "
         f"confidence={item.confidence} "
         f"reason={item.reason}"
+    )
+
+    print(
+        "scanner:",
+        item.scanner_classification,
+        "|",
+        item.scanner_score,
+        "|",
+        item.scanner_reason,
     )
 
     print(
@@ -1940,6 +2077,88 @@ def print_result( *, index: int, item: VerificationResult, ) -> None:
     )
 
 
+def result_to_json( item: VerificationResult, ) -> dict:
+    data = asdict(
+        item
+    )
+
+    data[
+        "classification"
+    ] = item.classification.value
+
+    return data
+
+
+def write_verification_json( *, scanner_candidates: list[ ScannerCandidate ], results: list[ VerificationResult ], missing_pairs: list[ tuple[int, int] ], ) -> None:
+    counts = Counter(
+        item.classification.value
+        for item in results
+    )
+
+    payload = {
+        "schema_version": 1,
+        "verifier_version": "v3",
+        "generated_at_utc": (
+            datetime.now(
+                timezone.utc
+            )
+            .isoformat()
+        ),
+        "source_file": str(
+            CANDIDATE_JSON_PATH
+        ),
+        "database_changes": False,
+        "auto_merge_executed": False,
+        "pairs_requested": len(
+            scanner_candidates
+        ),
+        "pairs_verified": len(
+            results
+        ),
+        "pairs_missing": len(
+            missing_pairs
+        ),
+        "counts": {
+            key: counts[
+                key
+            ]
+            for key
+            in (
+                VerificationClass.CONFIRMED_SAME_SKU.value,
+                VerificationClass.NEEDS_MANUAL_REVIEW.value,
+                VerificationClass.CONFIRMED_DIFFERENT_SKU.value,
+            )
+        },
+        "missing_pairs": [
+            {
+                "left_id": left_id,
+                "right_id": right_id,
+            }
+            for (
+                left_id,
+                right_id,
+            )
+            in missing_pairs
+        ],
+        "results": [
+            result_to_json(
+                item
+            )
+            for item
+            in results
+        ],
+    }
+
+    VERIFICATION_JSON_PATH.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def format_top_ids( items: list[ VerificationResult ], ) -> str:
     if not items:
         return "none"
@@ -1956,62 +2175,121 @@ def format_top_ids( items: list[ VerificationResult ], ) -> str:
     )
 
 
-def print_final_summary( *, results: list[ VerificationResult ], missing_pairs: list[ tuple[int, int] ], ) -> None:
+def print_class_block( *, title: str, items: list[ VerificationResult ], ) -> None:
+    print()
+    print(
+        "=" * 80
+    )
+    print(
+        title
+    )
+    print(
+        "=" * 80
+    )
+
+    if not items:
+        print(
+            "none"
+        )
+        return
+
+    for index, item in enumerate(
+        items[
+            :MAX_RESULT_OUTPUT_PER_CLASS
+        ],
+        start=1,
+    ):
+        print_result(
+            index=index,
+            item=item,
+        )
+
+    if (
+        len(
+            items
+        )
+        > MAX_RESULT_OUTPUT_PER_CLASS
+    ):
+        print(
+            "-" * 80
+        )
+
+        print(
+            "OUTPUT TRUNCATED:",
+            (
+                len(
+                    items
+                )
+                - MAX_RESULT_OUTPUT_PER_CLASS
+            ),
+            "more result(s) stored in",
+            str(
+                VERIFICATION_JSON_PATH
+            ),
+        )
+
+
+def print_final_summary( *, scanner_candidates: list[ ScannerCandidate ], results: list[ VerificationResult ], missing_pairs: list[ tuple[int, int] ], ) -> None:
     counts = Counter(
         item.classification.value
         for item in results
     )
 
-    same_items = [
-        item
-        for item in results
-        if (
-            item.classification
-            == VerificationClass.CONFIRMED_SAME_SKU
-        )
-    ]
+    scanner_counts = Counter(
+        item.classification
+        for item in scanner_candidates
+    )
 
-    review_items = [
-        item
-        for item in results
-        if (
-            item.classification
-            == VerificationClass.NEEDS_MANUAL_REVIEW
-        )
-    ]
-
-    different_items = [
-        item
-        for item in results
-        if (
-            item.classification
-            == VerificationClass.CONFIRMED_DIFFERENT_SKU
-        )
-    ]
-
-    same_items.sort(
+    same_items = sorted(
+        (
+            item
+            for item in results
+            if (
+                item.classification
+                == VerificationClass.CONFIRMED_SAME_SKU
+            )
+        ),
         key=lambda item: (
             item.confidence,
-            item.left_id,
-            item.right_id,
+            item.scanner_score,
+            -item.left_id,
+            -item.right_id,
         ),
         reverse=True,
     )
 
-    review_items.sort(
+    review_items = sorted(
+        (
+            item
+            for item in results
+            if (
+                item.classification
+                == VerificationClass.NEEDS_MANUAL_REVIEW
+            )
+        ),
         key=lambda item: (
             item.confidence,
-            item.left_id,
-            item.right_id,
+            item.scanner_score,
+            -item.left_id,
+            -item.right_id,
         ),
         reverse=True,
     )
 
-    different_items.sort(
+    different_items = sorted(
+        (
+            item
+            for item in results
+            if (
+                item.classification
+                == VerificationClass.CONFIRMED_DIFFERENT_SKU
+            )
+        ),
         key=lambda item: (
             item.confidence,
-            item.left_id,
-            item.right_id,
+            item.scanner_score,
+            -item.left_id,
+            -item.right_id,
         ),
         reverse=True,
     )
@@ -2028,11 +2306,41 @@ def print_final_summary( *, results: list[ VerificationResult ], missing_pairs: 
     )
 
     print(
-        "Pairs requested:",
-        len(
-            CANDIDATE_PAIRS
+        "Input file:",
+        str(
+            CANDIDATE_JSON_PATH
         ),
     )
+
+    print(
+        "Scanner candidates:",
+        len(
+            scanner_candidates
+        ),
+    )
+
+    print(
+        " AUTO_SAFE:",
+        scanner_counts[
+            "AUTO_SAFE"
+        ],
+    )
+
+    print(
+        " REVIEW:",
+        scanner_counts[
+            "REVIEW"
+        ],
+    )
+
+    print(
+        " BARCODE_CONFLICT_REVIEW:",
+        scanner_counts[
+            "BARCODE_CONFLICT_REVIEW"
+        ],
+    )
+
+    print()
 
     print(
         "Pairs verified:",
@@ -2103,9 +2411,20 @@ def print_final_summary( *, results: list[ VerificationResult ], missing_pairs: 
                     left,
                     right,
                 )
-                in missing_pairs
+                in missing_pairs[
+                    :FINAL_TOP_IDS
+                ]
             ),
         )
+
+    print()
+
+    print(
+        "VERIFICATION JSON:",
+        str(
+            VERIFICATION_JSON_PATH
+        ),
+    )
 
     print()
 
@@ -2128,11 +2447,18 @@ async def main() -> None:
     )
 
     print(
-        "MarkaRadar Duplicate Candidate Verifier v2"
+        "MarkaRadar Duplicate Candidate Verifier v3"
     )
 
     print(
-        "MODE: DEEP VERIFICATION ONLY"
+        "MODE: AUTOMATIC DEEP VERIFICATION OF ALL SCANNER CANDIDATES"
+    )
+
+    print(
+        "INPUT:",
+        str(
+            CANDIDATE_JSON_PATH
+        ),
     )
 
     print(
@@ -2147,6 +2473,39 @@ async def main() -> None:
         "=" * 80
     )
 
+    scanner_candidates = (
+        load_scanner_candidates()
+    )
+
+    print(
+        "Scanner candidates loaded:",
+        len(
+            scanner_candidates
+        ),
+    )
+
+    product_ids = {
+        product_id
+        for candidate
+        in scanner_candidates
+        for product_id
+        in (
+            candidate.left_id,
+            candidate.right_id,
+        )
+    }
+
+    bundles = await load_bundles(
+        product_ids=product_ids
+    )
+
+    print(
+        "Unique candidate products loaded:",
+        len(
+            bundles
+        ),
+    )
+
     results: list[
         VerificationResult
     ] = []
@@ -2155,101 +2514,128 @@ async def main() -> None:
         tuple[int, int]
     ] = []
 
-    async with (
-        async_session_maker()
-        as session
-    ):
-        for (
-            left_id,
-            right_id,
-        ) in CANDIDATE_PAIRS:
-            left = await load_bundle(
-                session=session,
-                product_id=left_id,
+    for scanner in scanner_candidates:
+        left = bundles.get(
+            scanner.left_id
+        )
+
+        right = bundles.get(
+            scanner.right_id
+        )
+
+        if (
+            left is None
+            or right is None
+        ):
+            missing_pairs.append(
+                (
+                    scanner.left_id,
+                    scanner.right_id,
+                )
             )
 
-            right = await load_bundle(
-                session=session,
-                product_id=right_id,
-            )
+            continue
 
+        result = verify_pair(
+            scanner=scanner,
+            left=left,
+            right=right,
+        )
+
+        results.append(
+            result
+        )
+
+    same_items = sorted(
+        [
+            item
+            for item in results
             if (
-                left is None
-                or right is None
-            ):
-                print(
-                    "-" * 80
-                )
-
-                print(
-                    "PAIR NOT FOUND:",
-                    left_id,
-                    "<->",
-                    right_id,
-                )
-
-                missing_pairs.append(
-                    (
-                        left_id,
-                        right_id,
-                    )
-                )
-
-                continue
-
-            result = verify_pair(
-                left=left,
-                right=right,
+                item.classification
+                == VerificationClass.CONFIRMED_SAME_SKU
             )
-
-            results.append(
-                result
-            )
-
-    ordered = sorted(
-        results,
+        ],
         key=lambda item: (
-            item.classification.value,
             item.confidence,
-            item.left_id,
-            item.right_id,
+            item.scanner_score,
         ),
         reverse=True,
     )
 
-    print()
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        "VERIFICATION RESULTS"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    if not ordered:
-        print(
-            "none"
-        )
-
-    for index, item in enumerate(
-        ordered[
-            :MAX_RESULTS_OUTPUT
+    review_items = sorted(
+        [
+            item
+            for item in results
+            if (
+                item.classification
+                == VerificationClass.NEEDS_MANUAL_REVIEW
+            )
         ],
-        start=1,
-    ):
-        print_result(
-            index=index,
-            item=item,
-        )
+        key=lambda item: (
+            item.confidence,
+            item.scanner_score,
+        ),
+        reverse=True,
+    )
 
-    print_final_summary(
+    different_items = sorted(
+        [
+            item
+            for item in results
+            if (
+                item.classification
+                == VerificationClass.CONFIRMED_DIFFERENT_SKU
+            )
+        ],
+        key=lambda item: (
+            item.confidence,
+            item.scanner_score,
+        ),
+        reverse=True,
+    )
+
+    write_verification_json(
+        scanner_candidates=(
+            scanner_candidates
+        ),
         results=results,
-        missing_pairs=missing_pairs,
+        missing_pairs=(
+            missing_pairs
+        ),
+    )
+
+    print_class_block(
+        title=(
+            "CONFIRMED SAME SKU"
+        ),
+        items=same_items,
+    )
+
+    print_class_block(
+        title=(
+            "NEEDS MANUAL REVIEW"
+        ),
+        items=review_items,
+    )
+
+    print_class_block(
+        title=(
+            "CONFIRMED DIFFERENT SKU"
+        ),
+        items=different_items,
+    )
+
+    #
+    # Финальная сводка обязательно последняя.
+    #
+    print_final_summary(
+        scanner_candidates=(
+            scanner_candidates
+        ),
+        results=results,
+        missing_pairs=(
+            missing_pairs
+        ),
     )
 
 
