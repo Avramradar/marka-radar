@@ -48,8 +48,18 @@ class DuplicateCandidate:
     jaccard: float
     common_count: int
 
-    left_discriminators: tuple[str, ...]
-    right_discriminators: tuple[str, ...]
+    left_percentages: tuple[str, ...]
+    right_percentages: tuple[str, ...]
+
+    left_counts: tuple[str, ...]
+    right_counts: tuple[str, ...]
+
+    left_name_packages: tuple[str, ...]
+    right_name_packages: tuple[str, ...]
+
+    left_variant_tokens: tuple[str, ...]
+    right_variant_tokens: tuple[str, ...]
+
     discriminator_conflicts: tuple[str, ...]
 
     reason: str
@@ -57,19 +67,25 @@ class DuplicateCandidate:
 
 
 PERCENT_PATTERN = re.compile(
-    r"(?<!\d)(\d+(?:[.,]\d+)?)\s*%",
+    r"(?<![\d.,])"
+    r"(\d+(?:[.,]\d+)?)"
+    r"\s*%",
     flags=re.IGNORECASE,
 )
 
 COUNT_PATTERN = re.compile(
-    r"(?<!\d)(\d+)\s*"
+    r"(?<![\d.,])"
+    r"(\d+)"
+    r"\s*"
     r"(шт|штук|капсул|пакетик(?:а|ов)?|"
     r"саше|порц(?:ия|ии|ий))\b",
     flags=re.IGNORECASE,
 )
 
 PACKAGE_IN_NAME_PATTERN = re.compile(
-    r"(?<!\d)(\d+(?:[.,]\d+)?)\s*"
+    r"(?<![\d.,])"
+    r"(\d+(?:[.,]\d+)?)"
+    r"\s*"
     r"(кг|г|гр|мл|л)\b",
     flags=re.IGNORECASE,
 )
@@ -80,6 +96,10 @@ WORD_PATTERN = re.compile(
 )
 
 
+#
+# Общие слова, которые сами по себе
+# не отличают SKU.
+#
 GENERIC_VARIANT_WORDS = {
     "колбаса",
     "сервелат",
@@ -96,28 +116,38 @@ GENERIC_VARIANT_WORDS = {
     "сливки",
     "напиток",
     "напитки",
+
     "капсулах",
     "капсулы",
     "кофемашин",
     "nespresso",
+
     "вареная",
     "вареный",
+    "вареное",
     "варено",
     "копченая",
     "копченый",
     "копченое",
     "копченые",
+    "варенокопченая",
+    "варенокопченый",
+
     "ультрапастеризованное",
     "пастеризованное",
+
     "сливочная",
     "классическая",
     "классический",
+
     "традиции",
     "традиционный",
     "традиционная",
     "традиционное",
+
     "гост",
     "бзмж",
+
     "для",
     "из",
     "на",
@@ -127,7 +157,7 @@ GENERIC_VARIANT_WORDS = {
 }
 
 
-def clean_text(value: object) -> str:
+def clean_text( value: object, ) -> str:
     if value is None:
         return ""
 
@@ -138,15 +168,39 @@ def clean_text(value: object) -> str:
     )
 
 
-def decimal_text(value: str) -> str:
+def comparable_text( value: object, ) -> str:
+    """ Нормализация, которая НЕ уничтожает %, точки и запятые. Это критично для: 2.5% 3.2% 1.35кг """
+
+    return (
+        clean_text(
+            value
+        )
+        .lower()
+        .replace(
+            "ё",
+            "е",
+        )
+    )
+
+
+def decimal_text( value: str, ) -> str:
     try:
         number = Decimal(
-            value.replace(",", ".")
+            value.replace(
+                ",",
+                ".",
+            )
         )
     except Exception:
-        return value.replace(",", ".")
+        return value.replace(
+            ",",
+            ".",
+        )
 
-    if number == number.to_integral():
+    if (
+        number
+        == number.to_integral()
+    ):
         return str(
             int(number)
         )
@@ -157,7 +211,7 @@ def decimal_text(value: str) -> str:
     )
 
 
-def package_text(product: Product) -> str:
+def package_text( product: Product, ) -> str:
     if product.package_value is None:
         return ""
 
@@ -168,7 +222,7 @@ def package_text(product: Product) -> str:
 
 
 def extract_percentages( value: str | None, ) -> tuple[str, ...]:
-    text = normalized(
+    text = comparable_text(
         value
     )
 
@@ -183,12 +237,14 @@ def extract_percentages( value: str | None, ) -> tuple[str, ...]:
     }
 
     return tuple(
-        sorted(values)
+        sorted(
+            values
+        )
     )
 
 
 def extract_counts( value: str | None, ) -> tuple[str, ...]:
-    text = normalized(
+    text = comparable_text(
         value
     )
 
@@ -198,8 +254,14 @@ def extract_counts( value: str | None, ) -> tuple[str, ...]:
         text
     ):
         number = match.group(1)
-        unit = normalized(
+
+        unit = (
             match.group(2)
+            .lower()
+            .replace(
+                "ё",
+                "е",
+            )
         )
 
         values.add(
@@ -207,14 +269,16 @@ def extract_counts( value: str | None, ) -> tuple[str, ...]:
         )
 
     return tuple(
-        sorted(values)
+        sorted(
+            values
+        )
     )
 
 
 def extract_name_packages( value: str | None, ) -> tuple[str, ...]:
-    """ Извлекает массу/объём прямо из названия. Это нужно, когда package_value в БД не заполнен. """
+    """ Извлекает массу/объём из названия. В отличие от старой версии: 1.35кг -> 1.35:кг а НЕ: 35:кг """
 
-    text = normalized(
+    text = comparable_text(
         value
     )
 
@@ -239,14 +303,17 @@ def extract_name_packages( value: str | None, ) -> tuple[str, ...]:
         )
 
     return tuple(
-        sorted(values)
+        sorted(
+            values
+        )
     )
 
 
 def tokenize_brand( brand_name: str | None, ) -> set[str]:
     return {
         token
-        for token in WORD_PATTERN.findall(
+        for token
+        in WORD_PATTERN.findall(
             normalized(
                 brand_name
             )
@@ -256,7 +323,7 @@ def tokenize_brand( brand_name: str | None, ) -> set[str]:
 
 
 def variant_tokens( value: str | None, *, brand_name: str | None, ) -> set[str]:
-    """ Выделяет слова, которые могут отличать один SKU от другого внутри одного бренда и категории. Например: Armonioso / Intenso / Cremoso / Forte финский индейкой Они не должны потеряться из-за общей похожести названий. """
+    """ Выделяет SKU-различающие слова. Примеры различий, которые должны остановить автоматическое объединение: финский индейкой armonioso intenso cremoso forte Если такое слово есть только у одной карточки, пара остаётся для ручной проверки и НЕ считается безопасным auto-merge кандидатом. """
 
     text = normalized(
         value
@@ -294,6 +361,7 @@ def values_conflict( left_values: Iterable[str], right_values: Iterable[str], ) 
     left = set(
         left_values
     )
+
     right = set(
         right_values
     )
@@ -309,12 +377,21 @@ def find_discriminator_conflicts( *, left: Product, right: Product, brand_name: 
     tuple[str, ...],
     tuple[str, ...],
     tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
 ]:
+    """ Возвращает структурированные признаки и список конфликтов. Главное изменение v3: односторонний variant token тоже считается небезопасным для автоматического merge. Это специально консервативно. """
+
     conflicts: list[str] = []
 
     left_percentages = extract_percentages(
         left.name
     )
+
     right_percentages = extract_percentages(
         right.name
     )
@@ -333,6 +410,7 @@ def find_discriminator_conflicts( *, left: Product, right: Product, brand_name: 
     left_counts = extract_counts(
         left.name
     )
+
     right_counts = extract_counts(
         right.name
     )
@@ -353,6 +431,7 @@ def find_discriminator_conflicts( *, left: Product, right: Product, brand_name: 
             left.name
         )
     )
+
     right_name_packages = (
         extract_name_packages(
             right.name
@@ -374,38 +453,21 @@ def find_discriminator_conflicts( *, left: Product, right: Product, brand_name: 
         left.name,
         brand_name=brand_name,
     )
+
     right_variants = variant_tokens(
         right.name,
         brand_name=brand_name,
     )
 
-    common_variants = (
-        left_variants
-        & right_variants
-    )
-
-    left_only = (
-        left_variants
-        - common_variants
-    )
-    right_only = (
-        right_variants
-        - common_variants
-    )
-
-    #
-    # Если с обеих сторон есть разные вариантные слова,
-    # считаем это сильным признаком разных SKU.
-    #
     if (
-        left_only
-        and right_only
+        left_variants
+        != right_variants
     ):
         conflicts.append(
             "different_variant_tokens:"
-            f"{tuple(sorted(left_only))}"
+            f"{tuple(sorted(left_variants))}"
             "!="
-            f"{tuple(sorted(right_only))}"
+            f"{tuple(sorted(right_variants))}"
         )
 
     left_discriminators = tuple(
@@ -431,8 +493,22 @@ def find_discriminator_conflicts( *, left: Product, right: Product, brand_name: 
     )
 
     return (
-        left_discriminators,
-        right_discriminators,
+        left_percentages,
+        right_percentages,
+        left_counts,
+        right_counts,
+        left_name_packages,
+        right_name_packages,
+        tuple(
+            sorted(
+                left_variants
+            )
+        ),
+        tuple(
+            sorted(
+                right_variants
+            )
+        ),
         tuple(
             conflicts
         ),
@@ -445,6 +521,9 @@ def candidate_score( *, barcode_equal: bool, package_compatible: bool | None, co
     if barcode_equal:
         score += 100.0
 
+    #
+    # Same brand + same category.
+    #
     score += 20.0
     score += 15.0
 
@@ -455,6 +534,7 @@ def candidate_score( *, barcode_equal: bool, package_compatible: bool | None, co
         coverage
         * 25.0
     )
+
     score += (
         jaccard
         * 15.0
@@ -462,6 +542,7 @@ def candidate_score( *, barcode_equal: bool, package_compatible: bool | None, co
 
     if common_count >= 3:
         score += 10.0
+
     elif common_count >= 2:
         score += 5.0
 
@@ -469,7 +550,7 @@ def candidate_score( *, barcode_equal: bool, package_compatible: bool | None, co
         len(
             discriminator_conflicts
         )
-        * 80.0
+        * 100.0
     )
 
     return round(
@@ -482,7 +563,7 @@ def should_keep_candidate( *, barcode_equal: bool, package_compatible: bool | No
     bool,
     str,
 ]:
-    """ Возвращает: keep, reason Важно: scanner по-прежнему ничего не объединяет. Он только показывает действительно сильные пары. """
+    """ Scanner v3 делит пары на два класса: 1. same_barcode Очень сильный кандидат. Даже при конфликте выводим для диагностики. 2. strong_brand_category_name_match Без barcode допускается только если НЕТ ни одного SKU-discriminator конфликта. """
 
     if barcode_equal:
         if package_compatible is False:
@@ -494,7 +575,7 @@ def should_keep_candidate( *, barcode_equal: bool, package_compatible: bool | No
         if discriminator_conflicts:
             return (
                 True,
-                "same_barcode_but_variant_conflict",
+                "same_barcode_but_discriminator_conflict",
             )
 
         return (
@@ -511,7 +592,7 @@ def should_keep_candidate( *, barcode_equal: bool, package_compatible: bool | No
     if discriminator_conflicts:
         return (
             False,
-            "variant_conflict",
+            "discriminator_conflict",
         )
 
     if common_count < 2:
@@ -542,12 +623,15 @@ async def main() -> None:
     print(
         "=" * 80
     )
+
     print(
-        "MarkaRadar Duplicate Scanner v2"
+        "MarkaRadar Duplicate Scanner v3"
     )
+
     print(
         "DATABASE CHANGES: NONE"
     )
+
     print(
         "=" * 80
     )
@@ -663,18 +747,19 @@ async def main() -> None:
         DuplicateCandidate,
     ] = {}
 
-    rejected_by_variant = 0
+    rejected_by_discriminator = 0
     rejected_by_package = 0
     rejected_by_name = 0
 
     async def evaluate_pair( *, left: Product, right: Product, brand: Brand, category: Category, force_barcode_equal: bool = False, ) -> None:
-        nonlocal rejected_by_variant
+        nonlocal rejected_by_discriminator
         nonlocal rejected_by_package
         nonlocal rejected_by_name
 
         left_barcode = normalize_barcode(
             left.barcode
         )
+
         right_barcode = normalize_barcode(
             right.barcode
         )
@@ -691,7 +776,7 @@ async def main() -> None:
 
         #
         # Разные известные barcode —
-        # жёстко разные SKU.
+        # жёсткий запрет.
         #
         if (
             left_barcode
@@ -728,8 +813,14 @@ async def main() -> None:
         )
 
         (
-            left_discriminators,
-            right_discriminators,
+            left_percentages,
+            right_percentages,
+            left_counts,
+            right_counts,
+            left_name_packages,
+            right_name_packages,
+            left_variant_tokens,
+            right_variant_tokens,
             discriminator_conflicts,
         ) = find_discriminator_conflicts(
             left=left,
@@ -754,10 +845,18 @@ async def main() -> None:
         )
 
         if not keep:
-            if reason == "variant_conflict":
-                rejected_by_variant += 1
-            elif reason == "package_conflict":
+            if (
+                reason
+                == "discriminator_conflict"
+            ):
+                rejected_by_discriminator += 1
+
+            elif (
+                reason
+                == "package_conflict"
+            ):
                 rejected_by_package += 1
+
             else:
                 rejected_by_name += 1
 
@@ -793,8 +892,7 @@ async def main() -> None:
 
         if (
             existing is not None
-            and existing.score
-            >= score
+            and existing.score >= score
         ):
             return
 
@@ -824,11 +922,25 @@ async def main() -> None:
             coverage=coverage,
             jaccard=jaccard,
             common_count=common_count,
-            left_discriminators=(
-                left_discriminators
+            left_percentages=(
+                left_percentages
             ),
-            right_discriminators=(
-                right_discriminators
+            right_percentages=(
+                right_percentages
+            ),
+            left_counts=left_counts,
+            right_counts=right_counts,
+            left_name_packages=(
+                left_name_packages
+            ),
+            right_name_packages=(
+                right_name_packages
+            ),
+            left_variant_tokens=(
+                left_variant_tokens
+            ),
+            right_variant_tokens=(
+                right_variant_tokens
             ),
             discriminator_conflicts=(
                 discriminator_conflicts
@@ -923,22 +1035,27 @@ async def main() -> None:
     )
 
     print()
+
     print(
         "Duplicate candidates:",
         len(ordered),
     )
+
     print(
-        "Rejected by variant conflict:",
-        rejected_by_variant,
+        "Rejected by discriminator conflict:",
+        rejected_by_discriminator,
     )
+
     print(
         "Rejected by package conflict:",
         rejected_by_package,
     )
+
     print(
         "Rejected by weak name:",
         rejected_by_name,
     )
+
     print()
 
     for index, item in enumerate(
@@ -948,73 +1065,118 @@ async def main() -> None:
         print(
             "-" * 80
         )
+
         print(
             f"#{index} "
             f"score={item.score} "
             f"reason={item.reason}"
         )
+
         print(
             "ids:",
             item.left_id,
             "<->",
             item.right_id,
         )
+
         print(
             "brand:",
             item.brand_name,
         )
+
         print(
             "category:",
             item.category_name,
         )
+
         print(
             "left:",
             repr(
                 item.left_name
             ),
         )
+
         print(
             "right:",
             repr(
                 item.right_name
             ),
         )
+
         print(
             "barcodes:",
             item.left_barcode,
             "|",
             item.right_barcode,
         )
+
         print(
             "packages:",
             item.left_package,
             "|",
             item.right_package,
         )
+
         print(
             "barcode_equal:",
             item.barcode_equal,
         )
+
         print(
             "package_compatible:",
             item.package_compatible,
         )
+
         print(
-            "left_discriminators:",
-            item.left_discriminators,
+            "left_percentages:",
+            item.left_percentages,
         )
+
         print(
-            "right_discriminators:",
-            item.right_discriminators,
+            "right_percentages:",
+            item.right_percentages,
         )
+
+        print(
+            "left_counts:",
+            item.left_counts,
+        )
+
+        print(
+            "right_counts:",
+            item.right_counts,
+        )
+
+        print(
+            "left_name_packages:",
+            item.left_name_packages,
+        )
+
+        print(
+            "right_name_packages:",
+            item.right_name_packages,
+        )
+
+        print(
+            "left_variant_tokens:",
+            item.left_variant_tokens,
+        )
+
+        print(
+            "right_variant_tokens:",
+            item.right_variant_tokens,
+        )
+
         print(
             "discriminator_conflicts:",
             item.discriminator_conflicts,
         )
+
         print(
             "common_count:",
             item.common_count,
         )
+
         print(
             "coverage:",
             round(
@@ -1022,6 +1184,7 @@ async def main() -> None:
                 3,
             ),
         )
+
         print(
             "jaccard:",
             round(
@@ -1031,15 +1194,19 @@ async def main() -> None:
         )
 
     print()
+
     print(
         "=" * 80
     )
+
     print(
         "SCAN COMPLETE"
     )
+
     print(
         "DATABASE CHANGES: NONE"
     )
+
     print(
         "=" * 80
     )
