@@ -11,7 +11,7 @@ async def main() -> None:
     duplicate_product_id = 31661
 
     print("=" * 70)
-    print("MarkaRadar Product Consolidation — CONFIRMED DRY RUN")
+    print("MarkaRadar Product Consolidation — APPLY")
     print("=" * 70)
     print(
         "canonical_product_id:",
@@ -27,10 +27,10 @@ async def main() -> None:
     )
     print(
         "dry_run:",
-        True,
+        False,
     )
     print(
-        "DATABASE CHANGES: DISABLED",
+        "DATABASE CHANGES: ENABLED",
     )
     print("=" * 70)
 
@@ -43,8 +43,8 @@ async def main() -> None:
             duplicate_product_id=(
                 duplicate_product_id
             ),
-            dry_run=True,
-            commit=False,
+            dry_run=False,
+            commit=True,
             confirmed_identity=True,
         )
 
@@ -120,7 +120,18 @@ async def main() -> None:
 
         print("=" * 70)
 
-        await session.rollback()
+        if result.applied:
+            print(
+                "SUCCESS: consolidation committed "
+                "to database."
+            )
+        else:
+            print(
+                "NOT APPLIED: consolidation was "
+                "not committed."
+            )
+
+        print("=" * 70)
 
 
 if __name__ == "__main__":
