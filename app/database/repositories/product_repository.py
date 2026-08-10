@@ -1084,6 +1084,26 @@ async def search_products( session: AsyncSession, query: str, limit: int = 20, )
             ):
                 break
 
+    # Если запрос точно совпал с названием бренда,
+    # это не fuzzy-сценарий, а явный выбор бренда.
+    # В таком случае возвращаем только товары этого бренда
+    # и не подмешиваем похожие слова/бренды вроде
+    # «Добрый» к запросу «Доброфлот».
+    exact_brand_results = [
+        row
+        for row in collected_results
+        if normalize_text(
+            getattr(row[1], "name", "") or ""
+        )
+        == normalized_query
+    ]
+
+    if exact_brand_results:
+        return deduplicate_results(
+            exact_brand_results,
+            limit=safe_limit,
+        )
+
     if len(collected_results) >= safe_limit:
         return deduplicate_results(
             collected_results,
