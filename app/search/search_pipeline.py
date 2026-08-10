@@ -59,35 +59,35 @@ class SearchPipelineResult:
     corrected_query: str | None
     explanation: str | None
 
-@property
+    @property
     def has_results(self) -> bool:
         return self.screen not in {
             SearchPipelineScreen.EMPTY,
             SearchPipelineScreen.NOT_FOUND,
         }
 
-@property
+    @property
     def is_barcode_result(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.BARCODE_PRODUCT
         )
 
-@property
+    @property
     def should_show_intents(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.INTENTS
         )
 
-@property
+    @property
     def should_show_families(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.FAMILIES
         )
 
-@property
+    @property
     def should_show_decision(self) -> bool:
         return (
             self.screen
