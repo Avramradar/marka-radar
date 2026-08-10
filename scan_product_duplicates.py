@@ -22,7 +22,6 @@ from app.database.session import async_session_maker
 from app.services.product_merge_service import (
     identity_name_similarity,
     identity_name_tokens,
-    is_generic_category,
     is_unknown_brand,
     normalize_barcode,
     normalize_package_unit,
@@ -32,29 +31,26 @@ from app.services.product_merge_service import (
 
 
 #
-# MarkaRadar Duplicate Scanner v9
+# MarkaRadar Duplicate Scanner v10
 #
-# Улучшения относительно v8:
+# Изменения относительно v9:
 #
-# 1. Разные известные barcode + различающий SKU-токен
-# по-прежнему сразу REJECT.
+# 1. Убран большой вывод REJECT EXAMPLES.
+# REJECT остаются в статистике, но больше не забивают лог.
 #
-# 2. Если barcode разные, но бренд и нормализованное
-# название полностью совпадают и нет других
-# структурных конфликтов, пара НЕ теряется:
-# она попадает в BARCODE_CONFLICT_REVIEW даже когда
-# package неизвестен.
+# 2. В самом КОНЦЕ всегда печатается короткий FINAL SUMMARY.
+# Его удобно копировать из GitHub Actions без прокрутки вверх.
 #
-# Это важно для случаев смены GTIN/штрихкода,
-# переупаковки или исторических дублей каталога.
+# 3. В FINAL SUMMARY выводятся:
+# - количество товаров;
+# - число coarse pairs;
+# - AUTO_SAFE / REVIEW / BARCODE_CONFLICT_REVIEW / REJECT;
+# - TOP ID-пары каждого полезного класса;
+# - подтверждение, что БД не изменялась.
 #
-# 3. Если при этом упаковка тоже подтверждена как
-# одинаковая — score у barcode-conflict review выше.
+# 4. Логика классификации v9 сохранена.
 #
-# 4. AUTO_SAFE остаётся консервативным:
-# разные barcode никогда автоматически не склеиваются.
-#
-# 5. База по-прежнему НЕ изменяется.
+# 5. AUTO MERGE по-прежнему НЕ выполняется.
 #
 
 
@@ -340,10 +336,10 @@ GENERIC_CATEGORY_NAMES = {
 
 MAX_TOKEN_BLOCK_SIZE = 50
 
-MAX_AUTO_SAFE_OUTPUT = 100
-MAX_REVIEW_OUTPUT = 100
+MAX_AUTO_SAFE_OUTPUT = 50
+MAX_REVIEW_OUTPUT = 50
 MAX_BARCODE_CONFLICT_OUTPUT = 50
-MAX_REJECT_OUTPUT = 20
+FINAL_TOP_IDS = 20
 
 
 def clean_text( value: object, ) -> str:
@@ -766,10 +762,6 @@ def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
             f"{right_name_packages}"
         )
 
-    #
-    # Если разные содержательные варианты есть
-    # с обеих сторон — жёсткий конфликт.
-    #
     if (
         left_only
         and right_only
@@ -781,12 +773,6 @@ def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
             f"{tuple(sorted(right_only))}"
         )
 
-    #
-    # Если вариант есть только с одной стороны —
-    # REVIEW в обычном случае.
-    # Но при разных barcode это уже будет REJECT
-    # на этапе classify_pair().
-    #
     elif (
         left_only
         or right_only
@@ -911,9 +897,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
         or evidence.right_only_variants
     )
 
-    #
-    # Сначала structural conflict.
-    #
     if evidence.hard_conflicts:
         return (
             CandidateClass.REJECT,
@@ -921,10 +904,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             0.0,
         )
 
-    #
-    # Разные barcode + дополнительный вариант
-    # = разные SKU.
-    #
     if (
         different_known_barcodes
         and has_one_sided_variant
@@ -935,21 +914,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             0.0,
         )
 
-    #
-    # Разные barcode без вариантных различий.
-    #
-    # Никогда не AUTO_SAFE.
-    #
-    # Но точное совпадение бренда + названия может
-    # означать:
-    # - смену GTIN;
-    # - переупаковку;
-    # - старую/новую карточку;
-    # - ошибочный исторический дубль.
-    #
-    # Поэтому такие пары сохраняем в отдельном
-    # BARCODE_CONFLICT_REVIEW.
-    #
     if different_known_barcodes:
         percentages_equal = (
             evidence.left_percentages
@@ -961,10 +925,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             == evidence.right_counts
         )
 
-        #
-        # Самый сильный barcode-conflict review:
-        # имя одинаковое + упаковка подтверждена.
-        #
         if (
             same_name
             and evidence.package_compatible is True
@@ -977,12 +937,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
                 92.0,
             )
 
-        #
-        # Имя полностью одинаковое, но package
-        # у одной/обеих карточек неизвестен.
-        #
-        # Это не REJECT — данных просто недостаточно.
-        #
         if (
             same_name
             and evidence.package_compatible is None
@@ -995,10 +949,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
                 82.0,
             )
 
-        #
-        # Не абсолютно одинаковое имя, но всё ещё
-        # почти идентичная identity-структура.
-        #
         very_strong_name = bool(
             evidence.common_count >= 3
             and evidence.coverage >= 0.98
@@ -1035,9 +985,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             0.0,
         )
 
-    #
-    # Одинаковый barcode — сильнейшее доказательство.
-    #
     if same_barcode:
         return (
             CandidateClass.AUTO_SAFE,
@@ -1054,11 +1001,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
         )
     )
 
-    #
-    # Точное имя + упаковка.
-    # Но на общей категории "Продукты" не даём
-    # AUTO_SAFE — только REVIEW.
-    #
     if (
         same_name
         and evidence.package_compatible is True
@@ -1076,9 +1018,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             97.0,
         )
 
-    #
-    # Очень сильное сходство без soft differences.
-    #
     if (
         evidence.package_compatible is True
         and evidence.common_count >= 3
@@ -1847,13 +1786,131 @@ def print_sieve_stats( stats: SieveStats, ) -> None:
     )
 
 
+def format_top_ids( items: list[ DuplicateCandidate ], ) -> str:
+    if not items:
+        return "none"
+
+    return ", ".join(
+        f"{item.left_id}<->{item.right_id}"
+        f"({item.score})"
+        for item
+        in items[
+            :FINAL_TOP_IDS
+        ]
+    )
+
+
+def print_final_summary( *, stats: SieveStats, ordered_auto_safe: list[ DuplicateCandidate ], ordered_review: list[ DuplicateCandidate ], ordered_barcode_conflict: list[ DuplicateCandidate ], reject_reason_counts: Counter[str], ) -> None:
+    print()
+    print(
+        "=" * 80
+    )
+    print(
+        "FINAL SUMMARY"
+    )
+    print(
+        "=" * 80
+    )
+
+    print(
+        "Products:",
+        stats.products_loaded,
+    )
+
+    print(
+        "Eligible products:",
+        stats.eligible_products,
+    )
+
+    print(
+        "Coarse pairs:",
+        stats.coarse_pairs_generated,
+    )
+
+    print()
+
+    print(
+        "AUTO_SAFE:",
+        stats.auto_safe,
+    )
+
+    print(
+        "REVIEW:",
+        stats.review,
+    )
+
+    print(
+        "BARCODE_CONFLICT_REVIEW:",
+        stats.barcode_conflict_review,
+    )
+
+    print(
+        "REJECT:",
+        stats.reject,
+    )
+
+    print()
+
+    print(
+        "TOP AUTO_SAFE IDS:",
+        format_top_ids(
+            ordered_auto_safe
+        ),
+    )
+
+    print(
+        "TOP REVIEW IDS:",
+        format_top_ids(
+            ordered_review
+        ),
+    )
+
+    print(
+        "TOP BARCODE CONFLICT IDS:",
+        format_top_ids(
+            ordered_barcode_conflict
+        ),
+    )
+
+    print()
+
+    print(
+        "TOP REJECT REASONS:",
+        ", ".join(
+            f"{reason}={count}"
+            for (
+                reason,
+                count,
+            )
+            in reject_reason_counts.most_common(
+                10
+            )
+        )
+        or "none",
+    )
+
+    print()
+
+    print(
+        "AUTO MERGE EXECUTED: NO"
+    )
+
+    print(
+        "DATABASE CHANGES: NONE"
+    )
+
+    print(
+        "=" * 80
+    )
+
+
 async def main() -> None:
     print(
         "=" * 80
     )
 
     print(
-        "MarkaRadar Duplicate Scanner v9"
+        "MarkaRadar Duplicate Scanner v10"
     )
 
     print(
@@ -1917,11 +1974,6 @@ async def main() -> None:
         DuplicateCandidate,
     ] = {}
 
-    reject_examples: dict[
-        tuple[int, int],
-        DuplicateCandidate,
-    ] = {}
-
     reject_reason_counts: Counter[str] = Counter()
 
     for (
@@ -1941,28 +1993,25 @@ async def main() -> None:
             right=right,
         )
 
-        #
-        # Жёсткая структура.
-        #
         if evidence.hard_conflicts:
             (
                 classification,
                 reason,
-                score,
+                _score,
             ) = classify_pair(
                 left=left,
                 right=right,
                 evidence=evidence,
             )
 
-            candidate = make_candidate(
-                classification=classification,
-                reason=reason,
-                score=score,
-                left=left,
-                right=right,
-                evidence=evidence,
-            )
+            if (
+                classification
+                != CandidateClass.REJECT
+            ):
+                raise RuntimeError(
+                    "Hard conflict pair was "
+                    "classified as non-REJECT."
+                )
 
             count_reject_reason(
                 reason=reason,
@@ -1972,19 +2021,6 @@ async def main() -> None:
                     reject_reason_counts
                 ),
             )
-
-            if (
-                len(
-                    reject_examples
-                )
-                < MAX_REJECT_OUTPUT
-            ):
-                reject_examples[
-                    pair_key(
-                        left_id,
-                        right_id,
-                    )
-                ] = candidate
 
             continue
 
@@ -2036,46 +2072,16 @@ async def main() -> None:
         )
 
         if not name_related:
-            classification = (
-                CandidateClass.REJECT
-            )
-
-            reason = (
-                "insufficient_identity_evidence"
-            )
-
-            score = 0.0
-
-            candidate = make_candidate(
-                classification=classification,
-                reason=reason,
-                score=score,
-                left=left,
-                right=right,
-                evidence=evidence,
-            )
-
             count_reject_reason(
-                reason=reason,
+                reason=(
+                    "insufficient_identity_evidence"
+                ),
                 evidence=evidence,
                 stats=stats,
                 reject_reason_counts=(
                     reject_reason_counts
                 ),
             )
-
-            if (
-                len(
-                    reject_examples
-                )
-                < MAX_REJECT_OUTPUT
-            ):
-                reject_examples[
-                    pair_key(
-                        left_id,
-                        right_id,
-                    )
-                ] = candidate
 
             continue
 
@@ -2091,6 +2097,26 @@ async def main() -> None:
             evidence=evidence,
         )
 
+        key = pair_key(
+            left_id,
+            right_id,
+        )
+
+        if (
+            classification
+            == CandidateClass.REJECT
+        ):
+            count_reject_reason(
+                reason=reason,
+                evidence=evidence,
+                stats=stats,
+                reject_reason_counts=(
+                    reject_reason_counts
+                ),
+            )
+
+            continue
+
         candidate = make_candidate(
             classification=classification,
             reason=reason,
@@ -2098,11 +2124,6 @@ async def main() -> None:
             left=left,
             right=right,
             evidence=evidence,
-        )
-
-        key = pair_key(
-            left_id,
-            right_id,
         )
 
         if (
@@ -2135,26 +2156,6 @@ async def main() -> None:
                 key
             ] = candidate
 
-        else:
-            count_reject_reason(
-                reason=reason,
-                evidence=evidence,
-                stats=stats,
-                reject_reason_counts=(
-                    reject_reason_counts
-                ),
-            )
-
-            if (
-                len(
-                    reject_examples
-                )
-                < MAX_REJECT_OUTPUT
-            ):
-                reject_examples[
-                    key
-                ] = candidate
-
     ordered_auto_safe = sorted(
         auto_safe.values(),
         key=lambda item: (
@@ -2180,10 +2181,6 @@ async def main() -> None:
             item.common_count,
         ),
         reverse=True,
-    )
-
-    ordered_reject = list(
-        reject_examples.values()
     )
 
     print_sieve_stats(
@@ -2295,48 +2292,25 @@ async def main() -> None:
             item=item,
         )
 
-    print()
-    print(
-        "=" * 80
-    )
-    print(
-        "REJECT EXAMPLES"
-    )
-    print(
-        "=" * 80
-    )
-
-    if not ordered_reject:
-        print(
-            "none"
-        )
-
-    for index, item in enumerate(
-        ordered_reject[
-            :MAX_REJECT_OUTPUT
-        ],
-        start=1,
-    ):
-        print_candidate(
-            index=index,
-            item=item,
-        )
-
-    print()
-    print(
-        "=" * 80
-    )
-    print(
-        "SCAN COMPLETE"
-    )
-    print(
-        "AUTO MERGE EXECUTED: NO"
-    )
-    print(
-        "DATABASE CHANGES: NONE"
-    )
-    print(
-        "=" * 80
+    #
+    # ВАЖНО:
+    # FINAL SUMMARY печатается ПОСЛЕДНИМ.
+    # Поэтому его всегда видно внизу GitHub Actions.
+    #
+    print_final_summary(
+        stats=stats,
+        ordered_auto_safe=(
+            ordered_auto_safe
+        ),
+        ordered_review=(
+            ordered_review
+        ),
+        ordered_barcode_conflict=(
+            ordered_barcode_conflict
+        ),
+        reject_reason_counts=(
+            reject_reason_counts
+        ),
     )
 
 
