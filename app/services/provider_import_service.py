@@ -262,6 +262,12 @@ async def convert_external_product( *, session: AsyncSession, product: ExternalP
     return ExternalProductData(
         source=product.provider,
         name=product.name,
+        source_id=_clean_text(
+            product.source_id
+        ),
+        source_url=_external_source_url(
+            product
+        ),
         brand_name=product.brand_name,
         barcode=product.barcode,
         category_id=category_id,
@@ -479,7 +485,8 @@ async def import_external_product( *, session: AsyncSession, product: ExternalPr
             logger.info(
                 "ProductSource known before merge: "
                 "provider=%s source_id=%s "
-                "product_id=%s",
+                "product_id=%s; "
+                "merge must prefer source_link",
                 provider_name,
                 source_id,
                 existing_source.product_id,
