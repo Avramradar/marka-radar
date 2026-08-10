@@ -61,6 +61,16 @@ jobs:
         run: |
           python verify_duplicate_candidates.py
 
+      - name: Upload duplicate analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: markaradar-duplicate-analysis
+          path: |
+            duplicate_candidates.json
+            duplicate_verification_results.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Start MarkaRadar
         run: |
           python bot.py
