@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 from collections import Counter
 from collections import defaultdict
@@ -31,36 +32,46 @@ from app.services.product_merge_service import (
 
 
 #
-# MarkaRadar Duplicate Scanner v5
+# MarkaRadar Duplicate Scanner v6
 #
-# Архитектура: "сито".
+# Принцип работы: многоступенчатое сито.
 #
-# Вместо того чтобы сразу глубоко сравнивать каждую пару,
-# мы последовательно пропускаем товары через уровни:
+# Сначала мы строим широкие группы кандидатов,
+# затем последовательно применяем всё более точные
+# фильтры и НЕ делаем никаких изменений в БД.
 #
-# SIEVE 0 — сильные блоки-кандидаты
-# SIEVE 1 — грубое совпадение identity-токенов
-# SIEVE 2 — жёсткие структурные конфликты
-# SIEVE 3 — package / проценты / количество
-# SIEVE 4 — сходство названий
-# SIEVE 5 — различающие SKU-токены
-# SIEVE 6 — итоговая классификация
+# Итоговые классы:
 #
-# На каждом следующем уровне остаётся меньше пар.
+# AUTO_SAFE
+# Очень сильные доказательства одного SKU.
 #
-# Результат:
-# AUTO_SAFE — можно рассматривать для автоматического merge
-# REVIEW — похожи, но нужен дополнительный источник/проверка
-# REJECT — доказано разные SKU или доказательств недостаточно
+# REVIEW
+# Сильное сходство, но данных недостаточно
+# для безопасного автоматического merge.
+#
+# BARCODE_CONFLICT_REVIEW
+# Название/бренд/упаковка могут совпадать,
+# но barcode разные. Автоматически объединять
+# такую пару НЕЛЬЗЯ, но её нельзя просто
+# выбрасывать из анализа.
+#
+# REJECT
+# Доказано разные SKU или слишком мало
+# доказательств.
 #
 # ВАЖНО:
-# Этот файл НИЧЕГО не меняет в БД.
+# Этот файл только анализирует данные.
+# AUTO MERGE EXECUTED: NO
+# DATABASE CHANGES: NONE
 #
 
 
 class CandidateClass(StrEnum):
     AUTO_SAFE = "AUTO_SAFE"
     REVIEW = "REVIEW"
+    BARCODE_CONFLICT_REVIEW = (
+        "BARCODE_CONFLICT_REVIEW"
+    )
     REJECT = "REJECT"
 
 
@@ -70,11 +81,19 @@ class ProductMeta:
     brand: Brand
     category: Category
     source_count: int
+
+    normalized_brand: str
+    normalized_category: str
+
     identity_tokens: frozenset[str]
+    searchable_tokens: frozenset[str]
 
 
 @dataclass(slots=True, frozen=True)
 class PairEvidence:
+    same_brand: bool
+    same_category: bool
+
     left_barcode: str | None
     right_barcode: str | None
 
@@ -109,8 +128,11 @@ class DuplicateCandidate:
     left_id: int
     right_id: int
 
-    brand_name: str
-    category_name: str
+    left_brand: str
+    right_brand: str
+
+    left_category: str
+    right_category: str
 
     left_name: str
     right_name: str
@@ -150,25 +172,21 @@ class DuplicateCandidate:
 class SieveStats:
     products_loaded: int = 0
 
-    brand_category_groups: int = 0
+    exact_barcode_groups: int = 0
+    normalized_brand_groups: int = 0
+    token_blocks: int = 0
 
-    possible_pairs_inside_groups: int = 0
+    possible_pairs_raw: int = 0
     coarse_pairs_generated: int = 0
 
-    rejected_different_barcode: int = 0
-    rejected_package_conflict: int = 0
-    rejected_percentage_conflict: int = 0
-    rejected_count_conflict: int = 0
-    rejected_name_package_conflict: int = 0
-    rejected_variant_conflict: int = 0
-    rejected_weak_identity: int = 0
-
-    passed_hard_sieve: int = 0
+    passed_brand_sieve: int = 0
+    passed_category_sieve: int = 0
+    passed_structure_sieve: int = 0
     passed_name_sieve: int = 0
-    passed_variant_sieve: int = 0
 
     auto_safe: int = 0
     review: int = 0
+    barcode_conflict_review: int = 0
     reject: int = 0
 
 
@@ -201,9 +219,15 @@ WORD_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
+HTML_ENTITY_PATTERN = re.compile(
+    r"&[a-z0-9#]+;",
+    flags=re.IGNORECASE,
+)
+
 
 #
-# Слова, которые сами по себе не различают SKU.
+# Слова, которые не должны считаться
+# различающими SKU-признаками.
 #
 GENERIC_VARIANT_WORDS = {
     "колбаса",
@@ -221,6 +245,9 @@ GENERIC_VARIANT_WORDS = {
     "сливки",
     "напиток",
     "напитки",
+    "вода",
+    "чай",
+    "кетчуп",
 
     "капсулах",
     "капсулы",
@@ -259,11 +286,59 @@ GENERIC_VARIANT_WORDS = {
     "с",
     "со",
     "без",
+
+    #
+    # HTML-мусор после старых импортов.
+    #
+    "quot",
+    "amp",
+    "lt",
+    "gt",
+    "nbsp",
 }
+
+
+#
+# Категории могут отличаться между провайдерами.
+# Здесь только самые очевидные родственные группы.
+#
+CATEGORY_EQUIVALENCE_GROUPS = (
+    {
+        "молочная продукция",
+        "dairy",
+        "dairy products",
+        "milk products",
+    },
+    {
+        "напитки",
+        "beverages",
+        "drinks",
+    },
+    {
+        "чай",
+        "teas",
+        "tea",
+    },
+    {
+        "батончики",
+        "bars",
+        "chocolate bars",
+    },
+    {
+        "вода",
+        "drinking water",
+        "water",
+    },
+    {
+        "кетчуп",
+        "ketchup",
+    },
+)
 
 
 MAX_AUTO_SAFE_OUTPUT = 100
 MAX_REVIEW_OUTPUT = 100
+MAX_BARCODE_CONFLICT_OUTPUT = 100
 MAX_REJECT_OUTPUT = 30
 
 
@@ -278,11 +353,31 @@ def clean_text( value: object, ) -> str:
     )
 
 
-def comparable_text( value: object, ) -> str:
-    """ Нормализация, которая сохраняет: - проценты; - точки; - запятые. Это важно для: 2.5% 3.2% 1.35кг """
+def html_clean_text( value: object, ) -> str:
+    text = clean_text(
+        value
+    )
 
+    if not text:
+        return ""
+
+    text = html.unescape(
+        text
+    )
+
+    text = HTML_ENTITY_PATTERN.sub(
+        " ",
+        text,
+    )
+
+    return " ".join(
+        text.split()
+    )
+
+
+def comparable_text( value: object, ) -> str:
     return (
-        clean_text(
+        html_clean_text(
             value
         )
         .lower()
@@ -386,8 +481,6 @@ def extract_counts( value: str | None, ) -> tuple[str, ...]:
 
 
 def extract_name_packages( value: str | None, ) -> tuple[str, ...]:
-    """ Масса/объём прямо из названия. Примеры: 1.35кг -> 1.35:кг 300г -> 300:г """
-
     text = comparable_text(
         value
     )
@@ -425,7 +518,9 @@ def tokenize_brand( brand_name: str | None, ) -> set[str]:
         for token
         in WORD_PATTERN.findall(
             normalized(
-                brand_name
+                html_clean_text(
+                    brand_name
+                )
             )
         )
         if len(token) >= 3
@@ -433,10 +528,10 @@ def tokenize_brand( brand_name: str | None, ) -> set[str]:
 
 
 def variant_tokens( value: str | None, *, brand_name: str | None, ) -> set[str]:
-    """ Выделяет слова, которые могут отличать SKU. Примеры: финский индейкой armonioso intenso cremoso forte """
-
     text = normalized(
-        value
+        html_clean_text(
+            value
+        )
     )
 
     brand_tokens = tokenize_brand(
@@ -458,6 +553,27 @@ def variant_tokens( value: str | None, *, brand_name: str | None, ) -> set[str]:
             continue
 
         if token in GENERIC_VARIANT_WORDS:
+            continue
+
+        #
+        # Масса вроде 300г/135кг уже отдельно
+        # анализируется как package и не должна
+        # считаться вариантом SKU.
+        #
+        if re.fullmatch(
+            r"\d+(?:\d+)?"
+            r"(?:г|гр|кг|мл|л)",
+            token,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        if re.fullmatch(
+            r"\d+(?:[.,]\d+)?"
+            r"(?:г|гр|кг|мл|л)",
+            token,
+            flags=re.IGNORECASE,
+        ):
             continue
 
         result.add(
@@ -483,182 +599,138 @@ def values_conflict( left_values: Iterable[str], right_values: Iterable[str], ) 
     )
 
 
-def calculate_possible_pairs( size: int, ) -> int:
-    if size < 2:
-        return 0
-
-    return (
-        size
-        * (
-            size - 1
+def category_group( value: str | None, ) -> str:
+    key = normalized(
+        html_clean_text(
+            value
         )
-        // 2
+    )
+
+    if not key:
+        return ""
+
+    for index, group in enumerate(
+        CATEGORY_EQUIVALENCE_GROUPS,
+        start=1,
+    ):
+        normalized_group = {
+            normalized(
+                item
+            )
+            for item in group
+        }
+
+        if key in normalized_group:
+            return (
+                f"equiv:{index}"
+            )
+
+    return key
+
+
+def categories_compatible( left: ProductMeta, right: ProductMeta, ) -> bool:
+    if (
+        left.category.id
+        == right.category.id
+    ):
+        return True
+
+    left_group = category_group(
+        left.category.name
+    )
+
+    right_group = category_group(
+        right.category.name
+    )
+
+    if (
+        left_group
+        and right_group
+        and left_group
+        == right_group
+    ):
+        return True
+
+    #
+    # Если категории различаются, но одна из них
+    # слишком общая — не режем пару слишком рано.
+    #
+    if is_generic_category(
+        left.category.name
+    ):
+        return True
+
+    if is_generic_category(
+        right.category.name
+    ):
+        return True
+
+    return False
+
+
+def brands_compatible( left: ProductMeta, right: ProductMeta, ) -> bool:
+    if (
+        left.brand.id
+        == right.brand.id
+    ):
+        return True
+
+    if (
+        left.normalized_brand
+        and right.normalized_brand
+        and left.normalized_brand
+        == right.normalized_brand
+    ):
+        return True
+
+    #
+    # Неизвестный бренд не является конфликтом.
+    #
+    if is_unknown_brand(
+        left.brand.name
+    ):
+        return True
+
+    if is_unknown_brand(
+        right.brand.name
+    ):
+        return True
+
+    return False
+
+
+def common_token_count( left: ProductMeta, right: ProductMeta, ) -> int:
+    return len(
+        left.searchable_tokens
+        & right.searchable_tokens
     )
 
 
-def coarse_pair_key( left_id: int, right_id: int, ) -> tuple[int, int]:
-    return (
-        min(
-            left_id,
-            right_id,
-        ),
-        max(
-            left_id,
-            right_id,
-        ),
-    )
+def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
+    left_product = left.product
+    right_product = right.product
 
-
-def generate_coarse_pairs( group: list[ProductMeta], ) -> set[
-    tuple[int, int]
-]:
-    """ SIEVE 0. Самое крупное сито. Вместо полного O(n²) сравнения всех товаров внутри brand+category строим инвертированный индекс по identity-токенам. Пара становится кандидатом, если: - есть хотя бы один общий identity-токен; ИЛИ - normalized_name полностью одинаков; ИЛИ - barcode одинаковый. Это резко сокращает число пар до глубокого анализа. """
-
-    pairs: set[
-        tuple[int, int]
-    ] = set()
-
-    token_index: dict[
-        str,
-        list[int],
-    ] = defaultdict(
-        list
-    )
-
-    exact_name_index: dict[
-        str,
-        list[int],
-    ] = defaultdict(
-        list
-    )
-
-    barcode_index: dict[
-        str,
-        list[int],
-    ] = defaultdict(
-        list
-    )
-
-    by_id: dict[
-        int,
-        ProductMeta,
-    ] = {}
-
-    for item in group:
-        product = item.product
-
-        by_id[
-            product.id
-        ] = item
-
-        for token in item.identity_tokens:
-            token_index[
-                token
-            ].append(
-                product.id
-            )
-
-        exact_name = normalized(
-            product.name
-        )
-
-        if exact_name:
-            exact_name_index[
-                exact_name
-            ].append(
-                product.id
-            )
-
-        barcode = normalize_barcode(
-            product.barcode
-        )
-
-        if barcode:
-            barcode_index[
-                barcode
-            ].append(
-                product.id
-            )
-
-    for ids in token_index.values():
-        if len(ids) < 2:
-            continue
-
-        for (
-            left_id,
-            right_id,
-        ) in combinations(
-            ids,
-            2,
-        ):
-            pairs.add(
-                coarse_pair_key(
-                    left_id,
-                    right_id,
-                )
-            )
-
-    for ids in exact_name_index.values():
-        if len(ids) < 2:
-            continue
-
-        for (
-            left_id,
-            right_id,
-        ) in combinations(
-            ids,
-            2,
-        ):
-            pairs.add(
-                coarse_pair_key(
-                    left_id,
-                    right_id,
-                )
-            )
-
-    for ids in barcode_index.values():
-        if len(ids) < 2:
-            continue
-
-        for (
-            left_id,
-            right_id,
-        ) in combinations(
-            ids,
-            2,
-        ):
-            pairs.add(
-                coarse_pair_key(
-                    left_id,
-                    right_id,
-                )
-            )
-
-    return pairs
-
-
-def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> PairEvidence:
     left_barcode = normalize_barcode(
-        left.barcode
+        left_product.barcode
     )
 
     right_barcode = normalize_barcode(
-        right.barcode
+        right_product.barcode
     )
 
     package_compatibility = (
         package_values_compatible(
             current_value=(
-                left.package_value
+                left_product.package_value
             ),
             current_unit=(
-                left.package_unit
+                left_product.package_unit
             ),
             incoming_value=(
-                right.package_value
+                right_product.package_value
             ),
             incoming_unit=(
-                right.package_unit
+                right_product.package_unit
             ),
         )
     )
@@ -668,57 +740,80 @@ def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> Pair
         jaccard,
         common_count,
     ) = identity_name_similarity(
-        left.name,
-        right.name,
+        left_product.name,
+        right_product.name,
     )
 
     left_percentages = extract_percentages(
-        left.name
+        left_product.name
     )
 
     right_percentages = extract_percentages(
-        right.name
+        right_product.name
     )
 
     left_counts = extract_counts(
-        left.name
+        left_product.name
     )
 
     right_counts = extract_counts(
-        right.name
+        right_product.name
     )
 
-    left_name_packages = extract_name_packages(
-        left.name
+    left_name_packages = (
+        extract_name_packages(
+            left_product.name
+        )
     )
 
-    right_name_packages = extract_name_packages(
-        right.name
+    right_name_packages = (
+        extract_name_packages(
+            right_product.name
+        )
     )
 
     left_variants = variant_tokens(
-        left.name,
-        brand_name=brand_name,
+        left_product.name,
+        brand_name=left.brand.name,
     )
 
     right_variants = variant_tokens(
-        right.name,
-        brand_name=brand_name,
+        right_product.name,
+        brand_name=right.brand.name,
     )
 
     hard_conflicts: list[str] = []
     soft_differences: list[str] = []
 
-    #
-    # SIEVE 2 — жёсткие SKU-конфликты.
-    #
+    if not brands_compatible(
+        left,
+        right,
+    ):
+        hard_conflicts.append(
+            "different_brand:"
+            f"{left.brand.name}"
+            "!="
+            f"{right.brand.name}"
+        )
+
+    if not categories_compatible(
+        left,
+        right,
+    ):
+        soft_differences.append(
+            "different_category:"
+            f"{left.category.name}"
+            "|"
+            f"{right.category.name}"
+        )
+
     if (
         left_barcode
         and right_barcode
         and left_barcode
         != right_barcode
     ):
-        hard_conflicts.append(
+        soft_differences.append(
             "different_barcode:"
             f"{left_barcode}"
             "!="
@@ -728,9 +823,9 @@ def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> Pair
     if package_compatibility is False:
         hard_conflicts.append(
             "different_package:"
-            f"{package_text(left)}"
+            f"{package_text(left_product)}"
             "!="
-            f"{package_text(right)}"
+            f"{package_text(right_product)}"
         )
 
     if values_conflict(
@@ -766,44 +861,41 @@ def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> Pair
             f"{right_name_packages}"
         )
 
-    #
-    # SIEVE 5 — вариантные SKU-токены.
-    #
     common_variants = (
         left_variants
         & right_variants
     )
 
-    left_only_variants = (
+    left_only = (
         left_variants
         - common_variants
     )
 
-    right_only_variants = (
+    right_only = (
         right_variants
         - common_variants
     )
 
     if (
-        left_only_variants
-        and right_only_variants
+        left_only
+        and right_only
     ):
         hard_conflicts.append(
             "different_variant_tokens:"
-            f"{tuple(sorted(left_only_variants))}"
+            f"{tuple(sorted(left_only))}"
             "!="
-            f"{tuple(sorted(right_only_variants))}"
+            f"{tuple(sorted(right_only))}"
         )
 
     elif (
-        left_only_variants
-        or right_only_variants
+        left_only
+        or right_only
     ):
         soft_differences.append(
             "one_sided_variant_tokens:"
-            f"{tuple(sorted(left_only_variants))}"
+            f"{tuple(sorted(left_only))}"
             "|"
-            f"{tuple(sorted(right_only_variants))}"
+            f"{tuple(sorted(right_only))}"
         )
 
     if bool(left_barcode) != bool(right_barcode):
@@ -813,13 +905,15 @@ def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> Pair
 
     if package_compatibility is None:
         left_has_package = bool(
-            left.package_value is not None
-            and left.package_unit
+            left_product.package_value
+            is not None
+            and left_product.package_unit
         )
 
         right_has_package = bool(
-            right.package_value is not None
-            and right.package_unit
+            right_product.package_value
+            is not None
+            and right_product.package_unit
         )
 
         if (
@@ -831,6 +925,14 @@ def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> Pair
             )
 
     return PairEvidence(
+        same_brand=brands_compatible(
+            left,
+            right,
+        ),
+        same_category=categories_compatible(
+            left,
+            right,
+        ),
         left_barcode=left_barcode,
         right_barcode=right_barcode,
         package_compatible=(
@@ -872,63 +974,31 @@ def build_evidence( *, left: Product, right: Product, brand_name: str, ) -> Pair
     )
 
 
-def hard_conflict_reason( evidence: PairEvidence, ) -> str:
-    for conflict in evidence.hard_conflicts:
-        if conflict.startswith(
-            "different_barcode:"
-        ):
-            return "different_barcode"
-
-        if conflict.startswith(
-            "different_package:"
-        ):
-            return "different_package"
-
-        if conflict.startswith(
-            "different_percentage:"
-        ):
-            return "different_percentage"
-
-        if conflict.startswith(
-            "different_count:"
-        ):
-            return "different_count"
-
-        if conflict.startswith(
-            "different_name_package:"
-        ):
-            return "different_name_package"
-
-        if conflict.startswith(
-            "different_variant_tokens:"
-        ):
-            return "different_variant_tokens"
-
-    return "hard_identity_conflict"
-
-
-def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -> tuple[
+def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvidence, ) -> tuple[
     CandidateClass,
     str,
     float,
 ]:
-    """ SIEVE 6 — финальный уровень. До сюда доходят только пары, которые пережили все более крупные фильтры. """
+    left_product = left.product
+    right_product = right.product
 
     if evidence.hard_conflicts:
         return (
             CandidateClass.REJECT,
-            hard_conflict_reason(
-                evidence
-            ),
+            "hard_identity_conflict",
             0.0,
         )
 
-    same_normalized_name = (
+    same_name = (
         normalized(
-            left.name
+            html_clean_text(
+                left_product.name
+            )
         )
         == normalized(
-            right.name
+            html_clean_text(
+                right_product.name
+            )
         )
     )
 
@@ -939,16 +1009,68 @@ def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -
         == evidence.right_barcode
     )
 
+    different_known_barcodes = bool(
+        evidence.left_barcode
+        and evidence.right_barcode
+        and evidence.left_barcode
+        != evidence.right_barcode
+    )
+
     #
-    # Самое мелкое сито №1:
-    # одинаковый barcode.
+    # Отдельный класс:
+    # всё похоже, но barcode конфликтуют.
     #
+    if different_known_barcodes:
+        strong_identity = bool(
+            same_name
+            or (
+                evidence.common_count >= 2
+                and evidence.coverage >= 0.80
+                and evidence.jaccard >= 0.55
+            )
+        )
+
+        same_or_unknown_package = (
+            evidence.package_compatible
+            is not False
+        )
+
+        if (
+            strong_identity
+            and same_or_unknown_package
+        ):
+            score = (
+                70.0
+                + evidence.coverage * 10.0
+                + evidence.jaccard * 10.0
+            )
+
+            return (
+                CandidateClass.BARCODE_CONFLICT_REVIEW,
+                "strong_identity_but_different_barcode",
+                round(
+                    min(
+                        score,
+                        92.0,
+                    ),
+                    1,
+                ),
+            )
+
+        return (
+            CandidateClass.REJECT,
+            "different_barcode_and_weak_identity",
+            0.0,
+        )
+
     if same_barcode:
-        if evidence.soft_differences:
+        if (
+            evidence.package_compatible is False
+        ):
             return (
                 CandidateClass.REVIEW,
-                "same_barcode_but_card_data_differs",
-                98.0,
+                "same_barcode_but_package_conflict",
+                95.0,
             )
 
         return (
@@ -957,55 +1079,43 @@ def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -
             100.0,
         )
 
-    #
-    # Самое мелкое сито №2:
-    # точное имя + подтверждённая упаковка.
-    #
     if (
-        same_normalized_name
+        same_name
         and evidence.package_compatible is True
-        and not evidence.soft_differences
+        and evidence.same_brand
     ):
         return (
             CandidateClass.AUTO_SAFE,
-            "exact_name_and_package",
-            96.0,
+            "exact_name_brand_package",
+            97.0,
         )
 
-    #
-    # Самое мелкое сито №3:
-    # практически идентичное имя +
-    # одинаковая известная упаковка.
-    #
     if (
-        evidence.package_compatible is True
+        evidence.same_brand
+        and evidence.package_compatible is True
         and evidence.common_count >= 3
         and evidence.coverage >= 0.95
         and evidence.jaccard >= 0.80
         and not evidence.soft_differences
     ):
         score = (
-            85.0
-            + evidence.coverage * 5.0
-            + evidence.jaccard * 5.0
+            88.0
+            + evidence.coverage * 4.0
+            + evidence.jaccard * 4.0
         )
 
         return (
             CandidateClass.AUTO_SAFE,
-            "very_strong_name_and_package",
+            "very_strong_identity",
             round(
                 min(
                     score,
-                    95.0,
+                    96.0,
                 ),
                 1,
             ),
         )
 
-    #
-    # REVIEW:
-    # barcode есть только у одной карточки.
-    #
     one_barcode_only = (
         bool(
             evidence.left_barcode
@@ -1017,11 +1127,12 @@ def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -
 
     if (
         one_barcode_only
+        and evidence.same_brand
         and evidence.common_count >= 1
         and evidence.coverage >= 0.70
     ):
         score = (
-            60.0
+            62.0
             + evidence.coverage * 15.0
             + evidence.jaccard * 10.0
         )
@@ -1035,23 +1146,20 @@ def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -
             round(
                 min(
                     score,
-                    89.0,
+                    90.0,
                 ),
                 1,
             ),
         )
 
-    #
-    # REVIEW:
-    # сильное имя, но данных ещё мало.
-    #
     if (
-        evidence.common_count >= 2
+        evidence.same_brand
+        and evidence.common_count >= 2
         and evidence.coverage >= 0.80
         and evidence.jaccard >= 0.55
     ):
         score = (
-            55.0
+            58.0
             + evidence.coverage * 15.0
             + evidence.jaccard * 10.0
         )
@@ -1065,17 +1173,20 @@ def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -
             round(
                 min(
                     score,
-                    88.0,
+                    89.0,
                 ),
                 1,
             ),
         )
 
-    if same_normalized_name:
+    if (
+        same_name
+        and evidence.same_brand
+    ):
         return (
             CandidateClass.REVIEW,
             "exact_name_but_identity_incomplete",
-            75.0,
+            78.0,
         )
 
     return (
@@ -1085,6 +1196,222 @@ def classify_pair( *, left: Product, right: Product, evidence: PairEvidence, ) -
     )
 
 
+def pair_key( left_id: int, right_id: int, ) -> tuple[int, int]:
+    return (
+        min(
+            left_id,
+            right_id,
+        ),
+        max(
+            left_id,
+            right_id,
+        ),
+    )
+
+
+def build_coarse_pairs( rows: list[ProductMeta], stats: SieveStats, ) -> set[
+    tuple[int, int]
+]:
+    """ SIEVE 0. Строим широкие кандидаты тремя независимыми путями: 1. одинаковый barcode; 2. одинаковый normalized brand + общий identity token; 3. общий identity token + совместимый/неизвестный бренд. Это позволяет не потерять карточки из разных category_id и исторические дубли брендов. """
+
+    pairs: set[
+        tuple[int, int]
+    ] = set()
+
+    barcode_index: dict[
+        str,
+        list[int],
+    ] = defaultdict(
+        list
+    )
+
+    brand_index: dict[
+        str,
+        list[int],
+    ] = defaultdict(
+        list
+    )
+
+    token_index: dict[
+        str,
+        list[int],
+    ] = defaultdict(
+        list
+    )
+
+    by_id = {
+        item.product.id: item
+        for item in rows
+    }
+
+    for item in rows:
+        barcode = normalize_barcode(
+            item.product.barcode
+        )
+
+        if barcode:
+            barcode_index[
+                barcode
+            ].append(
+                item.product.id
+            )
+
+        if item.normalized_brand:
+            brand_index[
+                item.normalized_brand
+            ].append(
+                item.product.id
+            )
+
+        for token in item.identity_tokens:
+            token_index[
+                token
+            ].append(
+                item.product.id
+            )
+
+    stats.exact_barcode_groups = sum(
+        1
+        for ids in barcode_index.values()
+        if len(ids) >= 2
+    )
+
+    stats.normalized_brand_groups = sum(
+        1
+        for ids in brand_index.values()
+        if len(ids) >= 2
+    )
+
+    stats.token_blocks = sum(
+        1
+        for ids in token_index.values()
+        if len(ids) >= 2
+    )
+
+    #
+    # 1. SAME BARCODE.
+    #
+    for ids in barcode_index.values():
+        if len(ids) < 2:
+            continue
+
+        for (
+            left_id,
+            right_id,
+        ) in combinations(
+            ids,
+            2,
+        ):
+            pairs.add(
+                pair_key(
+                    left_id,
+                    right_id,
+                )
+            )
+
+    #
+    # 2. SAME NORMALIZED BRAND.
+    #
+    for ids in brand_index.values():
+        if len(ids) < 2:
+            continue
+
+        stats.possible_pairs_raw += (
+            len(ids)
+            * (
+                len(ids) - 1
+            )
+            // 2
+        )
+
+        token_to_ids: dict[
+            str,
+            list[int],
+        ] = defaultdict(
+            list
+        )
+
+        for product_id in ids:
+            item = by_id[
+                product_id
+            ]
+
+            for token in item.identity_tokens:
+                token_to_ids[
+                    token
+                ].append(
+                    product_id
+                )
+
+        for token_ids in token_to_ids.values():
+            if len(token_ids) < 2:
+                continue
+
+            for (
+                left_id,
+                right_id,
+            ) in combinations(
+                token_ids,
+                2,
+            ):
+                pairs.add(
+                    pair_key(
+                        left_id,
+                        right_id,
+                    )
+                )
+
+    #
+    # 3. TOKEN-FIRST FALLBACK.
+    #
+    # Нужен для исторических дублей брендов или
+    # карточек с неизвестным брендом.
+    #
+    for ids in token_index.values():
+        if len(ids) < 2:
+            continue
+
+        #
+        # Ограничиваем очень широкие токены.
+        # Если один токен встречается у сотен товаров,
+        # это уже слишком слабый блок.
+        #
+        if len(ids) > 80:
+            continue
+
+        for (
+            left_id,
+            right_id,
+        ) in combinations(
+            ids,
+            2,
+        ):
+            left = by_id[
+                left_id
+            ]
+
+            right = by_id[
+                right_id
+            ]
+
+            if brands_compatible(
+                left,
+                right,
+            ):
+                pairs.add(
+                    pair_key(
+                        left_id,
+                        right_id,
+                    )
+                )
+
+    stats.coarse_pairs_generated = len(
+        pairs
+    )
+
+    return pairs
+
+
 def make_candidate( *, classification: CandidateClass, reason: str, score: float, left: ProductMeta, right: ProductMeta, evidence: PairEvidence, ) -> DuplicateCandidate:
     return DuplicateCandidate(
         classification=classification,
@@ -1092,9 +1419,13 @@ def make_candidate( *, classification: CandidateClass, reason: str, score: float
         score=score,
         left_id=left.product.id,
         right_id=right.product.id,
-        brand_name=left.brand.name,
-        category_name=(
+        left_brand=left.brand.name,
+        right_brand=right.brand.name,
+        left_category=(
             left.category.name
+        ),
+        right_category=(
+            right.category.name
         ),
         left_name=left.product.name,
         right_name=right.product.name,
@@ -1124,8 +1455,12 @@ def make_candidate( *, classification: CandidateClass, reason: str, score: float
         right_percentages=(
             evidence.right_percentages
         ),
-        left_counts=evidence.left_counts,
-        right_counts=evidence.right_counts,
+        left_counts=(
+            evidence.left_counts
+        ),
+        right_counts=(
+            evidence.right_counts
+        ),
         left_name_packages=(
             evidence.left_name_packages
         ),
@@ -1167,13 +1502,17 @@ def print_candidate( *, index: int, item: DuplicateCandidate, ) -> None:
     )
 
     print(
-        "brand:",
-        item.brand_name,
+        "brands:",
+        item.left_brand,
+        "|",
+        item.right_brand,
     )
 
     print(
-        "category:",
-        item.category_name,
+        "categories:",
+        item.left_category,
+        "|",
+        item.right_category,
     )
 
     print(
@@ -1335,7 +1674,9 @@ async def load_product_meta() -> list[
             )
         )
 
-        rows = []
+        items: list[
+            ProductMeta
+        ] = []
 
         for (
             product,
@@ -1343,7 +1684,28 @@ async def load_product_meta() -> list[
             category,
             source_count,
         ) in result.all():
-            rows.append(
+            cleaned_name = html_clean_text(
+                product.name
+            )
+
+            identity_tokens = frozenset(
+                identity_name_tokens(
+                    cleaned_name
+                )
+            )
+
+            searchable_tokens = frozenset(
+                token
+                for token
+                in WORD_PATTERN.findall(
+                    normalized(
+                        cleaned_name
+                    )
+                )
+                if len(token) >= 3
+            )
+
+            items.append(
                 ProductMeta(
                     product=product,
                     brand=brand,
@@ -1352,40 +1714,30 @@ async def load_product_meta() -> list[
                         source_count
                         or 0
                     ),
-                    identity_tokens=frozenset(
-                        identity_name_tokens(
-                            product.name
+                    normalized_brand=(
+                        normalized(
+                            html_clean_text(
+                                brand.name
+                            )
                         )
+                    ),
+                    normalized_category=(
+                        normalized(
+                            html_clean_text(
+                                category.name
+                            )
+                        )
+                    ),
+                    identity_tokens=(
+                        identity_tokens
+                    ),
+                    searchable_tokens=(
+                        searchable_tokens
                     ),
                 )
             )
 
-        return rows
-
-
-def update_reject_stats( *, reason: str, stats: SieveStats, ) -> None:
-    stats.reject += 1
-
-    if reason == "different_barcode":
-        stats.rejected_different_barcode += 1
-
-    elif reason == "different_package":
-        stats.rejected_package_conflict += 1
-
-    elif reason == "different_percentage":
-        stats.rejected_percentage_conflict += 1
-
-    elif reason == "different_count":
-        stats.rejected_count_conflict += 1
-
-    elif reason == "different_name_package":
-        stats.rejected_name_package_conflict += 1
-
-    elif reason == "different_variant_tokens":
-        stats.rejected_variant_conflict += 1
-
-    else:
-        stats.rejected_weak_identity += 1
+        return items
 
 
 def print_sieve_stats( stats: SieveStats, ) -> None:
@@ -1406,13 +1758,23 @@ def print_sieve_stats( stats: SieveStats, ) -> None:
     )
 
     print(
-        "Brand+category groups:",
-        stats.brand_category_groups,
+        "Exact barcode groups:",
+        stats.exact_barcode_groups,
     )
 
     print(
-        "Possible pairs inside groups:",
-        stats.possible_pairs_inside_groups,
+        "Normalized brand groups:",
+        stats.normalized_brand_groups,
+    )
+
+    print(
+        "Identity token blocks:",
+        stats.token_blocks,
+    )
+
+    print(
+        "Raw same-brand possible pairs:",
+        stats.possible_pairs_raw,
     )
 
     print(
@@ -1421,53 +1783,23 @@ def print_sieve_stats( stats: SieveStats, ) -> None:
     )
 
     print(
-        "SIEVE 2 - rejected different barcode:",
-        stats.rejected_different_barcode,
+        "SIEVE 1 - passed brand compatibility:",
+        stats.passed_brand_sieve,
     )
 
     print(
-        "SIEVE 3 - rejected package conflict:",
-        stats.rejected_package_conflict,
+        "SIEVE 2 - passed category compatibility:",
+        stats.passed_category_sieve,
     )
 
     print(
-        "SIEVE 3 - rejected percentage conflict:",
-        stats.rejected_percentage_conflict,
+        "SIEVE 3 - passed structural conflicts:",
+        stats.passed_structure_sieve,
     )
 
     print(
-        "SIEVE 3 - rejected count conflict:",
-        stats.rejected_count_conflict,
-    )
-
-    print(
-        "SIEVE 3 - rejected name-package conflict:",
-        stats.rejected_name_package_conflict,
-    )
-
-    print(
-        "Passed hard-identity sieve:",
-        stats.passed_hard_sieve,
-    )
-
-    print(
-        "Passed name-similarity sieve:",
+        "SIEVE 4 - passed name similarity:",
         stats.passed_name_sieve,
-    )
-
-    print(
-        "SIEVE 5 - rejected variant conflict:",
-        stats.rejected_variant_conflict,
-    )
-
-    print(
-        "Passed variant sieve:",
-        stats.passed_variant_sieve,
-    )
-
-    print(
-        "Rejected weak identity:",
-        stats.rejected_weak_identity,
     )
 
     print(
@@ -1478,6 +1810,11 @@ def print_sieve_stats( stats: SieveStats, ) -> None:
     print(
         "REVIEW:",
         stats.review,
+    )
+
+    print(
+        "BARCODE_CONFLICT_REVIEW:",
+        stats.barcode_conflict_review,
     )
 
     print(
@@ -1492,7 +1829,7 @@ async def main() -> None:
     )
 
     print(
-        "MarkaRadar Duplicate Scanner v5"
+        "MarkaRadar Duplicate Scanner v6"
     )
 
     print(
@@ -1519,35 +1856,14 @@ async def main() -> None:
         )
     )
 
-    by_brand_category: dict[
-        tuple[int, int],
-        list[ProductMeta],
-    ] = defaultdict(
-        list
-    )
+    by_id = {
+        item.product.id: item
+        for item in rows
+    }
 
-    for item in rows:
-        if is_unknown_brand(
-            item.brand.name
-        ):
-            continue
-
-        if is_generic_category(
-            item.category.name
-        ):
-            continue
-
-        by_brand_category[
-            (
-                item.brand.id,
-                item.category.id,
-            )
-        ].append(
-            item
-        )
-
-    stats.brand_category_groups = len(
-        by_brand_category
+    coarse_pairs = build_coarse_pairs(
+        rows,
+        stats,
     )
 
     auto_safe: dict[
@@ -1560,6 +1876,11 @@ async def main() -> None:
         DuplicateCandidate,
     ] = {}
 
+    barcode_conflict_review: dict[
+        tuple[int, int],
+        DuplicateCandidate,
+    ] = {}
+
     reject_examples: dict[
         tuple[int, int],
         DuplicateCandidate,
@@ -1567,196 +1888,73 @@ async def main() -> None:
 
     reject_reason_counts: Counter[str] = Counter()
 
-    for group in by_brand_category.values():
-        group_size = len(
-            group
-        )
+    for (
+        left_id,
+        right_id,
+    ) in coarse_pairs:
+        left = by_id[
+            left_id
+        ]
 
-        if group_size < 2:
+        right = by_id[
+            right_id
+        ]
+
+        #
+        # SIEVE 1 — бренд.
+        #
+        if not brands_compatible(
+            left,
+            right,
+        ):
+            stats.reject += 1
+
+            reject_reason_counts[
+                "different_brand"
+            ] += 1
+
             continue
 
-        stats.possible_pairs_inside_groups += (
-            calculate_possible_pairs(
-                group_size
+        stats.passed_brand_sieve += 1
+
+        #
+        # SIEVE 2 — категория.
+        #
+        category_ok = categories_compatible(
+            left,
+            right,
+        )
+
+        if category_ok:
+            stats.passed_category_sieve += 1
+
+        #
+        # SIEVE 3 — структура SKU.
+        #
+        evidence = build_evidence(
+            left=left,
+            right=right,
+        )
+
+        structural_hard_conflicts = tuple(
+            conflict
+            for conflict
+            in evidence.hard_conflicts
+            if not conflict.startswith(
+                "different_brand:"
             )
         )
 
-        by_id = {
-            item.product.id: item
-            for item in group
-        }
-
-        coarse_pairs = generate_coarse_pairs(
-            group
-        )
-
-        stats.coarse_pairs_generated += len(
-            coarse_pairs
-        )
-
-        for (
-            left_id,
-            right_id,
-        ) in coarse_pairs:
-            left = by_id[
-                left_id
-            ]
-
-            right = by_id[
-                right_id
-            ]
-
-            evidence = build_evidence(
-                left=left.product,
-                right=right.product,
-                brand_name=left.brand.name,
+        if structural_hard_conflicts:
+            classification = (
+                CandidateClass.REJECT
             )
 
-            #
-            # SIEVE 2 + SIEVE 3:
-            # жёсткие identity / package признаки.
-            #
-            if evidence.hard_conflicts:
-                (
-                    classification,
-                    reason,
-                    score,
-                ) = classify_pair(
-                    left=left.product,
-                    right=right.product,
-                    evidence=evidence,
-                )
-
-                candidate = make_candidate(
-                    classification=classification,
-                    reason=reason,
-                    score=score,
-                    left=left,
-                    right=right,
-                    evidence=evidence,
-                )
-
-                key = coarse_pair_key(
-                    left_id,
-                    right_id,
-                )
-
-                reject_reason_counts[
-                    reason
-                ] += 1
-
-                update_reject_stats(
-                    reason=reason,
-                    stats=stats,
-                )
-
-                if (
-                    len(
-                        reject_examples
-                    )
-                    < MAX_REJECT_OUTPUT
-                ):
-                    reject_examples[
-                        key
-                    ] = candidate
-
-                continue
-
-            stats.passed_hard_sieve += 1
-
-            #
-            # SIEVE 4:
-            # грубая похожесть имени.
-            #
-            same_name = (
-                normalized(
-                    left.product.name
-                )
-                == normalized(
-                    right.product.name
-                )
+            reason = (
+                "hard_identity_conflict"
             )
 
-            one_barcode_only = (
-                bool(
-                    evidence.left_barcode
-                )
-                != bool(
-                    evidence.right_barcode
-                )
-            )
-
-            name_related = bool(
-                same_name
-                or evidence.common_count >= 2
-                or (
-                    one_barcode_only
-                    and evidence.common_count >= 1
-                    and evidence.coverage >= 0.70
-                )
-            )
-
-            if not name_related:
-                classification = (
-                    CandidateClass.REJECT
-                )
-
-                reason = (
-                    "insufficient_identity_evidence"
-                )
-
-                score = 0.0
-
-                candidate = make_candidate(
-                    classification=classification,
-                    reason=reason,
-                    score=score,
-                    left=left,
-                    right=right,
-                    evidence=evidence,
-                )
-
-                key = coarse_pair_key(
-                    left_id,
-                    right_id,
-                )
-
-                reject_reason_counts[
-                    reason
-                ] += 1
-
-                update_reject_stats(
-                    reason=reason,
-                    stats=stats,
-                )
-
-                if (
-                    len(
-                        reject_examples
-                    )
-                    < MAX_REJECT_OUTPUT
-                ):
-                    reject_examples[
-                        key
-                    ] = candidate
-
-                continue
-
-            stats.passed_name_sieve += 1
-
-            #
-            # SIEVE 5 + SIEVE 6:
-            # variant-токены + финальная классификация.
-            #
-            (
-                classification,
-                reason,
-                score,
-            ) = classify_pair(
-                left=left.product,
-                right=right.product,
-                evidence=evidence,
-            )
+            score = 0.0
 
             candidate = make_candidate(
                 classification=classification,
@@ -1767,52 +1965,180 @@ async def main() -> None:
                 evidence=evidence,
             )
 
-            key = coarse_pair_key(
-                left_id,
-                right_id,
-            )
+            stats.reject += 1
+
+            reject_reason_counts[
+                reason
+            ] += 1
 
             if (
-                classification
-                == CandidateClass.AUTO_SAFE
-            ):
-                stats.passed_variant_sieve += 1
-                stats.auto_safe += 1
-
-                auto_safe[
-                    key
-                ] = candidate
-
-            elif (
-                classification
-                == CandidateClass.REVIEW
-            ):
-                stats.passed_variant_sieve += 1
-                stats.review += 1
-
-                review[
-                    key
-                ] = candidate
-
-            else:
-                reject_reason_counts[
-                    reason
-                ] += 1
-
-                update_reject_stats(
-                    reason=reason,
-                    stats=stats,
+                len(
+                    reject_examples
                 )
-
-                if (
-                    len(
-                        reject_examples
+                < MAX_REJECT_OUTPUT
+            ):
+                reject_examples[
+                    pair_key(
+                        left_id,
+                        right_id,
                     )
-                    < MAX_REJECT_OUTPUT
-                ):
-                    reject_examples[
-                        key
-                    ] = candidate
+                ] = candidate
+
+            continue
+
+        stats.passed_structure_sieve += 1
+
+        #
+        # SIEVE 4 — имя.
+        #
+        same_name = (
+            normalized(
+                html_clean_text(
+                    left.product.name
+                )
+            )
+            == normalized(
+                html_clean_text(
+                    right.product.name
+                )
+            )
+        )
+
+        one_barcode_only = (
+            bool(
+                evidence.left_barcode
+            )
+            != bool(
+                evidence.right_barcode
+            )
+        )
+
+        name_related = bool(
+            same_name
+            or evidence.common_count >= 2
+            or (
+                one_barcode_only
+                and evidence.common_count >= 1
+                and evidence.coverage >= 0.70
+            )
+        )
+
+        if not name_related:
+            classification = (
+                CandidateClass.REJECT
+            )
+
+            reason = (
+                "insufficient_identity_evidence"
+            )
+
+            score = 0.0
+
+            candidate = make_candidate(
+                classification=classification,
+                reason=reason,
+                score=score,
+                left=left,
+                right=right,
+                evidence=evidence,
+            )
+
+            stats.reject += 1
+
+            reject_reason_counts[
+                reason
+            ] += 1
+
+            if (
+                len(
+                    reject_examples
+                )
+                < MAX_REJECT_OUTPUT
+            ):
+                reject_examples[
+                    pair_key(
+                        left_id,
+                        right_id,
+                    )
+                ] = candidate
+
+            continue
+
+        stats.passed_name_sieve += 1
+
+        #
+        # SIEVE 5/6 — финальная классификация.
+        #
+        (
+            classification,
+            reason,
+            score,
+        ) = classify_pair(
+            left=left,
+            right=right,
+            evidence=evidence,
+        )
+
+        candidate = make_candidate(
+            classification=classification,
+            reason=reason,
+            score=score,
+            left=left,
+            right=right,
+            evidence=evidence,
+        )
+
+        key = pair_key(
+            left_id,
+            right_id,
+        )
+
+        if (
+            classification
+            == CandidateClass.AUTO_SAFE
+        ):
+            stats.auto_safe += 1
+
+            auto_safe[
+                key
+            ] = candidate
+
+        elif (
+            classification
+            == CandidateClass.REVIEW
+        ):
+            stats.review += 1
+
+            review[
+                key
+            ] = candidate
+
+        elif (
+            classification
+            == CandidateClass.BARCODE_CONFLICT_REVIEW
+        ):
+            stats.barcode_conflict_review += 1
+
+            barcode_conflict_review[
+                key
+            ] = candidate
+
+        else:
+            stats.reject += 1
+
+            reject_reason_counts[
+                reason
+            ] += 1
+
+            if (
+                len(
+                    reject_examples
+                )
+                < MAX_REJECT_OUTPUT
+            ):
+                reject_examples[
+                    key
+                ] = candidate
 
     ordered_auto_safe = sorted(
         auto_safe.values(),
@@ -1825,6 +2151,15 @@ async def main() -> None:
 
     ordered_review = sorted(
         review.values(),
+        key=lambda item: (
+            item.score,
+            item.common_count,
+        ),
+        reverse=True,
+    )
+
+    ordered_barcode_conflict = sorted(
+        barcode_conflict_review.values(),
         key=lambda item: (
             item.score,
             item.common_count,
@@ -1910,6 +2245,33 @@ async def main() -> None:
     for index, item in enumerate(
         ordered_review[
             :MAX_REVIEW_OUTPUT
+        ],
+        start=1,
+    ):
+        print_candidate(
+            index=index,
+            item=item,
+        )
+
+    print()
+    print(
+        "=" * 80
+    )
+    print(
+        "BARCODE CONFLICT REVIEW"
+    )
+    print(
+        "=" * 80
+    )
+
+    if not ordered_barcode_conflict:
+        print(
+            "none"
+        )
+
+    for index, item in enumerate(
+        ordered_barcode_conflict[
+            :MAX_BARCODE_CONFLICT_OUTPUT
         ],
         start=1,
     ):
