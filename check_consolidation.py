@@ -17,8 +17,8 @@ logging.basicConfig(
 
 
 async def main() -> None:
-    canonical_product_id = 31661
-    duplicate_product_id = 25659
+    canonical_product_id = 25659
+    duplicate_product_id = 31661
 
     print("=" * 70)
     print("MarkaRadar Product Consolidation — DRY RUN")
