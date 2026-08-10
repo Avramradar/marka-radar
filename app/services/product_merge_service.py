@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models.brand import Brand
 from app.database.models.category import Category
 from app.database.models.product import Product
+from app.database.models.product_source import ProductSource
 from app.utils.text import normalize_text
 
 
@@ -131,6 +132,7 @@ NAME_MATCH_STOPWORDS = {
 
 
 class ProductMatchType(StrEnum):
+    SOURCE_LINK = "source_link"
     BARCODE = "barcode"
     BRAND_AND_NAME = "brand_and_name"
     BRAND_AND_SIMILAR_NAME = "brand_and_similar_name"
@@ -142,6 +144,12 @@ class ProductMatchType(StrEnum):
 class ExternalProductData:
     source: str
     name: str
+
+    # Постоянная идентичность внешней карточки.
+    # Если provider уже был связан с Product,
+    # этот ключ сильнее barcode/name fuzzy-match.
+    source_id: str | None = None
+    source_url: str | None = None
 
     brand_name: str | None = None
     barcode: str | None = None
@@ -1082,6 +1090,63 @@ async def get_category_by_id( *, session: AsyncSession, category_id: int | None,
     return result.scalar_one_or_none()
 
 
+async def find_product_by_source( *, session: AsyncSession, source: str | None, source_id: str | None, ) -> Product | None:
+    """ Самое устойчивое сопоставление после того, как внешний товар уже однажды был привязан: provider + source_id -> product_id Такая связь важнее повторного fuzzy-match, потому что внешний каталог может немного менять название, описание или URL товара. """
+
+    cleaned_source = clean_text(
+        source
+    )
+
+    cleaned_source_id = clean_text(
+        source_id
+    )
+
+    if (
+        not cleaned_source
+        or not cleaned_source_id
+    ):
+        return None
+
+    result = await session.execute(
+        select(
+            Product
+        )
+        .join(
+            ProductSource,
+            ProductSource.product_id
+            == Product.id,
+        )
+        .where(
+            ProductSource.provider
+            == cleaned_source,
+            ProductSource.source_id
+            == cleaned_source_id,
+            Product.is_active.is_(
+                True
+            ),
+        )
+        .limit(
+            1
+        )
+    )
+
+    product = (
+        result.scalar_one_or_none()
+    )
+
+    if product is not None:
+        logger.info(
+            "Product source match: "
+            "provider=%s source_id=%s "
+            "product_id=%s",
+            cleaned_source,
+            cleaned_source_id,
+            product.id,
+        )
+
+    return product
+
+
 async def find_product_by_barcode( *, session: AsyncSession, barcode: str | None, ) -> Product | None:
     normalized_barcode = normalize_barcode(
         barcode
@@ -1526,7 +1591,21 @@ async def find_matching_product( *, session: AsyncSession, incoming: ExternalPro
     Product | None,
     ProductMatchType | None,
 ]:
-    """ Приоритет сопоставления: 1. точный barcode; 2. точный brand + name; 3. безопасный brand + similar name; 4. безопасное точное имя; 5. создание нового Product. Fuzzy-match намеренно стоит ПОСЛЕ barcode и точного brand+name. """
+    """ Приоритет сопоставления: 1. постоянная связь provider + source_id; 2. точный barcode; 3. точный brand + name; 4. безопасный brand + similar name; 5. безопасное точное имя; 6. создание нового Product. ProductSource — самый сильный повторный идентификатор уже известной внешней карточки. Fuzzy-match намеренно стоит только после source-link, barcode и точного brand+name. """
+
+    source_match = (
+        await find_product_by_source(
+            session=session,
+            source=incoming.source,
+            source_id=incoming.source_id,
+        )
+    )
+
+    if source_match is not None:
+        return (
+            source_match,
+            ProductMatchType.SOURCE_LINK,
+        )
 
     barcode_match = (
         await find_product_by_barcode(
