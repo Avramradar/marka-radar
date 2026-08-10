@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
 from collections import Counter
 from collections import defaultdict
+from dataclasses import asdict
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timezone
 from decimal import Decimal
 from enum import StrEnum
 from itertools import combinations
+from pathlib import Path
 from typing import Iterable
 
 from sqlalchemy import func
@@ -31,26 +36,42 @@ from app.services.product_merge_service import (
 
 
 #
-# MarkaRadar Duplicate Scanner v10
+# MarkaRadar Duplicate Scanner v11
 #
-# Изменения относительно v9:
+# Изменения относительно v10:
 #
-# 1. Убран большой вывод REJECT EXAMPLES.
-# REJECT остаются в статистике, но больше не забивают лог.
+# 1. Unicode-safe токенизация SKU-вариантов.
+# Теперь не теряются буквы вроде:
+# õ, ä, ö, ü, é, ñ и т.д.
 #
-# 2. В самом КОНЦЕ всегда печатается короткий FINAL SUMMARY.
-# Его удобно копировать из GitHub Actions без прокрутки вверх.
+# Пример:
+# "Sense cat Adult kana"
+# "Sense cat Adult kana+lõhe"
 #
-# 3. В FINAL SUMMARY выводятся:
-# - количество товаров;
-# - число coarse pairs;
-# - AUTO_SAFE / REVIEW / BARCODE_CONFLICT_REVIEW / REJECT;
-# - TOP ID-пары каждого полезного класса;
-# - подтверждение, что БД не изменялась.
+# В v10 "lõhe" мог потеряться.
+# В v11 он становится отдельным значимым variant-token,
+# поэтому при разных barcode такая пара будет REJECT.
 #
-# 4. Логика классификации v9 сохранена.
+# 2. Все полезные кандидаты сохраняются в машинный JSON:
 #
-# 5. AUTO MERGE по-прежнему НЕ выполняется.
+# duplicate_candidates.json
+#
+# В файл попадают:
+# AUTO_SAFE
+# REVIEW
+# BARCODE_CONFLICT_REVIEW
+#
+# REJECT туда не пишутся.
+#
+# 3. JSON создаётся специально для следующего этапа:
+# verify_duplicate_candidates.py v3 сможет автоматически
+# взять ВСЕ кандидаты, без ручного списка ID.
+#
+# 4. В конце GitHub Actions по-прежнему печатается
+# короткий FINAL SUMMARY.
+#
+# 5. База данных НЕ изменяется.
+# AUTO MERGE НЕ выполняется.
 #
 
 
@@ -202,9 +223,16 @@ PACKAGE_IN_NAME_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
-WORD_PATTERN = re.compile(
-    r"[a-zа-я0-9]+",
-    flags=re.IGNORECASE,
+#
+# Unicode-safe word tokenizer:
+# [^\W_] = любой Unicode word-char, кроме "_".
+#
+# В отличие от [a-zа-я0-9], сохраняет:
+# õ, ä, ö, ü, é, ñ и другие буквы.
+#
+UNICODE_WORD_PATTERN = re.compile(
+    r"[^\W_]+",
+    flags=re.UNICODE,
 )
 
 PACKAGE_TOKEN_PATTERN = re.compile(
@@ -341,6 +369,10 @@ MAX_REVIEW_OUTPUT = 50
 MAX_BARCODE_CONFLICT_OUTPUT = 50
 FINAL_TOP_IDS = 20
 
+CANDIDATE_JSON_PATH = Path(
+    "duplicate_candidates.json"
+)
+
 
 def clean_text( value: object, ) -> str:
     if value is None:
@@ -374,7 +406,7 @@ def comparable_text( value: object, ) -> str:
         html_clean_text(
             value
         )
-        .lower()
+        .casefold()
         .replace(
             "ё",
             "е",
@@ -452,7 +484,7 @@ def extract_counts( value: str | None, ) -> tuple[str, ...]:
     ):
         values.add(
             f"{match.group(1)}:"
-            f"{match.group(2).lower().replace('ё', 'е')}"
+            f"{match.group(2).casefold().replace('ё', 'е')}"
         )
 
     return tuple(
@@ -491,36 +523,49 @@ def extract_name_packages( value: str | None, ) -> tuple[str, ...]:
     )
 
 
+def unicode_tokens( value: str | None, ) -> list[str]:
+    text = comparable_text(
+        value
+    )
+
+    return [
+        token
+        for token
+        in UNICODE_WORD_PATTERN.findall(
+            text
+        )
+        if token
+    ]
+
+
 def tokenize_brand( brand_name: str | None, ) -> set[str]:
     return {
         token
         for token
-        in WORD_PATTERN.findall(
-            normalized(
-                html_clean_text(
-                    brand_name
-                )
-            )
+        in unicode_tokens(
+            brand_name
         )
         if len(token) >= 3
     }
 
 
 def variant_tokens( value: str | None, *, brand_name: str | None, ) -> set[str]:
-    text = normalized(
-        html_clean_text(
-            value
-        )
-    )
-
+    #
+    # ВАЖНО:
+    # Здесь намеренно НЕ используем normalized()
+    # перед токенизацией.
+    #
+    # normalized() остаётся полезным для identity-сравнений,
+    # но SKU-варианты должны сохранять Unicode-буквы.
+    #
     brand_tokens = tokenize_brand(
         brand_name
     )
 
     result: set[str] = set()
 
-    for token in WORD_PATTERN.findall(
-        text
+    for token in unicode_tokens(
+        value
     ):
         if len(token) < 3:
             continue
@@ -1384,6 +1429,67 @@ def make_candidate( *, classification: CandidateClass, reason: str, score: float
     )
 
 
+def candidate_to_json( item: DuplicateCandidate, ) -> dict:
+    data = asdict(
+        item
+    )
+
+    data[
+        "classification"
+    ] = item.classification.value
+
+    return data
+
+
+def write_candidate_json( *, stats: SieveStats, auto_safe: list[ DuplicateCandidate ], review: list[ DuplicateCandidate ], barcode_conflict: list[ DuplicateCandidate ], ) -> None:
+    payload = {
+        "schema_version": 1,
+        "scanner_version": "v11",
+        "generated_at_utc": (
+            datetime.now(
+                timezone.utc
+            )
+            .isoformat()
+        ),
+        "database_changes": False,
+        "auto_merge_executed": False,
+        "stats": asdict(
+            stats
+        ),
+        "counts": {
+            CandidateClass.AUTO_SAFE.value: len(
+                auto_safe
+            ),
+            CandidateClass.REVIEW.value: len(
+                review
+            ),
+            CandidateClass.BARCODE_CONFLICT_REVIEW.value: len(
+                barcode_conflict
+            ),
+        },
+        "candidates": [
+            candidate_to_json(
+                item
+            )
+            for item
+            in (
+                auto_safe
+                + review
+                + barcode_conflict
+            )
+        ],
+    }
+
+    CANDIDATE_JSON_PATH.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def print_candidate( *, index: int, item: DuplicateCandidate, ) -> None:
     print(
         "-" * 80
@@ -1892,6 +1998,30 @@ def print_final_summary( *, stats: SieveStats, ordered_auto_safe: list[ Duplicat
     print()
 
     print(
+        "CANDIDATE JSON:",
+        str(
+            CANDIDATE_JSON_PATH
+        ),
+    )
+
+    print(
+        "CANDIDATES WRITTEN:",
+        (
+            len(
+                ordered_auto_safe
+            )
+            + len(
+                ordered_review
+            )
+            + len(
+                ordered_barcode_conflict
+            )
+        ),
+    )
+
+    print()
+
+    print(
         "AUTO MERGE EXECUTED: NO"
     )
 
@@ -1910,11 +2040,15 @@ async def main() -> None:
     )
 
     print(
-        "MarkaRadar Duplicate Scanner v10"
+        "MarkaRadar Duplicate Scanner v11"
     )
 
     print(
         "MODE: NARROWING MULTI-STAGE SIEVE"
+    )
+
+    print(
+        "UNICODE SKU TOKENIZATION: ON"
     )
 
     print(
@@ -2161,6 +2295,8 @@ async def main() -> None:
         key=lambda item: (
             item.score,
             item.common_count,
+            -item.left_id,
+            -item.right_id,
         ),
         reverse=True,
     )
@@ -2170,6 +2306,8 @@ async def main() -> None:
         key=lambda item: (
             item.score,
             item.common_count,
+            -item.left_id,
+            -item.right_id,
         ),
         reverse=True,
     )
@@ -2179,8 +2317,19 @@ async def main() -> None:
         key=lambda item: (
             item.score,
             item.common_count,
+            -item.left_id,
+            -item.right_id,
         ),
         reverse=True,
+    )
+
+    write_candidate_json(
+        stats=stats,
+        auto_safe=ordered_auto_safe,
+        review=ordered_review,
+        barcode_conflict=(
+            ordered_barcode_conflict
+        ),
     )
 
     print_sieve_stats(
@@ -2293,9 +2442,7 @@ async def main() -> None:
         )
 
     #
-    # ВАЖНО:
-    # FINAL SUMMARY печатается ПОСЛЕДНИМ.
-    # Поэтому его всегда видно внизу GitHub Actions.
+    # FINAL SUMMARY обязательно печатается ПОСЛЕДНИМ.
     #
     print_final_summary(
         stats=stats,
