@@ -53,6 +53,10 @@ jobs:
         run: |
           alembic upgrade head
 
+      - name: Check product consolidation
+        run: |
+          python check_consolidation.py
+
       - name: Start MarkaRadar
         run: |
           python bot.py
