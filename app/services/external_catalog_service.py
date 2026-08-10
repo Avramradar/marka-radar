@@ -45,7 +45,7 @@ class ExternalCatalogServiceResult:
         ...
     ]
 
-@property
+    @property
     def enriched( self, ) -> bool:
         return (
             self.total_imported
