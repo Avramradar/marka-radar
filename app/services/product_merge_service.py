@@ -29,16 +29,47 @@ UNKNOWN_BRAND_NAMES = {
     "без бренда",
 }
 
+
 GENERIC_PRODUCT_NAMES = {
-    "кофе", "молоко", "чай", "вода", "пицца", "сыр", "масло",
-    "йогурт", "кефир", "сельдь", "сок", "сметана", "творог",
-    "сливки", "колбаса",
+    "кофе",
+    "молоко",
+    "чай",
+    "вода",
+    "пицца",
+    "сыр",
+    "масло",
+    "йогурт",
+    "кефир",
+    "сельдь",
+    "сок",
+    "сметана",
+    "творог",
+    "сливки",
+    "колбаса",
+    "майонез",
+    "паштет",
+    "печенье",
+    "шоколад",
+    "мороженое",
+    "пельмени",
+    "вареники",
 }
 
+
 GENERIC_CATEGORY_NAMES = {
-    "", "продукты", "продукт", "еда", "food", "foods",
-    "products", "product", "прочее", "другое", "other",
+    "",
+    "продукты",
+    "продукт",
+    "еда",
+    "food",
+    "foods",
+    "products",
+    "product",
+    "прочее",
+    "другое",
+    "other",
 }
+
 
 PLACEHOLDER_IMAGE_MARKERS = (
     "placeholder",
@@ -50,6 +81,7 @@ PLACEHOLDER_IMAGE_MARKERS = (
     "image_not_found",
 )
 
+
 MARKETING_DESCRIPTION_MARKERS = (
     "купить",
     "заказать",
@@ -60,6 +92,7 @@ MARKETING_DESCRIPTION_MARKERS = (
     "лучшая цена",
 )
 
+
 PACKAGE_FAMILIES = {
     "г": "mass",
     "кг": "mass",
@@ -68,59 +101,132 @@ PACKAGE_FAMILIES = {
 }
 
 
+#
+# Слова, которые полезны для показа пользователю,
+# но почти ничего не доказывают при идентификации SKU.
+#
+# Их исключаем только из fuzzy-сопоставления названий.
+# В самой карточке они, конечно, сохраняются.
+#
+NAME_MATCH_STOPWORDS = {
+    *GENERIC_PRODUCT_NAMES,
+    "продукт",
+    "продукты",
+    "товар",
+    "товары",
+    "традиции",
+    "традиционный",
+    "традиционные",
+    "классический",
+    "классическая",
+    "классическое",
+    "классические",
+    "охлажденный",
+    "охлажденная",
+    "замороженный",
+    "замороженная",
+    "бзмж",
+    "гост",
+}
+
+
 class ProductMatchType(StrEnum):
     BARCODE = "barcode"
     BRAND_AND_NAME = "brand_and_name"
+    BRAND_AND_SIMILAR_NAME = "brand_and_similar_name"
     NAME = "name"
     CREATED = "created"
 
 
-@dataclass(slots=True)
+@dataclass( slots=True, )
 class ExternalProductData:
     source: str
     name: str
+
     brand_name: str | None = None
     barcode: str | None = None
+
     category_id: int | None = None
     family_id: int | None = None
+
     package_value: Decimal | float | int | None = None
     package_unit: str | None = None
+
     subtype: str | None = None
     description: str | None = None
     image_url: str | None = None
     keywords: str | None = None
 
-    # Эти поля уже готовы для будущего слоя provenance.
+    #
+    # Уже готовы для будущего provenance.
     # Старые провайдеры их могут не передавать.
+    #
     source_priority: int = 50
     confidence: float = 100.0
 
 
-@dataclass(slots=True)
+@dataclass( slots=True, )
 class ProductMergeResult:
     product: Product
     brand: Brand
+
     created: bool
     match_type: ProductMatchType
-    updated_fields: tuple[str, ...]
+
+    updated_fields: tuple[
+        str,
+        ...
+    ]
+
     source: str
-    conflicts: tuple[str, ...] = ()
+
+    conflicts: tuple[
+        str,
+        ...
+    ] = ()
 
 
-def clean_text(value: Any) -> str:
+@dataclass( slots=True, frozen=True, )
+class SimilarProductCandidate:
+    """ Внутренняя оценка кандидата fuzzy-match. score: Итоговая уверенность 0..1. token_coverage: Какая доля меньшего набора значимых слов совпала. token_jaccard: Пересечение / объединение значимых слов. """
+
+    product: Product
+    score: float
+    token_coverage: float
+    token_jaccard: float
+
+
+def clean_text( value: Any, ) -> str:
     if value is None:
         return ""
-    return " ".join(str(value).strip().split())
+
+    return " ".join(
+        str(value)
+        .strip()
+        .split()
+    )
 
 
-def normalized(value: Any) -> str:
-    cleaned = clean_text(value)
+def normalized( value: Any, ) -> str:
+    cleaned = clean_text(
+        value
+    )
+
     if not cleaned:
         return ""
-    return normalize_text(cleaned).replace("ё", "е")
+
+    return (
+        normalize_text(
+            cleaned
+        )
+        .replace(
+            "ё",
+            "е",
+        )
+    )
 
 
-def normalize_barcode(barcode: str | None) -> str | None:
+def normalize_barcode( barcode: str | None, ) -> str | None:
     if not barcode:
         return None
 
@@ -136,8 +242,10 @@ def normalize_barcode(barcode: str | None) -> str | None:
     return digits
 
 
-def normalize_package_unit(unit: str | None) -> str | None:
-    clean_unit = normalized(unit)
+def normalize_package_unit( unit: str | None, ) -> str | None:
+    clean_unit = normalized(
+        unit
+    )
 
     if not clean_unit:
         return None
@@ -150,14 +258,17 @@ def normalize_package_unit(unit: str | None) -> str | None:
         "gram": "г",
         "grams": "г",
         "g": "г",
+
         "килограмм": "кг",
         "килограмма": "кг",
         "килограммов": "кг",
         "kg": "кг",
+
         "миллилитр": "мл",
         "миллилитра": "мл",
         "миллилитров": "мл",
         "ml": "мл",
+
         "литр": "л",
         "литра": "л",
         "литров": "л",
@@ -166,7 +277,9 @@ def normalize_package_unit(unit: str | None) -> str | None:
 
     return aliases.get(
         clean_unit,
-        clean_text(unit).lower(),
+        clean_text(
+            unit
+        ).lower(),
     )
 
 
@@ -175,7 +288,9 @@ def normalize_package_value( value: Decimal | float | int | None, ) -> Decimal |
         return None
 
     try:
-        decimal_value = Decimal(str(value))
+        decimal_value = Decimal(
+            str(value)
+        )
     except Exception:
         return None
 
@@ -185,30 +300,64 @@ def normalize_package_value( value: Decimal | float | int | None, ) -> Decimal |
     return decimal_value
 
 
-def package_to_base( value: Decimal | float | int | None, unit: str | None, ) -> tuple[str | None, Decimal | None]:
-    normalized_value = normalize_package_value(value)
-    normalized_unit = normalize_package_unit(unit)
+def package_to_base( value: Decimal | float | int | None, unit: str | None, ) -> tuple[
+    str | None,
+    Decimal | None,
+]:
+    normalized_value = (
+        normalize_package_value(
+            value
+        )
+    )
 
-    if normalized_value is None or normalized_unit is None:
+    normalized_unit = (
+        normalize_package_unit(
+            unit
+        )
+    )
+
+    if (
+        normalized_value is None
+        or normalized_unit is None
+    ):
         return None, None
 
-    family = PACKAGE_FAMILIES.get(normalized_unit)
+    family = PACKAGE_FAMILIES.get(
+        normalized_unit
+    )
 
     if family is None:
         return None, None
 
-    if normalized_unit in {"кг", "л"}:
-        normalized_value *= Decimal("1000")
+    if normalized_unit in {
+        "кг",
+        "л",
+    }:
+        normalized_value *= Decimal(
+            "1000"
+        )
 
-    return family, normalized_value
+    return (
+        family,
+        normalized_value,
+    )
 
 
 def package_values_compatible( *, current_value: Decimal | float | int | None, current_unit: str | None, incoming_value: Decimal | float | int | None, incoming_unit: str | None, tolerance_percent: Decimal = Decimal("3"), ) -> bool | None:
-    current_family, current_base = package_to_base(
+    """ Возвращает: True: обе упаковки известны и совместимы; False: обе известны и конфликтуют; None: хотя бы у одной стороны упаковка неполная/неизвестная. Для merge главное правило: False = жёсткий запрет на объединение. """
+
+    (
+        current_family,
+        current_base,
+    ) = package_to_base(
         current_value,
         current_unit,
     )
-    incoming_family, incoming_base = package_to_base(
+
+    (
+        incoming_family,
+        incoming_base,
+    ) = package_to_base(
         incoming_value,
         incoming_unit,
     )
@@ -224,97 +373,283 @@ def package_values_compatible( *, current_value: Decimal | float | int | None, c
     if current_family != incoming_family:
         return False
 
-    larger = max(current_base, incoming_base)
+    larger = max(
+        current_base,
+        incoming_base,
+    )
 
     if larger <= 0:
         return None
 
     difference_percent = (
-        abs(current_base - incoming_base)
+        abs(
+            current_base
+            - incoming_base
+        )
         / larger
         * Decimal("100")
     )
 
-    return difference_percent <= tolerance_percent
+    return (
+        difference_percent
+        <= tolerance_percent
+    )
 
 
-def is_unknown_brand(brand_name: str | None) -> bool:
-    normalized_name = normalized(brand_name)
+def is_unknown_brand( brand_name: str | None, ) -> bool:
+    normalized_name = normalized(
+        brand_name
+    )
 
     return (
         not normalized_name
         or normalized_name
         in {
             normalized(item)
-            for item in UNKNOWN_BRAND_NAMES
+            for item
+            in UNKNOWN_BRAND_NAMES
         }
     )
 
 
-def is_generic_category(category_name: str | None) -> bool:
+def is_generic_category( category_name: str | None, ) -> bool:
     return (
-        normalized(category_name)
+        normalized(
+            category_name
+        )
         in {
             normalized(item)
-            for item in GENERIC_CATEGORY_NAMES
+            for item
+            in GENERIC_CATEGORY_NAMES
         }
     )
 
 
-def is_generic_product_name(name: str | None) -> bool:
+def is_generic_product_name( name: str | None, ) -> bool:
     return (
-        normalized(name)
+        normalized(
+            name
+        )
         in {
             normalized(item)
-            for item in GENERIC_PRODUCT_NAMES
+            for item
+            in GENERIC_PRODUCT_NAMES
         }
     )
 
 
-def tokenize_text(value: str | None) -> set[str]:
+def tokenize_text( value: str | None, ) -> set[str]:
     return {
         token
         for token in re.findall(
             r"[a-zа-я0-9]+",
-            normalized(value),
+            normalized(
+                value
+            ),
             flags=re.IGNORECASE,
         )
         if len(token) >= 2
     }
 
 
-def text_similarity( left: str | None, right: str | None, ) -> float:
-    left_tokens = tokenize_text(left)
-    right_tokens = tokenize_text(right)
+def identity_name_tokens( value: str | None, ) -> set[str]:
+    """ Значимые слова названия для fuzzy-match. Исключаем: - общий тип товара; - единицы измерения; - чистые числа; - проценты; - слабые маркетинговые/описательные слова. Пример: "Пельмени Сибирская коллекция Иркутские традиции, 700г" превращается примерно в: {"сибирская", "коллекция", "иркутские"} Это позволяет объединить её с: "Сибирская Коллекция Пельмени Иркутские" но не со: "Сибирская коллекция Пельмени Сочные". """
 
-    if not left_tokens or not right_tokens:
+    text = normalized(
+        value
+    )
+
+    if not text:
+        return set()
+
+    raw_tokens = re.findall(
+        r"[a-zа-я]+|\d+(?:[.,]\d+)?",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    result: set[str] = set()
+
+    normalized_stopwords = {
+        normalized(item)
+        for item
+        in NAME_MATCH_STOPWORDS
+    }
+
+    unit_tokens = {
+        "г",
+        "гр",
+        "кг",
+        "мл",
+        "л",
+        "g",
+        "kg",
+        "ml",
+        "l",
+    }
+
+    for raw_token in raw_tokens:
+        token = (
+            raw_token
+            .replace(
+                ",",
+                ".",
+            )
+            .strip()
+        )
+
+        if not token:
+            continue
+
+        if token in unit_tokens:
+            continue
+
+        if token.replace(
+            ".",
+            "",
+            1,
+        ).isdigit():
+            continue
+
+        if token in normalized_stopwords:
+            continue
+
+        if len(token) < 3:
+            continue
+
+        result.add(
+            token
+        )
+
+    return result
+
+
+def text_similarity( left: str | None, right: str | None, ) -> float:
+    left_tokens = tokenize_text(
+        left
+    )
+
+    right_tokens = tokenize_text(
+        right
+    )
+
+    if (
+        not left_tokens
+        or not right_tokens
+    ):
         return 0.0
 
-    union = len(left_tokens | right_tokens)
+    union = len(
+        left_tokens
+        | right_tokens
+    )
 
     if union <= 0:
         return 0.0
 
-    return len(left_tokens & right_tokens) / union
+    return (
+        len(
+            left_tokens
+            & right_tokens
+        )
+        / union
+    )
 
 
-def name_quality_score(value: str | None) -> float:
-    text = clean_text(value)
+def identity_name_similarity( left: str | None, right: str | None, ) -> tuple[
+    float,
+    float,
+    int,
+]:
+    """ Возвращает: coverage: пересечение / размер меньшего набора; jaccard: пересечение / объединение; common_count: число общих значимых токенов. """
+
+    left_tokens = identity_name_tokens(
+        left
+    )
+
+    right_tokens = identity_name_tokens(
+        right
+    )
+
+    if (
+        not left_tokens
+        or not right_tokens
+    ):
+        return (
+            0.0,
+            0.0,
+            0,
+        )
+
+    intersection = (
+        left_tokens
+        & right_tokens
+    )
+
+    common_count = len(
+        intersection
+    )
+
+    smaller_size = min(
+        len(left_tokens),
+        len(right_tokens),
+    )
+
+    union_size = len(
+        left_tokens
+        | right_tokens
+    )
+
+    coverage = (
+        common_count
+        / smaller_size
+        if smaller_size > 0
+        else 0.0
+    )
+
+    jaccard = (
+        common_count
+        / union_size
+        if union_size > 0
+        else 0.0
+    )
+
+    return (
+        coverage,
+        jaccard,
+        common_count,
+    )
+
+
+def name_quality_score( value: str | None, ) -> float:
+    text = clean_text(
+        value
+    )
 
     if not text:
         return 0.0
 
     score = 20.0
 
-    if not is_generic_product_name(text):
+    if not is_generic_product_name(
+        text
+    ):
         score += 30.0
 
     score += min(
-        len(tokenize_text(text)) * 5.0,
+        len(
+            tokenize_text(
+                text
+            )
+        )
+        * 5.0,
         25.0,
     )
 
-    if re.search(r"\d", text):
+    if re.search(
+        r"\d",
+        text,
+    ):
         score += 5.0
 
     if len(text) >= 12:
@@ -323,17 +658,31 @@ def name_quality_score(value: str | None) -> float:
     if len(text) > 180:
         score -= 20.0
 
-    return max(0.0, min(score, 100.0))
+    return max(
+        0.0,
+        min(
+            score,
+            100.0,
+        ),
+    )
 
 
-def description_quality_score(value: str | None) -> float:
-    text = clean_text(value)
+def description_quality_score( value: str | None, ) -> float:
+    text = clean_text(
+        value
+    )
 
     if not text:
         return 0.0
 
-    score = min(len(text) / 8.0, 70.0)
-    normalized_text = normalized(text)
+    score = min(
+        len(text) / 8.0,
+        70.0,
+    )
+
+    normalized_text = normalized(
+        text
+    )
 
     marketing_hits = sum(
         1
@@ -341,7 +690,10 @@ def description_quality_score(value: str | None) -> float:
         if marker in normalized_text
     )
 
-    score -= marketing_hits * 10.0
+    score -= (
+        marketing_hits
+        * 10.0
+    )
 
     if len(text) >= 80:
         score += 10.0
@@ -349,24 +701,42 @@ def description_quality_score(value: str | None) -> float:
     if len(text) >= 200:
         score += 10.0
 
-    return max(0.0, min(score, 100.0))
+    return max(
+        0.0,
+        min(
+            score,
+            100.0,
+        ),
+    )
 
 
-def image_quality_score(value: str | None) -> float:
-    image = clean_text(value)
+def image_quality_score( value: str | None, ) -> float:
+    """ Только локальная эвристика для выбора между двумя уже найденными image_url. Это НЕ заменяет Image Validator. """
+
+    image = clean_text(
+        value
+    )
 
     if not image:
         return 0.0
 
-    normalized_image = normalized(image)
+    normalized_image = normalized(
+        image
+    )
 
     if any(
         marker in normalized_image
-        for marker in PLACEHOLDER_IMAGE_MARKERS
+        for marker
+        in PLACEHOLDER_IMAGE_MARKERS
     ):
         return 10.0
 
-    if image.startswith(("http://", "https://")):
+    if image.startswith(
+        (
+            "http://",
+            "https://",
+        )
+    ):
         score = 70.0
 
         if re.search(
@@ -376,15 +746,23 @@ def image_quality_score(value: str | None) -> float:
         ):
             score += 10.0
 
-        return min(score, 100.0)
+        return min(
+            score,
+            100.0,
+        )
 
-    # Telegram file_id / локальное пользовательское изображение.
+    # Telegram file_id / внутреннее изображение.
     return 95.0
 
 
 def is_better_name( *, current_name: str | None, incoming_name: str | None, ) -> bool:
-    current = clean_text(current_name)
-    incoming = clean_text(incoming_name)
+    current = clean_text(
+        current_name
+    )
+
+    incoming = clean_text(
+        incoming_name
+    )
 
     if not incoming:
         return False
@@ -392,75 +770,123 @@ def is_better_name( *, current_name: str | None, incoming_name: str | None, ) ->
     if not current:
         return True
 
-    if normalized(current) == normalized(incoming):
+    if (
+        normalized(current)
+        == normalized(incoming)
+    ):
         return False
 
     if (
-        is_generic_product_name(current)
-        and not is_generic_product_name(incoming)
+        is_generic_product_name(
+            current
+        )
+        and not is_generic_product_name(
+            incoming
+        )
     ):
         return True
 
-    similarity = text_similarity(current, incoming)
+    similarity = text_similarity(
+        current,
+        incoming,
+    )
 
+    #
     # Хорошее существующее имя нельзя заменить
     # совершенно другим названием.
+    #
     if (
-        not is_generic_product_name(current)
+        not is_generic_product_name(
+            current
+        )
         and similarity < 0.20
     ):
         return False
 
     return (
-        name_quality_score(incoming)
-        >= name_quality_score(current) + 15.0
+        name_quality_score(
+            incoming
+        )
+        >= name_quality_score(
+            current
+        )
+        + 15.0
     )
 
 
 def should_replace_description( *, current_value: str | None, incoming_value: str | None, ) -> bool:
-    incoming = clean_text(incoming_value)
+    incoming = clean_text(
+        incoming_value
+    )
 
     if not incoming:
         return False
 
-    current = clean_text(current_value)
+    current = clean_text(
+        current_value
+    )
 
     if not current:
         return True
 
     return (
-        description_quality_score(incoming)
-        >= description_quality_score(current) + 15.0
+        description_quality_score(
+            incoming
+        )
+        >= description_quality_score(
+            current
+        )
+        + 15.0
     )
 
 
 def should_replace_image( *, current_value: str | None, incoming_value: str | None, ) -> bool:
-    incoming = clean_text(incoming_value)
+    incoming = clean_text(
+        incoming_value
+    )
 
     if not incoming:
         return False
 
-    current = clean_text(current_value)
+    current = clean_text(
+        current_value
+    )
 
     if not current:
         return True
 
     return (
-        image_quality_score(incoming)
-        >= image_quality_score(current) + 20.0
+        image_quality_score(
+            incoming
+        )
+        >= image_quality_score(
+            current
+        )
+        + 20.0
     )
 
 
 def should_fill_text( current_value: Any, incoming_value: Any, ) -> bool:
     return (
-        not clean_text(current_value)
-        and bool(clean_text(incoming_value))
+        not clean_text(
+            current_value
+        )
+        and bool(
+            clean_text(
+                incoming_value
+            )
+        )
     )
 
 
 def combine_keywords( current_keywords: str | None, incoming_keywords: str | None, ) -> str | None:
-    current = clean_text(current_keywords)
-    incoming = clean_text(incoming_keywords)
+    current = clean_text(
+        current_keywords
+    )
+
+    incoming = clean_text(
+        incoming_keywords
+    )
 
     if not current and not incoming:
         return None
@@ -474,33 +900,58 @@ def combine_keywords( current_keywords: str | None, incoming_keywords: str | Non
     values: list[str] = []
     seen: set[str] = set()
 
-    for text in (current, incoming):
+    for text in (
+        current,
+        incoming,
+    ):
         parts = [
             part.strip()
-            for part in text.replace(";", ",").split(",")
+            for part
+            in text.replace(
+                ";",
+                ",",
+            ).split(",")
             if part.strip()
         ]
 
         if len(parts) == 1:
-            parts = [text]
+            parts = [
+                text
+            ]
 
         for part in parts:
-            key = normalized(part)
+            key = normalized(
+                part
+            )
 
-            if not key or key in seen:
+            if (
+                not key
+                or key in seen
+            ):
                 continue
 
-            seen.add(key)
-            values.append(part)
+            seen.add(
+                key
+            )
 
-    return ", ".join(values)
+            values.append(
+                part
+            )
+
+    return ", ".join(
+        values
+    )
 
 
 def build_search_text( *, product: Product, brand: Brand, category: Category | None = None, ) -> str:
     parts = (
         product.name,
         brand.name,
-        category.name if category is not None else None,
+        (
+            category.name
+            if category is not None
+            else None
+        ),
         product.subtype,
         product.keywords,
         product.description,
@@ -510,7 +961,9 @@ def build_search_text( *, product: Product, brand: Brand, category: Category | N
     )
 
     normalized_parts = [
-        normalized(part)
+        normalized(
+            part
+        )
         for part in parts
         if part is not None
     ]
@@ -523,34 +976,52 @@ def build_search_text( *, product: Product, brand: Brand, category: Category | N
 
 
 async def find_brand( *, session: AsyncSession, brand_name: str, ) -> Brand | None:
-    normalized_name = normalized(brand_name)
+    normalized_name = normalized(
+        brand_name
+    )
 
     if not normalized_name:
         return None
 
     statement = (
-        select(Brand)
+        select(
+            Brand
+        )
         .where(
             or_(
-                Brand.normalized_name == normalized_name,
-                Brand.name.ilike(brand_name),
+                Brand.normalized_name
+                == normalized_name,
+                Brand.name.ilike(
+                    brand_name
+                ),
             )
         )
-        .limit(1)
+        .limit(
+            1
+        )
     )
 
-    result = await session.execute(statement)
+    result = await session.execute(
+        statement
+    )
+
     return result.scalar_one_or_none()
 
 
 async def get_or_create_brand( *, session: AsyncSession, brand_name: str | None, ) -> Brand:
-    clean_brand = clean_text(brand_name)
+    clean_brand = clean_text(
+        brand_name
+    )
 
     if (
         not clean_brand
-        or is_unknown_brand(clean_brand)
+        or is_unknown_brand(
+            clean_brand
+        )
     ):
-        clean_brand = "Бренд не указан"
+        clean_brand = (
+            "Бренд не указан"
+        )
 
     existing = await find_brand(
         session=session,
@@ -562,10 +1033,15 @@ async def get_or_create_brand( *, session: AsyncSession, brand_name: str | None,
 
     brand = Brand(
         name=clean_brand,
-        normalized_name=normalized(clean_brand),
+        normalized_name=normalized(
+            clean_brand
+        ),
     )
 
-    session.add(brand)
+    session.add(
+        brand
+    )
+
     await session.flush()
 
     return brand
@@ -573,9 +1049,15 @@ async def get_or_create_brand( *, session: AsyncSession, brand_name: str | None,
 
 async def get_brand_by_id( *, session: AsyncSession, brand_id: int, ) -> Brand | None:
     result = await session.execute(
-        select(Brand)
-        .where(Brand.id == brand_id)
-        .limit(1)
+        select(
+            Brand
+        )
+        .where(
+            Brand.id == brand_id
+        )
+        .limit(
+            1
+        )
     )
 
     return result.scalar_one_or_none()
@@ -586,24 +1068,39 @@ async def get_category_by_id( *, session: AsyncSession, category_id: int | None,
         return None
 
     result = await session.execute(
-        select(Category)
-        .where(Category.id == category_id)
-        .limit(1)
+        select(
+            Category
+        )
+        .where(
+            Category.id == category_id
+        )
+        .limit(
+            1
+        )
     )
 
     return result.scalar_one_or_none()
 
 
 async def find_product_by_barcode( *, session: AsyncSession, barcode: str | None, ) -> Product | None:
-    normalized_barcode = normalize_barcode(barcode)
+    normalized_barcode = normalize_barcode(
+        barcode
+    )
 
     if normalized_barcode is None:
         return None
 
     result = await session.execute(
-        select(Product)
-        .where(Product.barcode == normalized_barcode)
-        .limit(1)
+        select(
+            Product
+        )
+        .where(
+            Product.barcode
+            == normalized_barcode
+        )
+        .limit(
+            1
+        )
     )
 
     return result.scalar_one_or_none()
@@ -617,33 +1114,123 @@ def product_package_compatible_with_incoming( *, product: Product, incoming: Ext
         incoming_unit=incoming.package_unit,
     )
 
-    return compatibility is not False
+    #
+    # False — доказанный конфликт SKU.
+    # None — данных недостаточно, merge пока
+    # не запрещаем.
+    #
+    return (
+        compatibility
+        is not False
+    )
+
+
+def barcodes_do_not_conflict( *, product: Product, incoming: ExternalProductData, ) -> bool:
+    current_barcode = normalize_barcode(
+        product.barcode
+    )
+
+    incoming_barcode = normalize_barcode(
+        incoming.barcode
+    )
+
+    if (
+        current_barcode
+        and incoming_barcode
+        and current_barcode
+        != incoming_barcode
+    ):
+        return False
+
+    return True
+
+
+async def categories_compatible( *, session: AsyncSession, product: Product, incoming: ExternalProductData, ) -> bool:
+    """ Категория используется как страховка. Разные конкретные категории = запрет fuzzy-merge. Общая/неизвестная категория конфликтом не считается. """
+
+    if incoming.category_id is None:
+        return True
+
+    if product.category_id == incoming.category_id:
+        return True
+
+    current_category = (
+        await get_category_by_id(
+            session=session,
+            category_id=product.category_id,
+        )
+    )
+
+    incoming_category = (
+        await get_category_by_id(
+            session=session,
+            category_id=incoming.category_id,
+        )
+    )
+
+    if (
+        current_category is None
+        or incoming_category is None
+    ):
+        return True
+
+    if (
+        is_generic_category(
+            current_category.name
+        )
+        or is_generic_category(
+            incoming_category.name
+        )
+    ):
+        return True
+
+    return False
 
 
 async def find_product_by_brand_and_name( *, session: AsyncSession, brand: Brand, incoming: ExternalProductData, ) -> Product | None:
-    normalized_name = normalized(incoming.name)
+    """ Точное совпадение brand + normalized_name. Упаковка обязательно не должна конфликтовать. """
+
+    normalized_name = normalized(
+        incoming.name
+    )
 
     if not normalized_name:
         return None
 
     result = await session.execute(
-        select(Product)
-        .where(
-            Product.brand_id == brand.id,
-            Product.normalized_name == normalized_name,
-            Product.is_active.is_(True),
+        select(
+            Product
         )
-        .limit(10)
+        .where(
+            Product.brand_id
+            == brand.id,
+            Product.normalized_name
+            == normalized_name,
+            Product.is_active.is_(
+                True
+            ),
+        )
+        .limit(
+            10
+        )
     )
 
-    products = list(result.scalars().all())
+    products = list(
+        result.scalars().all()
+    )
 
     compatible = [
         product
         for product in products
-        if product_package_compatible_with_incoming(
-            product=product,
-            incoming=incoming,
+        if (
+            product_package_compatible_with_incoming(
+                product=product,
+                incoming=incoming,
+            )
+            and barcodes_do_not_conflict(
+                product=product,
+                incoming=incoming,
+            )
         )
     ]
 
@@ -653,23 +1240,235 @@ async def find_product_by_brand_and_name( *, session: AsyncSession, brand: Brand
     return compatible[0]
 
 
+async def find_product_by_brand_and_similar_name( *, session: AsyncSession, brand: Brand, incoming: ExternalProductData, ) -> Product | None:
+    """ Безопасный fuzzy-match для multi-source enrichment. Используется ТОЛЬКО когда: - входящий бренд реальный; - ищем только товары того же brand_id; - разные штрихкоды запрещают merge; - разные известные упаковки запрещают merge; - разные конкретные категории запрещают merge; - названия должны иметь сильное совпадение именно по значимым словам. Это позволяет объединить: OFF: "Сибирская Коллекция Пельмени Иркутские" METRO: "Пельмени Сибирская коллекция Иркутские традиции, 700г" но не должно объединить: "Сибирская коллекция Пельмени Сочные" с "Иркутскими". """
+
+    if is_unknown_brand(
+        brand.name
+    ):
+        return None
+
+    incoming_tokens = identity_name_tokens(
+        incoming.name
+    )
+
+    #
+    # Для fuzzy-match одного значимого слова
+    # недостаточно: слишком большой риск
+    # склеивания разных SKU.
+    #
+    if len(incoming_tokens) < 2:
+        return None
+
+    result = await session.execute(
+        select(
+            Product
+        )
+        .where(
+            Product.brand_id
+            == brand.id,
+            Product.is_active.is_(
+                True
+            ),
+        )
+        .limit(
+            100
+        )
+    )
+
+    products = list(
+        result.scalars().all()
+    )
+
+    candidates: list[
+        SimilarProductCandidate
+    ] = []
+
+    for product in products:
+        if not barcodes_do_not_conflict(
+            product=product,
+            incoming=incoming,
+        ):
+            continue
+
+        package_compatibility = (
+            package_values_compatible(
+                current_value=product.package_value,
+                current_unit=product.package_unit,
+                incoming_value=incoming.package_value,
+                incoming_unit=incoming.package_unit,
+            )
+        )
+
+        if package_compatibility is False:
+            continue
+
+        if not await categories_compatible(
+            session=session,
+            product=product,
+            incoming=incoming,
+        ):
+            continue
+
+        (
+            coverage,
+            jaccard,
+            common_count,
+        ) = identity_name_similarity(
+            product.name,
+            incoming.name,
+        )
+
+        #
+        # Минимум два сильных общих признака.
+        #
+        if common_count < 2:
+            continue
+
+        #
+        # Главный порог:
+        # меньшая сторона должна почти полностью
+        # входить в большую.
+        #
+        if coverage < 0.80:
+            continue
+
+        #
+        # Дополнительная защита от названий,
+        # где совпадает только брендовая основа,
+        # а SKU-часть различается.
+        #
+        if jaccard < 0.55:
+            continue
+
+        score = (
+            coverage
+            * 0.65
+            + jaccard
+            * 0.35
+        )
+
+        #
+        # Если обе упаковки известны и совпали,
+        # это дополнительное сильное доказательство.
+        #
+        if package_compatibility is True:
+            score += 0.08
+
+        score = min(
+            score,
+            1.0,
+        )
+
+        candidates.append(
+            SimilarProductCandidate(
+                product=product,
+                score=score,
+                token_coverage=coverage,
+                token_jaccard=jaccard,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: item.score,
+        reverse=True,
+    )
+
+    best = candidates[0]
+
+    #
+    # Даже лучший кандидат должен быть
+    # действительно сильным.
+    #
+    if best.score < 0.78:
+        return None
+
+    #
+    # Если два кандидата почти одинаково хороши,
+    # лучше создать отдельную карточку,
+    # чем ошибочно склеить разные SKU.
+    #
+    if len(candidates) >= 2:
+        second = candidates[1]
+
+        if (
+            best.score
+            - second.score
+            < 0.12
+        ):
+            logger.info(
+                "Fuzzy product match ambiguous: "
+                "source=%s incoming=%r "
+                "best_product_id=%s best_score=%.3f "
+                "second_product_id=%s second_score=%.3f",
+                incoming.source,
+                incoming.name,
+                best.product.id,
+                best.score,
+                second.product.id,
+                second.score,
+            )
+
+            return None
+
+    logger.info(
+        "Fuzzy product match accepted: "
+        "source=%s incoming=%r "
+        "product_id=%s current=%r "
+        "score=%.3f coverage=%.3f jaccard=%.3f "
+        "incoming_package=%s%s current_package=%s%s",
+        incoming.source,
+        incoming.name,
+        best.product.id,
+        best.product.name,
+        best.score,
+        best.token_coverage,
+        best.token_jaccard,
+        incoming.package_value,
+        incoming.package_unit or "",
+        best.product.package_value,
+        best.product.package_unit or "",
+    )
+
+    return best.product
+
+
 async def find_safe_name_match( *, session: AsyncSession, incoming: ExternalProductData, incoming_brand: Brand, ) -> Product | None:
-    normalized_name = normalized(incoming.name)
+    """ Последний безопасный fallback: полное normalized_name при совместимом бренде и отсутствии package/barcode конфликта. """
+
+    normalized_name = normalized(
+        incoming.name
+    )
 
     if not normalized_name:
         return None
 
     result = await session.execute(
-        select(Product)
-        .where(
-            Product.normalized_name == normalized_name,
-            Product.is_active.is_(True),
+        select(
+            Product
         )
-        .limit(10)
+        .where(
+            Product.normalized_name
+            == normalized_name,
+            Product.is_active.is_(
+                True
+            ),
+        )
+        .limit(
+            10
+        )
     )
 
-    products = list(result.scalars().all())
-    compatible_products: list[Product] = []
+    products = list(
+        result.scalars().all()
+    )
+
+    compatible_products: list[
+        Product
+    ] = []
 
     for product in products:
         if not product_package_compatible_with_incoming(
@@ -678,9 +1477,17 @@ async def find_safe_name_match( *, session: AsyncSession, incoming: ExternalProd
         ):
             continue
 
-        existing_brand = await get_brand_by_id(
-            session=session,
-            brand_id=product.brand_id,
+        if not barcodes_do_not_conflict(
+            product=product,
+            incoming=incoming,
+        ):
+            continue
+
+        existing_brand = (
+            await get_brand_by_id(
+                session=session,
+                brand_id=product.brand_id,
+            )
         )
 
         existing_brand_name = (
@@ -690,14 +1497,24 @@ async def find_safe_name_match( *, session: AsyncSession, incoming: ExternalProd
         )
 
         if (
-            not is_unknown_brand(existing_brand_name)
-            and not is_unknown_brand(incoming_brand.name)
-            and normalized(existing_brand_name)
-            != normalized(incoming_brand.name)
+            not is_unknown_brand(
+                existing_brand_name
+            )
+            and not is_unknown_brand(
+                incoming_brand.name
+            )
+            and normalized(
+                existing_brand_name
+            )
+            != normalized(
+                incoming_brand.name
+            )
         ):
             continue
 
-        compatible_products.append(product)
+        compatible_products.append(
+            product
+        )
 
     if len(compatible_products) != 1:
         return None
@@ -709,18 +1526,27 @@ async def find_matching_product( *, session: AsyncSession, incoming: ExternalPro
     Product | None,
     ProductMatchType | None,
 ]:
-    barcode_match = await find_product_by_barcode(
-        session=session,
-        barcode=incoming.barcode,
+    """ Приоритет сопоставления: 1. точный barcode; 2. точный brand + name; 3. безопасный brand + similar name; 4. безопасное точное имя; 5. создание нового Product. Fuzzy-match намеренно стоит ПОСЛЕ barcode и точного brand+name. """
+
+    barcode_match = (
+        await find_product_by_barcode(
+            session=session,
+            barcode=incoming.barcode,
+        )
     )
 
     if barcode_match is not None:
-        return barcode_match, ProductMatchType.BARCODE
+        return (
+            barcode_match,
+            ProductMatchType.BARCODE,
+        )
 
-    brand_name_match = await find_product_by_brand_and_name(
-        session=session,
-        brand=brand,
-        incoming=incoming,
+    brand_name_match = (
+        await find_product_by_brand_and_name(
+            session=session,
+            brand=brand,
+            incoming=incoming,
+        )
     )
 
     if brand_name_match is not None:
@@ -729,17 +1555,41 @@ async def find_matching_product( *, session: AsyncSession, incoming: ExternalPro
             ProductMatchType.BRAND_AND_NAME,
         )
 
-    if not is_generic_product_name(incoming.name):
-        name_match = await find_safe_name_match(
+    similar_name_match = (
+        await find_product_by_brand_and_similar_name(
             session=session,
+            brand=brand,
             incoming=incoming,
-            incoming_brand=brand,
+        )
+    )
+
+    if similar_name_match is not None:
+        return (
+            similar_name_match,
+            ProductMatchType.BRAND_AND_SIMILAR_NAME,
+        )
+
+    if not is_generic_product_name(
+        incoming.name
+    ):
+        name_match = (
+            await find_safe_name_match(
+                session=session,
+                incoming=incoming,
+                incoming_brand=brand,
+            )
         )
 
         if name_match is not None:
-            return name_match, ProductMatchType.NAME
+            return (
+                name_match,
+                ProductMatchType.NAME,
+            )
 
-    return None, None
+    return (
+        None,
+        None,
+    )
 
 
 async def merge_product_fields( *, session: AsyncSession, product: Product, incoming_brand: Brand, incoming: ExternalProductData, ) -> tuple[
@@ -748,93 +1598,164 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
     Brand,
     Category | None,
 ]:
+    """ Обогащает существующий канонический Product. Важный принцип: конфликтующие identity-поля не перезаписываются. """
+
     updated_fields: list[str] = []
     conflicts: list[str] = []
 
-    current_brand = await get_brand_by_id(
-        session=session,
-        brand_id=product.brand_id,
+    current_brand = (
+        await get_brand_by_id(
+            session=session,
+            brand_id=product.brand_id,
+        )
     )
 
-    current_category = await get_category_by_id(
-        session=session,
-        category_id=product.category_id,
+    current_category = (
+        await get_category_by_id(
+            session=session,
+            category_id=product.category_id,
+        )
     )
 
-    incoming_name = clean_text(incoming.name)
+    incoming_name = clean_text(
+        incoming.name
+    )
 
     if is_better_name(
         current_name=product.name,
         incoming_name=incoming_name,
     ):
         product.name = incoming_name
-        product.normalized_name = normalized(incoming_name)
-        updated_fields.append("name")
 
-    normalized_barcode = normalize_barcode(incoming.barcode)
-    current_barcode = normalize_barcode(product.barcode)
+        product.normalized_name = (
+            normalized(
+                incoming_name
+            )
+        )
 
-    if current_barcode is None and normalized_barcode:
-        product.barcode = normalized_barcode
-        updated_fields.append("barcode")
+        updated_fields.append(
+            "name"
+        )
+
+    normalized_barcode = (
+        normalize_barcode(
+            incoming.barcode
+        )
+    )
+
+    current_barcode = (
+        normalize_barcode(
+            product.barcode
+        )
+    )
+
+    if (
+        current_barcode is None
+        and normalized_barcode
+    ):
+        product.barcode = (
+            normalized_barcode
+        )
+
+        updated_fields.append(
+            "barcode"
+        )
 
     elif (
         current_barcode
         and normalized_barcode
-        and current_barcode != normalized_barcode
+        and current_barcode
+        != normalized_barcode
     ):
         conflicts.append(
-            f"barcode_conflict:{current_barcode}!={normalized_barcode}"
+            "barcode_conflict:"
+            f"{current_barcode}"
+            "!="
+            f"{normalized_barcode}"
         )
 
-    incoming_package_value = normalize_package_value(
-        incoming.package_value
-    )
-    incoming_package_unit = normalize_package_unit(
-        incoming.package_unit
+    incoming_package_value = (
+        normalize_package_value(
+            incoming.package_value
+        )
     )
 
-    package_compatibility = package_values_compatible(
-        current_value=product.package_value,
-        current_unit=product.package_unit,
-        incoming_value=incoming_package_value,
-        incoming_unit=incoming_package_unit,
+    incoming_package_unit = (
+        normalize_package_unit(
+            incoming.package_unit
+        )
+    )
+
+    package_compatibility = (
+        package_values_compatible(
+            current_value=product.package_value,
+            current_unit=product.package_unit,
+            incoming_value=incoming_package_value,
+            incoming_unit=incoming_package_unit,
+        )
     )
 
     if package_compatibility is False:
         conflicts.append(
             "package_conflict:"
-            f"{product.package_value}{product.package_unit or ''}"
+            f"{product.package_value}"
+            f"{product.package_unit or ''}"
             "!="
-            f"{incoming_package_value}{incoming_package_unit or ''}"
+            f"{incoming_package_value}"
+            f"{incoming_package_unit or ''}"
         )
+
     else:
         if (
             product.package_value is None
-            and incoming_package_value is not None
+            and incoming_package_value
+            is not None
         ):
-            product.package_value = incoming_package_value
-            updated_fields.append("package_value")
+            product.package_value = (
+                incoming_package_value
+            )
+
+            updated_fields.append(
+                "package_value"
+            )
 
         if (
             not product.package_unit
             and incoming_package_unit
         ):
-            product.package_unit = incoming_package_unit
-            updated_fields.append("package_unit")
+            product.package_unit = (
+                incoming_package_unit
+            )
+
+            updated_fields.append(
+                "package_unit"
+            )
 
     if should_fill_text(
         product.subtype,
         incoming.subtype,
     ):
-        product.subtype = clean_text(incoming.subtype)
-        updated_fields.append("subtype")
+        product.subtype = clean_text(
+            incoming.subtype
+        )
+
+        updated_fields.append(
+            "subtype"
+        )
 
     elif (
-        clean_text(product.subtype)
-        and clean_text(incoming.subtype)
-        and normalized(product.subtype)
-        != normalized(incoming.subtype)
+        clean_text(
+            product.subtype
+        )
+        and clean_text(
+            incoming.subtype
+        )
+        and normalized(
+            product.subtype
+        )
+        != normalized(
+            incoming.subtype
+        )
     ):
         conflicts.append(
             "subtype_conflict:"
@@ -847,19 +1768,29 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
         current_value=product.description,
         incoming_value=incoming.description,
     ):
-        product.description = clean_text(
-            incoming.description
+        product.description = (
+            clean_text(
+                incoming.description
+            )
         )
-        updated_fields.append("description")
+
+        updated_fields.append(
+            "description"
+        )
 
     if should_replace_image(
         current_value=product.image_url,
         incoming_value=incoming.image_url,
     ):
-        product.image_url = clean_text(
-            incoming.image_url
+        product.image_url = (
+            clean_text(
+                incoming.image_url
+            )
         )
-        updated_fields.append("image_url")
+
+        updated_fields.append(
+            "image_url"
+        )
 
     merged_keywords = combine_keywords(
         product.keywords,
@@ -868,10 +1799,16 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
 
     if (
         merged_keywords
-        and merged_keywords != product.keywords
+        and merged_keywords
+        != product.keywords
     ):
-        product.keywords = merged_keywords
-        updated_fields.append("keywords")
+        product.keywords = (
+            merged_keywords
+        )
+
+        updated_fields.append(
+            "keywords"
+        )
 
     current_brand_name = (
         current_brand.name
@@ -880,23 +1817,44 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
     )
 
     if (
-        not is_unknown_brand(incoming_brand.name)
+        not is_unknown_brand(
+            incoming_brand.name
+        )
         and (
             current_brand is None
-            or is_unknown_brand(current_brand_name)
+            or is_unknown_brand(
+                current_brand_name
+            )
         )
-        and product.brand_id != incoming_brand.id
+        and product.brand_id
+        != incoming_brand.id
     ):
-        product.brand_id = incoming_brand.id
-        current_brand = incoming_brand
-        updated_fields.append("brand_id")
+        product.brand_id = (
+            incoming_brand.id
+        )
+
+        current_brand = (
+            incoming_brand
+        )
+
+        updated_fields.append(
+            "brand_id"
+        )
 
     elif (
         current_brand is not None
-        and not is_unknown_brand(current_brand.name)
-        and not is_unknown_brand(incoming_brand.name)
-        and normalized(current_brand.name)
-        != normalized(incoming_brand.name)
+        and not is_unknown_brand(
+            current_brand.name
+        )
+        and not is_unknown_brand(
+            incoming_brand.name
+        )
+        and normalized(
+            current_brand.name
+        )
+        != normalized(
+            incoming_brand.name
+        )
     ):
         conflicts.append(
             "brand_conflict:"
@@ -906,9 +1864,11 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
         )
 
     if incoming.category_id is not None:
-        incoming_category = await get_category_by_id(
-            session=session,
-            category_id=incoming.category_id,
+        incoming_category = (
+            await get_category_by_id(
+                session=session,
+                category_id=incoming.category_id,
+            )
         )
 
         if incoming_category is not None:
@@ -930,9 +1890,17 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
                 and product.category_id
                 != incoming_category.id
             ):
-                product.category_id = incoming_category.id
-                current_category = incoming_category
-                updated_fields.append("category_id")
+                product.category_id = (
+                    incoming_category.id
+                )
+
+                current_category = (
+                    incoming_category
+                )
+
+                updated_fields.append(
+                    "category_id"
+                )
 
             elif (
                 current_category is not None
@@ -952,20 +1920,34 @@ async def merge_product_fields( *, session: AsyncSession, product: Product, inco
                     f"{incoming_category.name}"
                 )
 
-    actual_brand = current_brand or incoming_brand
+    actual_brand = (
+        current_brand
+        or incoming_brand
+    )
 
-    new_search_text = build_search_text(
-        product=product,
-        brand=actual_brand,
-        category=current_category,
+    new_search_text = (
+        build_search_text(
+            product=product,
+            brand=actual_brand,
+            category=current_category,
+        )
     )
 
     if (
-        clean_text(product.search_text)
-        != clean_text(new_search_text)
+        clean_text(
+            product.search_text
+        )
+        != clean_text(
+            new_search_text
+        )
     ):
-        product.search_text = new_search_text
-        updated_fields.append("search_text")
+        product.search_text = (
+            new_search_text
+        )
+
+        updated_fields.append(
+            "search_text"
+        )
 
     return (
         updated_fields,
@@ -982,7 +1964,9 @@ async def create_product( *, session: AsyncSession, incoming: ExternalProductDat
             "без category_id."
         )
 
-    product_name = clean_text(incoming.name)
+    product_name = clean_text(
+        incoming.name
+    )
 
     if not product_name:
         raise ValueError(
@@ -992,50 +1976,71 @@ async def create_product( *, session: AsyncSession, incoming: ExternalProductDat
 
     product = Product(
         name=product_name,
-        normalized_name=normalized(product_name),
+        normalized_name=normalized(
+            product_name
+        ),
         brand_id=brand.id,
         category_id=incoming.category_id,
         family_id=incoming.family_id,
         barcode=normalize_barcode(
             incoming.barcode
         ),
-        package_value=normalize_package_value(
-            incoming.package_value
+        package_value=(
+            normalize_package_value(
+                incoming.package_value
+            )
         ),
-        package_unit=normalize_package_unit(
-            incoming.package_unit
+        package_unit=(
+            normalize_package_unit(
+                incoming.package_unit
+            )
         ),
         subtype=(
-            clean_text(incoming.subtype)
+            clean_text(
+                incoming.subtype
+            )
             or None
         ),
         description=(
-            clean_text(incoming.description)
+            clean_text(
+                incoming.description
+            )
             or None
         ),
         image_url=(
-            clean_text(incoming.image_url)
+            clean_text(
+                incoming.image_url
+            )
             or None
         ),
         keywords=(
-            clean_text(incoming.keywords)
+            clean_text(
+                incoming.keywords
+            )
             or None
         ),
         is_active=True,
     )
 
-    session.add(product)
-    await session.flush()
-
-    category = await get_category_by_id(
-        session=session,
-        category_id=product.category_id,
+    session.add(
+        product
     )
 
-    product.search_text = build_search_text(
-        product=product,
-        brand=brand,
-        category=category,
+    await session.flush()
+
+    category = (
+        await get_category_by_id(
+            session=session,
+            category_id=product.category_id,
+        )
+    )
+
+    product.search_text = (
+        build_search_text(
+            product=product,
+            brand=brand,
+            category=category,
+        )
     )
 
     await session.flush()
@@ -1043,65 +2048,143 @@ async def create_product( *, session: AsyncSession, incoming: ExternalProductDat
     return product
 
 
+def created_product_updated_fields( *, product: Product, ) -> tuple[
+    str,
+    ...
+]:
+    """ Возвращает только реально заполненные поля. Это исправляет старую диагностику, где subtype/barcode могли логироваться как updated, хотя фактически были None. """
+
+    fields: list[str] = [
+        "name",
+        "brand_id",
+        "category_id",
+    ]
+
+    optional_fields = (
+        "family_id",
+        "barcode",
+        "package_value",
+        "package_unit",
+        "subtype",
+        "description",
+        "image_url",
+        "keywords",
+        "search_text",
+    )
+
+    for field in optional_fields:
+        value = getattr(
+            product,
+            field,
+            None,
+        )
+
+        if value is None:
+            continue
+
+        if (
+            isinstance(
+                value,
+                str,
+            )
+            and not value.strip()
+        ):
+            continue
+
+        fields.append(
+            field
+        )
+
+    return tuple(
+        fields
+    )
+
+
 async def merge_external_product( *, session: AsyncSession, incoming: ExternalProductData, commit: bool = False, ) -> ProductMergeResult:
-    source = clean_text(incoming.source)
+    """ Главная точка Product Merge Engine. Цель: несколько внешних источников должны улучшать ОДНУ каноническую карточку, если есть достаточно доказательств, что это один SKU. Жёсткие конфликты: - разные известные barcode; - несовместимые известные упаковки; - разные конкретные категории при fuzzy-match. При сомнении система НЕ склеивает товары. """
+
+    source = clean_text(
+        incoming.source
+    )
 
     if not source:
         raise ValueError(
             "Не указан источник товара."
         )
 
-    if not clean_text(incoming.name):
+    if not clean_text(
+        incoming.name
+    ):
         raise ValueError(
             "Не указано название товара."
         )
 
     incoming.source_priority = max(
         0,
-        min(int(incoming.source_priority), 100),
+        min(
+            int(
+                incoming.source_priority
+            ),
+            100,
+        ),
     )
+
     incoming.confidence = max(
         0.0,
-        min(float(incoming.confidence), 100.0),
+        min(
+            float(
+                incoming.confidence
+            ),
+            100.0,
+        ),
     )
 
-    incoming_brand = await get_or_create_brand(
-        session=session,
-        brand_name=incoming.brand_name,
+    incoming_brand = (
+        await get_or_create_brand(
+            session=session,
+            brand_name=incoming.brand_name,
+        )
     )
 
-    product, match_type = await find_matching_product(
+    (
+        product,
+        match_type,
+    ) = await find_matching_product(
         session=session,
         incoming=incoming,
         brand=incoming_brand,
     )
 
     created = False
-    result_brand = incoming_brand
-    conflicts: tuple[str, ...] = ()
+
+    result_brand = (
+        incoming_brand
+    )
+
+    conflicts: tuple[
+        str,
+        ...
+    ] = ()
 
     if product is None:
-        product = await create_product(
-            session=session,
-            incoming=incoming,
-            brand=incoming_brand,
+        product = (
+            await create_product(
+                session=session,
+                incoming=incoming,
+                brand=incoming_brand,
+            )
         )
 
         created = True
-        match_type = ProductMatchType.CREATED
+
+        match_type = (
+            ProductMatchType.CREATED
+        )
 
         updated_fields = (
-            "name",
-            "brand_id",
-            "category_id",
-            "barcode",
-            "package_value",
-            "package_unit",
-            "subtype",
-            "description",
-            "image_url",
-            "keywords",
-            "search_text",
+            created_product_updated_fields(
+                product=product
+            )
         )
 
     else:
@@ -1120,6 +2203,7 @@ async def merge_external_product( *, session: AsyncSession, incoming: ExternalPr
         updated_fields = tuple(
             updated_list
         )
+
         conflicts = tuple(
             conflict_list
         )
