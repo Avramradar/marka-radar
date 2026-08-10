@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import html
+import re
 from collections import Counter
-from collections import defaultdict
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
+from typing import Iterable
 
-from sqlalchemy import func
 from sqlalchemy import select
 
 from app.database.models.brand import Brand
@@ -19,37 +20,49 @@ from app.database.session import async_session_maker
 from app.services.product_merge_service import (
     identity_name_similarity,
     normalize_barcode,
+    normalize_package_unit,
     normalized,
     package_values_compatible,
 )
 
 
 #
-# MarkaRadar Duplicate Candidate Verifier v1
+# MarkaRadar Duplicate Candidate Verifier v2
 #
-# Назначение:
-# - взять только уже отобранные потенциальные дубли;
-# - глубже проверить их по независимым доказательствам;
-# - определить финальный класс;
-# - предложить каноническую карточку;
-# - НИЧЕГО не менять в БД.
+# Что исправлено относительно v1:
 #
-# Финальные классы:
+# 1. Значимые SKU-варианты больше не теряются.
+# Примеры:
+# "Сервелат финский" != "Сервелат"
+# "Сливушка с индейкой" != "Сливушка"
 #
-# CONFIRMED_SAME_SKU
-# Доказательств достаточно, что это один SKU.
+# Односторонний variant-token не позволяет подтвердить SAME_SKU
+# без независимого доказательства.
 #
-# NEEDS_MANUAL_REVIEW
-# Пара очень похожа, но данных недостаточно
-# или есть противоречие, которое нельзя безопасно
-# разрешить автоматически.
+# 2. Используются эквивалентные категории.
+# Например:
+# "Smetana" ~= "Молочная продукция"
 #
-# CONFIRMED_DIFFERENT_SKU
-# Есть сильное доказательство, что это разные SKU.
+# Разные технические названия совместимых категорий больше
+# не считаются автоматическим доказательством разных SKU.
 #
-# ВАЖНО:
-# AUTO MERGE EXECUTED: NO
-# DATABASE CHANGES: NONE
+# 3. Barcode только на одной стороне не является отрицательным
+# доказательством.
+#
+# 4. Разные известные barcode никогда не дают автоматическое
+# CONFIRMED_SAME_SKU.
+#
+# 5. Для CONFIRMED_SAME_SKU теперь обязательно нужно независимое
+# подтверждение:
+# - одинаковый barcode; ИЛИ
+# - одинаковый provider+source_id; ИЛИ
+# - две независимые внешние карточки разных providers
+# при точном совпадении core identity.
+#
+# 6. Без такого независимого подтверждения даже очень похожая
+# пара остаётся NEEDS_MANUAL_REVIEW.
+#
+# 7. База данных НЕ изменяется.
 #
 
 
@@ -73,6 +86,51 @@ class ProductBundle:
     category: Category
     family: ProductFamily | None
     sources: tuple[SourceInfo, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class PairEvidence:
+    same_brand: bool
+
+    same_name: bool
+    name_coverage: float
+    name_jaccard: float
+    name_common_count: int
+
+    category_compatible: bool
+
+    left_barcode: str | None
+    right_barcode: str | None
+    same_barcode: bool
+    different_known_barcodes: bool
+    one_barcode_only: bool
+
+    package_compatible: bool | None
+
+    left_percentages: tuple[str, ...]
+    right_percentages: tuple[str, ...]
+
+    left_counts: tuple[str, ...]
+    right_counts: tuple[str, ...]
+
+    left_name_packages: tuple[str, ...]
+    right_name_packages: tuple[str, ...]
+
+    left_variants: tuple[str, ...]
+    right_variants: tuple[str, ...]
+
+    left_only_variants: tuple[str, ...]
+    right_only_variants: tuple[str, ...]
+
+    subtype_equal: bool | None
+    same_family: bool | None
+
+    shared_source_identity: bool
+    independent_external_sources: bool
+    same_provider_different_source_ids: bool
+
+    positive_evidence: tuple[str, ...]
+    negative_evidence: tuple[str, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -107,18 +165,21 @@ class VerificationResult:
     left_sources: tuple[SourceInfo, ...]
     right_sources: tuple[SourceInfo, ...]
 
+    left_variants: tuple[str, ...]
+    right_variants: tuple[str, ...]
+
+    left_only_variants: tuple[str, ...]
+    right_only_variants: tuple[str, ...]
+
     positive_evidence: tuple[str, ...]
     negative_evidence: tuple[str, ...]
 
 
 #
-# Здесь перечисляем пары, которые хотим глубоко проверить.
+# Первый тестовый набор.
 #
-# На первом запуске берём известные REVIEW-кандидаты
-# из текущего сита.
-#
-# После запуска можно расширить этот список ID-парами
-# из FINAL SUMMARY, не меняя остальной код.
+# Пока сознательно проверяем те же 3 пары,
+# чтобы сравнить результат v2 с v1.
 #
 CANDIDATE_PAIRS: tuple[
     tuple[int, int],
@@ -132,6 +193,156 @@ CANDIDATE_PAIRS: tuple[
 
 MAX_RESULTS_OUTPUT = 100
 FINAL_TOP_IDS = 50
+
+
+PERCENT_PATTERN = re.compile(
+    r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*%",
+    flags=re.IGNORECASE,
+)
+
+COUNT_PATTERN = re.compile(
+    r"(?<![\d.,])(\d+)\s*"
+    r"(шт|штук|капсул|пакетик(?:а|ов)?|"
+    r"саше|порц(?:ия|ии|ий))\b",
+    flags=re.IGNORECASE,
+)
+
+PACKAGE_IN_NAME_PATTERN = re.compile(
+    r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*"
+    r"(кг|г|гр|мл|л)\b",
+    flags=re.IGNORECASE,
+)
+
+WORD_PATTERN = re.compile(
+    r"[a-zа-я0-9]+",
+    flags=re.IGNORECASE,
+)
+
+PACKAGE_TOKEN_PATTERN = re.compile(
+    r"^\d+(?:[.,]\d+)?(?:г|гр|кг|мл|л)$",
+    flags=re.IGNORECASE,
+)
+
+
+GENERIC_VARIANT_WORDS = {
+    "колбаса",
+    "сервелат",
+    "сметана",
+    "молоко",
+    "кофе",
+    "пельмени",
+    "майонез",
+    "сыр",
+    "масло",
+    "йогурт",
+    "кефир",
+    "творог",
+    "сливки",
+    "напиток",
+    "напитки",
+    "вода",
+    "чай",
+    "кетчуп",
+
+    "капсулах",
+    "капсулы",
+    "кофемашин",
+    "nespresso",
+
+    "вареная",
+    "вареный",
+    "вареное",
+    "варено",
+    "копченая",
+    "копченый",
+    "копченое",
+    "копченые",
+    "варенокопченая",
+    "варенокопченый",
+
+    "ультрапастеризованное",
+    "пастеризованное",
+
+    "сливочная",
+    "классическая",
+    "классический",
+
+    "традиции",
+    "традиционный",
+    "традиционная",
+    "традиционное",
+
+    "гост",
+    "бзмж",
+
+    "для",
+    "из",
+    "на",
+    "с",
+    "со",
+    "без",
+
+    "quot",
+    "amp",
+    "lt",
+    "gt",
+    "nbsp",
+}
+
+
+CATEGORY_EQUIVALENCE_GROUPS = (
+    {
+        "молочная продукция",
+        "dairy",
+        "dairy products",
+        "milk products",
+        "smetana",
+    },
+    {
+        "напитки",
+        "beverages",
+        "drinks",
+    },
+    {
+        "чай",
+        "teas",
+        "tea",
+    },
+    {
+        "батончики",
+        "bars",
+        "chocolate bars",
+    },
+    {
+        "вода",
+        "drinking water",
+        "water",
+    },
+    {
+        "кетчуп",
+        "ketchup",
+    },
+    {
+        "колбаса",
+        "sausages",
+        "sausage",
+    },
+)
+
+
+GENERIC_CATEGORY_NAMES = {
+    "",
+    "продукты",
+    "продукт",
+    "еда",
+    "food",
+    "foods",
+    "products",
+    "product",
+    "прочее",
+    "другое",
+    "other",
+}
 
 
 def clean_text( value: object, ) -> str:
@@ -169,6 +380,34 @@ def normalized_clean( value: object, ) -> str:
     )
 
 
+def decimal_text( value: str, ) -> str:
+    try:
+        number = Decimal(
+            value.replace(
+                ",",
+                ".",
+            )
+        )
+    except Exception:
+        return value.replace(
+            ",",
+            ".",
+        )
+
+    if (
+        number
+        == number.to_integral()
+    ):
+        return str(
+            int(number)
+        )
+
+    return format(
+        number.normalize(),
+        "f",
+    )
+
+
 def package_text( product: Product, ) -> str:
     if product.package_value is None:
         return ""
@@ -179,18 +418,240 @@ def package_text( product: Product, ) -> str:
     )
 
 
-def normalize_optional_text( value: str | None, ) -> str:
-    return normalized_clean(
+def extract_percentages( value: str | None, ) -> tuple[str, ...]:
+    text = clean_html_text(
+        value
+    ).lower().replace(
+        "ё",
+        "е",
+    )
+
+    return tuple(
+        sorted(
+            {
+                decimal_text(
+                    match.group(1)
+                )
+                for match
+                in PERCENT_PATTERN.finditer(
+                    text
+                )
+            }
+        )
+    )
+
+
+def extract_counts( value: str | None, ) -> tuple[str, ...]:
+    text = clean_html_text(
+        value
+    ).lower().replace(
+        "ё",
+        "е",
+    )
+
+    values: set[str] = set()
+
+    for match in COUNT_PATTERN.finditer(
+        text
+    ):
+        values.add(
+            f"{match.group(1)}:"
+            f"{match.group(2).lower().replace('ё', 'е')}"
+        )
+
+    return tuple(
+        sorted(
+            values
+        )
+    )
+
+
+def extract_name_packages( value: str | None, ) -> tuple[str, ...]:
+    text = clean_html_text(
+        value
+    ).lower().replace(
+        "ё",
+        "е",
+    )
+
+    values: set[str] = set()
+
+    for match in PACKAGE_IN_NAME_PATTERN.finditer(
+        text
+    ):
+        unit = normalize_package_unit(
+            match.group(2)
+        )
+
+        if not unit:
+            continue
+
+        values.add(
+            f"{decimal_text(match.group(1))}:"
+            f"{unit}"
+        )
+
+    return tuple(
+        sorted(
+            values
+        )
+    )
+
+
+def values_conflict( left_values: Iterable[str], right_values: Iterable[str], ) -> bool:
+    left = set(
+        left_values
+    )
+
+    right = set(
+        right_values
+    )
+
+    return bool(
+        left
+        and right
+        and left != right
+    )
+
+
+def tokenize_brand( brand_name: str | None, ) -> set[str]:
+    return {
+        token
+        for token
+        in WORD_PATTERN.findall(
+            normalized_clean(
+                brand_name
+            )
+        )
+        if len(token) >= 3
+    }
+
+
+def variant_tokens( value: str | None, *, brand_name: str | None, ) -> set[str]:
+    text = normalized_clean(
         value
     )
 
+    brand_tokens = tokenize_brand(
+        brand_name
+    )
+
+    result: set[str] = set()
+
+    for token in WORD_PATTERN.findall(
+        text
+    ):
+        if len(token) < 3:
+            continue
+
+        if token.isdigit():
+            continue
+
+        if token in brand_tokens:
+            continue
+
+        if token in GENERIC_VARIANT_WORDS:
+            continue
+
+        if PACKAGE_TOKEN_PATTERN.fullmatch(
+            token
+        ):
+            continue
+
+        result.add(
+            token
+        )
+
+    return result
+
+
+def category_bucket( category_name: str | None, ) -> str:
+    key = normalized_clean(
+        category_name
+    )
+
+    if not key:
+        return ""
+
+    for index, group in enumerate(
+        CATEGORY_EQUIVALENCE_GROUPS,
+        start=1,
+    ):
+        normalized_group = {
+            normalized_clean(
+                item
+            )
+            for item in group
+        }
+
+        if key in normalized_group:
+            return (
+                f"equiv:{index}"
+            )
+
+    return key
+
+
+def is_generic_category_name( category_name: str | None, ) -> bool:
+    key = normalized_clean(
+        category_name
+    )
+
+    return (
+        key
+        in {
+            normalized_clean(
+                item
+            )
+            for item
+            in GENERIC_CATEGORY_NAMES
+        }
+    )
+
+
+def categories_compatible( left: Category, right: Category, ) -> bool:
+    if left.id == right.id:
+        return True
+
+    left_bucket = category_bucket(
+        left.name
+    )
+
+    right_bucket = category_bucket(
+        right.name
+    )
+
+    if (
+        left_bucket
+        and right_bucket
+        and left_bucket
+        == right_bucket
+    ):
+        return True
+
+    #
+    # Общая категория "Продукты" не является
+    # конфликтом, но и не даёт сильного подтверждения.
+    #
+    if (
+        is_generic_category_name(
+            left.name
+        )
+        or is_generic_category_name(
+            right.name
+        )
+    ):
+        return True
+
+    return False
+
 
 def same_optional_text( left: str | None, right: str | None, ) -> bool | None:
-    left_value = normalize_optional_text(
+    left_value = normalized_clean(
         left
     )
 
-    right_value = normalize_optional_text(
+    right_value = normalized_clean(
         right
     )
 
@@ -208,9 +669,14 @@ def same_optional_text( left: str | None, right: str | None, ) -> bool | None:
 
 def source_provider_set( bundle: ProductBundle, ) -> set[str]:
     return {
-        source.provider
+        normalized_clean(
+            source.provider
+        )
         for source
         in bundle.sources
+        if normalized_clean(
+            source.provider
+        )
     }
 
 
@@ -219,11 +685,23 @@ def source_identity_set( bundle: ProductBundle, ) -> set[
 ]:
     return {
         (
-            source.provider,
-            source.source_id,
+            normalized_clean(
+                source.provider
+            ),
+            clean_text(
+                source.source_id
+            ),
         )
         for source
         in bundle.sources
+        if (
+            normalized_clean(
+                source.provider
+            )
+            and clean_text(
+                source.source_id
+            )
+        )
     }
 
 
@@ -278,13 +756,11 @@ def product_completeness_score( bundle: ProductBundle, ) -> float:
     ):
         score += 15.0
 
-    score += (
-        min(
-            text_quality_score(
-                product.description
-            ),
-            20.0,
-        )
+    score += min(
+        text_quality_score(
+            product.description
+        ),
+        20.0,
     )
 
     if clean_text(
@@ -331,12 +807,6 @@ def choose_canonical_product( *, left: ProductBundle, right: ProductBundle, ) ->
     if right_score > left_score:
         return right.product.id
 
-    #
-    # При равенстве предпочитаем карточку:
-    # 1. с barcode;
-    # 2. с большим числом источников;
-    # 3. с меньшим ID как более старую.
-    #
     left_barcode = normalize_barcode(
         left.product.barcode
     )
@@ -429,10 +899,6 @@ async def load_bundle( *, session, product_id: int, ) -> ProductBundle | None:
         )
     )
 
-    source_rows = list(
-        sources_result.scalars().all()
-    )
-
     sources = tuple(
         SourceInfo(
             provider=source.provider,
@@ -440,7 +906,7 @@ async def load_bundle( *, session, product_id: int, ) -> ProductBundle | None:
             source_url=source.source_url,
         )
         for source
-        in source_rows
+        in sources_result.scalars().all()
     )
 
     return ProductBundle(
@@ -452,23 +918,15 @@ async def load_bundle( *, session, product_id: int, ) -> ProductBundle | None:
     )
 
 
-def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> VerificationResult:
+def build_evidence( *, left: ProductBundle, right: ProductBundle, ) -> PairEvidence:
     positive: list[str] = []
     negative: list[str] = []
 
     left_product = left.product
     right_product = right.product
 
-    left_barcode = normalize_barcode(
-        left_product.barcode
-    )
-
-    right_barcode = normalize_barcode(
-        right_product.barcode
-    )
-
     #
-    # 1. BRAND
+    # BRAND
     #
     same_brand = (
         normalized_clean(
@@ -489,7 +947,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
 
     #
-    # 2. NAME
+    # NAME
     #
     same_name = (
         normalized_clean(
@@ -527,11 +985,18 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
     elif (
         common_count >= 2
-        and coverage >= 0.80
-        and jaccard >= 0.55
+        and coverage >= 0.75
+        and jaccard >= 0.50
     ):
         positive.append(
             "strong_name_similarity"
+        )
+    elif (
+        common_count >= 1
+        and coverage >= 0.50
+    ):
+        positive.append(
+            "related_name"
         )
     else:
         negative.append(
@@ -539,32 +1004,79 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
 
     #
-    # 3. BARCODE
+    # CATEGORY
     #
-    if (
+    category_compatible = (
+        categories_compatible(
+            left.category,
+            right.category,
+        )
+    )
+
+    if category_compatible:
+        positive.append(
+            "compatible_category"
+        )
+    else:
+        negative.append(
+            "different_category"
+        )
+
+    #
+    # BARCODE
+    #
+    left_barcode = normalize_barcode(
+        left_product.barcode
+    )
+
+    right_barcode = normalize_barcode(
+        right_product.barcode
+    )
+
+    same_barcode = bool(
         left_barcode
         and right_barcode
-    ):
-        if (
+        and left_barcode
+        == right_barcode
+    )
+
+    different_known_barcodes = bool(
+        left_barcode
+        and right_barcode
+        and left_barcode
+        != right_barcode
+    )
+
+    one_barcode_only = (
+        bool(
             left_barcode
-            == right_barcode
-        ):
-            positive.append(
-                "same_barcode"
-            )
-        else:
-            negative.append(
-                "different_barcode"
-            )
-    elif bool(left_barcode) != bool(
-        right_barcode
-    ):
+        )
+        != bool(
+            right_barcode
+        )
+    )
+
+    if same_barcode:
+        positive.append(
+            "same_barcode"
+        )
+
+    elif different_known_barcodes:
+        negative.append(
+            "different_barcode"
+        )
+
+    elif one_barcode_only:
+        #
+        # Не плюс и не минус для identity.
+        # Просто фиксируем факт.
+        #
         positive.append(
             "barcode_known_on_one_side"
         )
 
     #
-    # 4. PACKAGE
+    # PACKAGE
     #
     package_compatibility = (
         package_values_compatible(
@@ -594,7 +1106,137 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
 
     #
-    # 5. SUBTYPE
+    # PERCENTAGE / COUNT / PACKAGE INSIDE NAME
+    #
+    left_percentages = extract_percentages(
+        left_product.name
+    )
+
+    right_percentages = extract_percentages(
+        right_product.name
+    )
+
+    left_counts = extract_counts(
+        left_product.name
+    )
+
+    right_counts = extract_counts(
+        right_product.name
+    )
+
+    left_name_packages = extract_name_packages(
+        left_product.name
+    )
+
+    right_name_packages = extract_name_packages(
+        right_product.name
+    )
+
+    if values_conflict(
+        left_percentages,
+        right_percentages,
+    ):
+        negative.append(
+            "different_percentage"
+        )
+    elif (
+        left_percentages
+        and right_percentages
+        and left_percentages
+        == right_percentages
+    ):
+        positive.append(
+            "same_percentage"
+        )
+
+    if values_conflict(
+        left_counts,
+        right_counts,
+    ):
+        negative.append(
+            "different_count"
+        )
+    elif (
+        left_counts
+        and right_counts
+        and left_counts
+        == right_counts
+    ):
+        positive.append(
+            "same_count"
+        )
+
+    if values_conflict(
+        left_name_packages,
+        right_name_packages,
+    ):
+        negative.append(
+            "different_name_package"
+        )
+    elif (
+        left_name_packages
+        and right_name_packages
+        and left_name_packages
+        == right_name_packages
+    ):
+        positive.append(
+            "same_name_package"
+        )
+
+    #
+    # SKU VARIANTS
+    #
+    left_variants_set = variant_tokens(
+        left_product.name,
+        brand_name=left.brand.name,
+    )
+
+    right_variants_set = variant_tokens(
+        right_product.name,
+        brand_name=right.brand.name,
+    )
+
+    common_variants = (
+        left_variants_set
+        & right_variants_set
+    )
+
+    left_only_variants = (
+        left_variants_set
+        - common_variants
+    )
+
+    right_only_variants = (
+        right_variants_set
+        - common_variants
+    )
+
+    if (
+        left_only_variants
+        and right_only_variants
+    ):
+        negative.append(
+            "different_variant_tokens"
+        )
+
+    elif (
+        left_only_variants
+        or right_only_variants
+    ):
+        negative.append(
+            "one_sided_variant_tokens"
+        )
+
+    elif (
+        left_variants_set
+        and right_variants_set
+    ):
+        positive.append(
+            "same_variant_tokens"
+        )
+
+    #
+    # SUBTYPE
     #
     subtype_equal = same_optional_text(
         left_product.subtype,
@@ -612,16 +1254,20 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         )
 
     #
-    # 6. FAMILY
+    # FAMILY
     #
+    same_family: bool | None = None
+
     if (
         left.family is not None
         and right.family is not None
     ):
-        if (
+        same_family = (
             left.family.id
             == right.family.id
-        ):
+        )
+
+        if same_family:
             positive.append(
                 "same_family"
             )
@@ -631,7 +1277,7 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             )
 
     #
-    # 7. SOURCES
+    # SOURCES
     #
     left_source_ids = (
         source_identity_set(
@@ -653,14 +1299,27 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
         right
     )
 
-    shared_source_identity = (
+    shared_source_identity = bool(
         left_source_ids
         & right_source_ids
     )
 
-    independent_providers = (
-        left_providers
-        | right_providers
+    independent_external_sources = bool(
+        left.sources
+        and right.sources
+        and len(
+            left_providers
+            | right_providers
+        ) >= 2
+    )
+
+    same_provider_different_source_ids = bool(
+        left.sources
+        and right.sources
+        and left_providers
+        and left_providers
+        == right_providers
+        and not shared_source_identity
     )
 
     if shared_source_identity:
@@ -668,360 +1327,101 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             "shared_provider_source_identity"
         )
 
-    if (
-        left.sources
-        and right.sources
-        and not shared_source_identity
-        and len(
-            independent_providers
-        ) >= 2
-    ):
+    if independent_external_sources:
         positive.append(
             "independent_external_sources"
         )
 
-    if (
-        left.sources
-        and right.sources
-        and left_providers
-        == right_providers
-        and not shared_source_identity
-    ):
+    if same_provider_different_source_ids:
         negative.append(
             "same_provider_different_source_ids"
         )
 
-    #
-    # 8. DESCRIPTION
-    #
-    description_equal = (
-        same_optional_text(
-            left_product.description,
-            right_product.description,
-        )
-    )
-
-    if description_equal is True:
-        positive.append(
-            "same_description"
-        )
-
-    #
-    # 9. CATEGORY
-    #
-    same_category = (
-        left.category.id
-        == right.category.id
-        or normalized_clean(
-            left.category.name
-        )
-        == normalized_clean(
-            right.category.name
-        )
-    )
-
-    if same_category:
-        positive.append(
-            "same_category"
-        )
-    else:
-        negative.append(
-            "different_category"
-        )
-
-    #
-    # РЕШЕНИЕ.
-    #
-    hard_negative = {
-        "different_brand",
-        "different_package",
-        "different_subtype",
-    }
-
-    if (
-        hard_negative
-        & set(
+    return PairEvidence(
+        same_brand=same_brand,
+        same_name=same_name,
+        name_coverage=coverage,
+        name_jaccard=jaccard,
+        name_common_count=common_count,
+        category_compatible=category_compatible,
+        left_barcode=left_barcode,
+        right_barcode=right_barcode,
+        same_barcode=same_barcode,
+        different_known_barcodes=(
+            different_known_barcodes
+        ),
+        one_barcode_only=(
+            one_barcode_only
+        ),
+        package_compatible=(
+            package_compatibility
+        ),
+        left_percentages=(
+            left_percentages
+        ),
+        right_percentages=(
+            right_percentages
+        ),
+        left_counts=left_counts,
+        right_counts=right_counts,
+        left_name_packages=(
+            left_name_packages
+        ),
+        right_name_packages=(
+            right_name_packages
+        ),
+        left_variants=tuple(
+            sorted(
+                left_variants_set
+            )
+        ),
+        right_variants=tuple(
+            sorted(
+                right_variants_set
+            )
+        ),
+        left_only_variants=tuple(
+            sorted(
+                left_only_variants
+            )
+        ),
+        right_only_variants=tuple(
+            sorted(
+                right_only_variants
+            )
+        ),
+        subtype_equal=subtype_equal,
+        same_family=same_family,
+        shared_source_identity=(
+            shared_source_identity
+        ),
+        independent_external_sources=(
+            independent_external_sources
+        ),
+        same_provider_different_source_ids=(
+            same_provider_different_source_ids
+        ),
+        positive_evidence=tuple(
+            positive
+        ),
+        negative_evidence=tuple(
             negative
-        )
-    ):
-        return VerificationResult(
-            classification=(
-                VerificationClass.CONFIRMED_DIFFERENT_SKU
-            ),
-            reason=(
-                "hard_identity_conflict"
-            ),
-            confidence=99.0,
-            left_id=left_product.id,
-            right_id=right_product.id,
-            canonical_product_id=None,
-            left_name=left_product.name,
-            right_name=right_product.name,
-            left_brand=left.brand.name,
-            right_brand=right.brand.name,
-            left_category=(
-                left.category.name
-            ),
-            right_category=(
-                right.category.name
-            ),
-            left_family=(
-                left.family.name
-                if left.family is not None
-                else None
-            ),
-            right_family=(
-                right.family.name
-                if right.family is not None
-                else None
-            ),
-            left_barcode=left_barcode,
-            right_barcode=right_barcode,
-            left_package=package_text(
-                left_product
-            ),
-            right_package=package_text(
-                right_product
-            ),
-            left_sources=left.sources,
-            right_sources=right.sources,
-            positive_evidence=tuple(
-                positive
-            ),
-            negative_evidence=tuple(
-                negative
-            ),
-        )
-
-    #
-    # Разные известные barcode не позволяют
-    # автоматически подтвердить один SKU.
-    #
-    if "different_barcode" in negative:
-        return VerificationResult(
-            classification=(
-                VerificationClass.NEEDS_MANUAL_REVIEW
-            ),
-            reason=(
-                "barcode_conflict_requires_external_confirmation"
-            ),
-            confidence=70.0,
-            left_id=left_product.id,
-            right_id=right_product.id,
-            canonical_product_id=None,
-            left_name=left_product.name,
-            right_name=right_product.name,
-            left_brand=left.brand.name,
-            right_brand=right.brand.name,
-            left_category=(
-                left.category.name
-            ),
-            right_category=(
-                right.category.name
-            ),
-            left_family=(
-                left.family.name
-                if left.family is not None
-                else None
-            ),
-            right_family=(
-                right.family.name
-                if right.family is not None
-                else None
-            ),
-            left_barcode=left_barcode,
-            right_barcode=right_barcode,
-            left_package=package_text(
-                left_product
-            ),
-            right_package=package_text(
-                right_product
-            ),
-            left_sources=left.sources,
-            right_sources=right.sources,
-            positive_evidence=tuple(
-                positive
-            ),
-            negative_evidence=tuple(
-                negative
-            ),
-        )
-
-    strong_identity = bool(
-        "same_barcode" in positive
-        or (
-            "exact_normalized_name"
-            in positive
-            and "same_brand"
-            in positive
-            and "same_package"
-            in positive
-        )
-        or (
-            "very_strong_name_similarity"
-            in positive
-            and "same_brand"
-            in positive
-            and "same_package"
-            in positive
-            and (
-                "independent_external_sources"
-                in positive
-                or "same_family"
-                in positive
-                or "same_subtype"
-                in positive
-            )
-        )
+        ),
     )
 
-    if strong_identity:
-        canonical_id = (
-            choose_canonical_product(
-                left=left,
-                right=right,
-            )
-        )
 
-        confidence = 96.0
-
-        if (
-            "same_barcode"
-            in positive
-        ):
-            confidence = 100.0
-
-        elif (
-            "independent_external_sources"
-            in positive
-        ):
-            confidence = 98.0
-
-        return VerificationResult(
-            classification=(
-                VerificationClass.CONFIRMED_SAME_SKU
-            ),
-            reason=(
-                "multiple_independent_identity_signals"
-            ),
-            confidence=confidence,
-            left_id=left_product.id,
-            right_id=right_product.id,
-            canonical_product_id=(
-                canonical_id
-            ),
-            left_name=left_product.name,
-            right_name=right_product.name,
-            left_brand=left.brand.name,
-            right_brand=right.brand.name,
-            left_category=(
-                left.category.name
-            ),
-            right_category=(
-                right.category.name
-            ),
-            left_family=(
-                left.family.name
-                if left.family is not None
-                else None
-            ),
-            right_family=(
-                right.family.name
-                if right.family is not None
-                else None
-            ),
-            left_barcode=left_barcode,
-            right_barcode=right_barcode,
-            left_package=package_text(
-                left_product
-            ),
-            right_package=package_text(
-                right_product
-            ),
-            left_sources=left.sources,
-            right_sources=right.sources,
-            positive_evidence=tuple(
-                positive
-            ),
-            negative_evidence=tuple(
-                negative
-            ),
-        )
-
-    #
-    # Если есть сильное сходство, но не хватает
-    # независимого подтверждения — ручная проверка.
-    #
-    if (
-        "exact_normalized_name"
-        in positive
-        or "very_strong_name_similarity"
-        in positive
-        or "strong_name_similarity"
-        in positive
-    ):
-        return VerificationResult(
-            classification=(
-                VerificationClass.NEEDS_MANUAL_REVIEW
-            ),
-            reason=(
-                "strong_similarity_but_not_enough_independent_evidence"
-            ),
-            confidence=80.0,
-            left_id=left_product.id,
-            right_id=right_product.id,
-            canonical_product_id=None,
-            left_name=left_product.name,
-            right_name=right_product.name,
-            left_brand=left.brand.name,
-            right_brand=right.brand.name,
-            left_category=(
-                left.category.name
-            ),
-            right_category=(
-                right.category.name
-            ),
-            left_family=(
-                left.family.name
-                if left.family is not None
-                else None
-            ),
-            right_family=(
-                right.family.name
-                if right.family is not None
-                else None
-            ),
-            left_barcode=left_barcode,
-            right_barcode=right_barcode,
-            left_package=package_text(
-                left_product
-            ),
-            right_package=package_text(
-                right_product
-            ),
-            left_sources=left.sources,
-            right_sources=right.sources,
-            positive_evidence=tuple(
-                positive
-            ),
-            negative_evidence=tuple(
-                negative
-            ),
-        )
-
+def make_result( *, classification: VerificationClass, reason: str, confidence: float, left: ProductBundle, right: ProductBundle, evidence: PairEvidence, canonical_product_id: int | None, ) -> VerificationResult:
     return VerificationResult(
-        classification=(
-            VerificationClass.CONFIRMED_DIFFERENT_SKU
+        classification=classification,
+        reason=reason,
+        confidence=confidence,
+        left_id=left.product.id,
+        right_id=right.product.id,
+        canonical_product_id=(
+            canonical_product_id
         ),
-        reason=(
-            "insufficient_identity_overlap"
-        ),
-        confidence=95.0,
-        left_id=left_product.id,
-        right_id=right_product.id,
-        canonical_product_id=None,
-        left_name=left_product.name,
-        right_name=right_product.name,
+        left_name=left.product.name,
+        right_name=right.product.name,
         left_brand=left.brand.name,
         right_brand=right.brand.name,
         left_category=(
@@ -1040,22 +1440,376 @@ def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> Verification
             if right.family is not None
             else None
         ),
-        left_barcode=left_barcode,
-        right_barcode=right_barcode,
+        left_barcode=(
+            evidence.left_barcode
+        ),
+        right_barcode=(
+            evidence.right_barcode
+        ),
         left_package=package_text(
-            left_product
+            left.product
         ),
         right_package=package_text(
-            right_product
+            right.product
         ),
         left_sources=left.sources,
         right_sources=right.sources,
-        positive_evidence=tuple(
-            positive
+        left_variants=(
+            evidence.left_variants
         ),
-        negative_evidence=tuple(
-            negative
+        right_variants=(
+            evidence.right_variants
         ),
+        left_only_variants=(
+            evidence.left_only_variants
+        ),
+        right_only_variants=(
+            evidence.right_only_variants
+        ),
+        positive_evidence=(
+            evidence.positive_evidence
+        ),
+        negative_evidence=(
+            evidence.negative_evidence
+        ),
+    )
+
+
+def verify_pair( *, left: ProductBundle, right: ProductBundle, ) -> VerificationResult:
+    evidence = build_evidence(
+        left=left,
+        right=right,
+    )
+
+    negative = set(
+        evidence.negative_evidence
+    )
+
+    positive = set(
+        evidence.positive_evidence
+    )
+
+    #
+    # ЖЁСТКИЕ ДОКАЗАТЕЛЬСТВА РАЗНЫХ SKU.
+    #
+    # Здесь только признаки, которые достаточно
+    # надёжны, чтобы не отправлять пару дальше.
+    #
+    hard_different = {
+        "different_brand",
+        "different_package",
+        "different_percentage",
+        "different_count",
+        "different_name_package",
+        "different_variant_tokens",
+    }
+
+    if (
+        hard_different
+        & negative
+    ):
+        return make_result(
+            classification=(
+                VerificationClass.CONFIRMED_DIFFERENT_SKU
+            ),
+            reason=(
+                "hard_identity_conflict"
+            ),
+            confidence=99.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # Разные известные barcode + variant difference
+    # считаем достаточным подтверждением разных SKU.
+    #
+    if (
+        evidence.different_known_barcodes
+        and (
+            "one_sided_variant_tokens"
+            in negative
+            or "different_subtype"
+            in negative
+        )
+    ):
+        return make_result(
+            classification=(
+                VerificationClass.CONFIRMED_DIFFERENT_SKU
+            ),
+            reason=(
+                "different_barcode_plus_variant_difference"
+            ),
+            confidence=99.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # Разные известные barcode без сильного variant-conflict:
+    # только manual review.
+    #
+    if evidence.different_known_barcodes:
+        return make_result(
+            classification=(
+                VerificationClass.NEEDS_MANUAL_REVIEW
+            ),
+            reason=(
+                "barcode_conflict_requires_external_confirmation"
+            ),
+            confidence=75.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # Односторонний variant-token:
+    # "финский" vs без "финский"
+    # "с индейкой" vs без "с индейкой"
+    #
+    # Без независимого подтверждения это нельзя
+    # автоматически признать одним SKU.
+    #
+    if (
+        "one_sided_variant_tokens"
+        in negative
+    ):
+        return make_result(
+            classification=(
+                VerificationClass.NEEDS_MANUAL_REVIEW
+            ),
+            reason=(
+                "one_sided_sku_variant_requires_confirmation"
+            ),
+            confidence=70.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # Разный subtype сам по себе тоже пока manual:
+    # subtype может быть заполнен неодинаково разными источниками.
+    #
+    if (
+        "different_subtype"
+        in negative
+    ):
+        return make_result(
+            classification=(
+                VerificationClass.NEEDS_MANUAL_REVIEW
+            ),
+            reason=(
+                "subtype_difference_requires_confirmation"
+            ),
+            confidence=70.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # CORE IDENTITY.
+    #
+    strong_name = bool(
+        evidence.same_name
+        or (
+            evidence.name_common_count >= 3
+            and evidence.name_coverage >= 0.95
+            and evidence.name_jaccard >= 0.80
+        )
+    )
+
+    core_identity = bool(
+        evidence.same_brand
+        and evidence.category_compatible
+        and strong_name
+        and evidence.package_compatible is True
+    )
+
+    #
+    # НЕЗАВИСИМОЕ ПОДТВЕРЖДЕНИЕ.
+    #
+    # SAME SKU разрешён только если есть хотя бы
+    # один из этих независимых сигналов.
+    #
+    exact_external_identity = bool(
+        evidence.shared_source_identity
+    )
+
+    same_barcode_confirmation = bool(
+        evidence.same_barcode
+    )
+
+    #
+    # Две независимые внешние карточки разных providers
+    # можно использовать как подтверждение ТОЛЬКО
+    # при очень строгом core identity:
+    # точное имя + бренд + package + категория,
+    # без variant/subtype/barcode конфликтов.
+    #
+    independent_source_confirmation = bool(
+        evidence.independent_external_sources
+        and evidence.same_name
+        and evidence.same_brand
+        and evidence.category_compatible
+        and evidence.package_compatible is True
+        and not (
+            {
+                "one_sided_variant_tokens",
+                "different_variant_tokens",
+                "different_subtype",
+                "different_barcode",
+            }
+            & negative
+        )
+    )
+
+    independently_confirmed = bool(
+        same_barcode_confirmation
+        or exact_external_identity
+        or independent_source_confirmation
+    )
+
+    if (
+        core_identity
+        and independently_confirmed
+    ):
+        canonical_id = (
+            choose_canonical_product(
+                left=left,
+                right=right,
+            )
+        )
+
+        if same_barcode_confirmation:
+            confidence = 100.0
+            reason = (
+                "same_barcode_plus_core_identity"
+            )
+
+        elif exact_external_identity:
+            confidence = 99.0
+            reason = (
+                "same_external_identity_plus_core_identity"
+            )
+
+        else:
+            confidence = 98.0
+            reason = (
+                "independent_sources_plus_exact_core_identity"
+            )
+
+        return make_result(
+            classification=(
+                VerificationClass.CONFIRMED_SAME_SKU
+            ),
+            reason=reason,
+            confidence=confidence,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=(
+                canonical_id
+            ),
+        )
+
+    #
+    # Точное/сильное совпадение без независимого
+    # подтверждения — ручная проверка.
+    #
+    if core_identity:
+        return make_result(
+            classification=(
+                VerificationClass.NEEDS_MANUAL_REVIEW
+            ),
+            reason=(
+                "core_identity_matches_but_no_independent_confirmation"
+            ),
+            confidence=85.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # Более слабая пара, но есть существенные совпадения.
+    #
+    related_identity = bool(
+        evidence.same_brand
+        and evidence.category_compatible
+        and evidence.package_compatible is not False
+        and (
+            evidence.same_name
+            or evidence.name_common_count >= 1
+            or "same_percentage"
+            in positive
+            or "same_name_package"
+            in positive
+        )
+    )
+
+    if related_identity:
+        return make_result(
+            classification=(
+                VerificationClass.NEEDS_MANUAL_REVIEW
+            ),
+            reason=(
+                "related_core_identity_needs_more_evidence"
+            ),
+            confidence=75.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    #
+    # Разные несовместимые категории сами по себе
+    # не превращают пару в DIFFERENT, но в сочетании
+    # со слабым названием дают достаточно оснований.
+    #
+    if (
+        "different_category"
+        in negative
+        and "weak_name_similarity"
+        in negative
+    ):
+        return make_result(
+            classification=(
+                VerificationClass.CONFIRMED_DIFFERENT_SKU
+            ),
+            reason=(
+                "weak_name_and_incompatible_category"
+            ),
+            confidence=95.0,
+            left=left,
+            right=right,
+            evidence=evidence,
+            canonical_product_id=None,
+        )
+
+    return make_result(
+        classification=(
+            VerificationClass.NEEDS_MANUAL_REVIEW
+        ),
+        reason=(
+            "insufficient_evidence_for_safe_decision"
+        ),
+        confidence=60.0,
+        left=left,
+        right=right,
+        evidence=evidence,
+        canonical_product_id=None,
     )
 
 
@@ -1152,6 +1906,20 @@ def print_result( *, index: int, item: VerificationResult, ) -> None:
     )
 
     print(
+        "variant_tokens:",
+        item.left_variants,
+        "|",
+        item.right_variants,
+    )
+
+    print(
+        "only_variants:",
+        item.left_only_variants,
+        "|",
+        item.right_only_variants,
+    )
+
+    print(
         "positive_evidence:",
         item.positive_evidence,
     )
@@ -1188,7 +1956,7 @@ def format_top_ids( items: list[ VerificationResult ], ) -> str:
     )
 
 
-def print_final_summary( *, results: list[ VerificationResult ], ) -> None:
+def print_final_summary( *, results: list[ VerificationResult ], missing_pairs: list[ tuple[int, int] ], ) -> None:
     counts = Counter(
         item.classification.value
         for item in results
@@ -1273,6 +2041,13 @@ def print_final_summary( *, results: list[ VerificationResult ], ) -> None:
         ),
     )
 
+    print(
+        "Pairs missing:",
+        len(
+            missing_pairs
+        ),
+    )
+
     print()
 
     print(
@@ -1319,6 +2094,19 @@ def print_final_summary( *, results: list[ VerificationResult ], ) -> None:
         ),
     )
 
+    if missing_pairs:
+        print(
+            "MISSING IDS:",
+            ", ".join(
+                f"{left}<->{right}"
+                for (
+                    left,
+                    right,
+                )
+                in missing_pairs
+            ),
+        )
+
     print()
 
     print(
@@ -1340,7 +2128,7 @@ async def main() -> None:
     )
 
     print(
-        "MarkaRadar Duplicate Candidate Verifier v1"
+        "MarkaRadar Duplicate Candidate Verifier v2"
     )
 
     print(
@@ -1361,6 +2149,10 @@ async def main() -> None:
 
     results: list[
         VerificationResult
+    ] = []
+
+    missing_pairs: list[
+        tuple[int, int]
     ] = []
 
     async with (
@@ -1396,6 +2188,13 @@ async def main() -> None:
                     right_id,
                 )
 
+                missing_pairs.append(
+                    (
+                        left_id,
+                        right_id,
+                    )
+                )
+
                 continue
 
             result = verify_pair(
@@ -1412,6 +2211,8 @@ async def main() -> None:
         key=lambda item: (
             item.classification.value,
             item.confidence,
+            item.left_id,
+            item.right_id,
         ),
         reverse=True,
     )
@@ -1448,10 +2249,11 @@ async def main() -> None:
 
     print_final_summary(
         results=results,
+        missing_pairs=missing_pairs,
     )
 
 
 if __name__ == "__main__":
     asyncio.run(
         main()
-  )
+    )
