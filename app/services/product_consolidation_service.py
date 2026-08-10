@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
 
-from sqlalchemy import delete
 from sqlalchemy import select
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models.brand import Brand
-from app.database.models.category import Category
 from app.database.models.price import PriceObservation
 from app.database.models.product import Product
 from app.database.models.product_alias import ProductAlias
@@ -41,10 +37,8 @@ from app.services.product_merge_service import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass( slots=True, frozen=True, )
+@dataclass(slots=True, frozen=True)
 class ProductConsolidationResult:
-    """ Итог безопасной консолидации двух Product. canonical_product_id: ID карточки, которая остаётся канонической. duplicate_product_id: ID карточки-дубля. applied: Были ли реально внесены изменения. dry_run: Был ли это только диагностический прогон. updated_fields: Какие поля канонической карточки улучшены. moved_*: Сколько связанных записей перепривязано. removed_*_conflicts: Сколько конфликтующих Rating/Review дублей удалено из-за UNIQUE(user_id, product_id). aliases_added: Сколько новых alias добавлено. conflicts: Зафиксированные некритические конфликты. blocked_reasons: Причины, по которым консолидация запрещена. """
-
     canonical_product_id: int
     duplicate_product_id: int
 
@@ -69,7 +63,9 @@ class ProductConsolidationResult:
     blocked_reasons: tuple[str, ...]
 
 
-def _dedupe_strings( values: list[str], ) -> tuple[str, ...]:
+def _dedupe_strings(
+    values: list[str],
+) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
             value
@@ -79,29 +75,41 @@ def _dedupe_strings( values: list[str], ) -> tuple[str, ...]:
     )
 
 
-async def _load_product( *, session: AsyncSession, product_id: int, ) -> Product | None:
+async def _load_product(
+    *,
+    session: AsyncSession,
+    product_id: int,
+) -> Product | None:
     result = await session.execute(
-        select(
-            Product
-        )
+        select(Product)
         .where(
-            Product.id == int(
-                product_id
-            )
+            Product.id == int(product_id)
         )
-        .limit(
-            1
-        )
+        .limit(1)
     )
 
     return result.scalar_one_or_none()
 
 
-async def _identity_safety_check( *, session: AsyncSession, canonical: Product, duplicate: Product, ) -> tuple[
-    list[str],
-    list[str],
-]:
-    """ Проверяет, можно ли вообще объединять товары. Жёсткие блокировки: - разные известные barcode; - конфликтующая известная упаковка; - разные реальные бренды; - разные конкретные категории; - слишком слабое совпадение названий. При сомнении консолидация НЕ выполняется. """
+async def _identity_safety_check(
+    *,
+    session: AsyncSession,
+    canonical: Product,
+    duplicate: Product,
+) -> tuple[list[str], list[str]]:
+    """
+    Проверяет безопасность объединения.
+
+    Жёсткие блокировки:
+    - разные известные barcode;
+    - конфликтующая известная упаковка;
+    - разные реальные бренды;
+    - разные конкретные категории;
+    - слишком слабое совпадение названий.
+
+    Последняя блокировка может быть снята только
+    через confirmed_identity=True.
+    """
 
     blocked: list[str] = []
     conflicts: list[str] = []
@@ -109,7 +117,6 @@ async def _identity_safety_check( *, session: AsyncSession, canonical: Product, 
     canonical_barcode = normalize_barcode(
         canonical.barcode
     )
-
     duplicate_barcode = normalize_barcode(
         duplicate.barcode
     )
@@ -117,8 +124,7 @@ async def _identity_safety_check( *, session: AsyncSession, canonical: Product, 
     if (
         canonical_barcode
         and duplicate_barcode
-        and canonical_barcode
-        != duplicate_barcode
+        and canonical_barcode != duplicate_barcode
     ):
         blocked.append(
             "barcode_conflict:"
@@ -127,13 +133,11 @@ async def _identity_safety_check( *, session: AsyncSession, canonical: Product, 
             f"{duplicate_barcode}"
         )
 
-    package_compatibility = (
-        package_values_compatible(
-            current_value=canonical.package_value,
-            current_unit=canonical.package_unit,
-            incoming_value=duplicate.package_value,
-            incoming_unit=duplicate.package_unit,
-        )
+    package_compatibility = package_values_compatible(
+        current_value=canonical.package_value,
+        current_unit=canonical.package_unit,
+        incoming_value=duplicate.package_value,
+        incoming_unit=duplicate.package_unit,
     )
 
     if package_compatibility is False:
@@ -169,18 +173,10 @@ async def _identity_safety_check( *, session: AsyncSession, canonical: Product, 
     )
 
     if (
-        not is_unknown_brand(
-            canonical_brand_name
-        )
-        and not is_unknown_brand(
-            duplicate_brand_name
-        )
-        and normalized(
-            canonical_brand_name
-        )
-        != normalized(
-            duplicate_brand_name
-        )
+        not is_unknown_brand(canonical_brand_name)
+        and not is_unknown_brand(duplicate_brand_name)
+        and normalized(canonical_brand_name)
+        != normalized(duplicate_brand_name)
     ):
         blocked.append(
             "brand_conflict:"
@@ -227,10 +223,6 @@ async def _identity_safety_check( *, session: AsyncSession, canonical: Product, 
         duplicate.name,
     )
 
-    #
-    # Не полагаемся только на название, но требуем,
-    # чтобы оно хотя бы достаточно подтверждало SKU.
-    #
     if common_count < 2:
         blocked.append(
             "name_similarity_too_weak:"
@@ -247,27 +239,20 @@ async def _identity_safety_check( *, session: AsyncSession, canonical: Product, 
             f"jaccard={jaccard:.3f}"
         )
 
-    #
-    # Если упаковка у одной стороны неизвестна,
-    # это не блокировка, но полезно видеть в логах.
-    #
     if package_compatibility is None:
         conflicts.append(
             "package_not_confirmed"
         )
 
-    return (
-        blocked,
-        conflicts,
-    )
+    return blocked, conflicts
 
 
-async def _merge_card_fields( *, session: AsyncSession, canonical: Product, duplicate: Product, ) -> tuple[
-    list[str],
-    list[str],
-]:
-    """ Переносит только полезные поля карточки. Identity-поля не перезаписываются, если это может испортить канонический SKU. """
-
+async def _merge_card_fields(
+    *,
+    session: AsyncSession,
+    canonical: Product,
+    duplicate: Product,
+) -> tuple[list[str], list[str]]:
     updated_fields: list[str] = []
     conflicts: list[str] = []
 
@@ -291,9 +276,7 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         category_id=duplicate.category_id,
     )
 
-    #
     # NAME
-    #
     if is_better_name(
         current_name=canonical.name,
         incoming_name=duplicate.name,
@@ -301,18 +284,12 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         canonical.name = clean_text(
             duplicate.name
         )
-
         canonical.normalized_name = normalized(
             duplicate.name
         )
+        updated_fields.append("name")
 
-        updated_fields.append(
-            "name"
-        )
-
-    #
     # BRAND
-    #
     if (
         canonical_brand is not None
         and is_unknown_brand(
@@ -323,21 +300,11 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
             duplicate_brand.name
         )
     ):
-        canonical.brand_id = (
-            duplicate_brand.id
-        )
+        canonical.brand_id = duplicate_brand.id
+        canonical_brand = duplicate_brand
+        updated_fields.append("brand_id")
 
-        canonical_brand = (
-            duplicate_brand
-        )
-
-        updated_fields.append(
-            "brand_id"
-        )
-
-    #
     # CATEGORY
-    #
     if (
         canonical_category is not None
         and is_generic_category(
@@ -351,18 +318,12 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         canonical.category_id = (
             duplicate_category.id
         )
-
         canonical_category = (
             duplicate_category
         )
+        updated_fields.append("category_id")
 
-        updated_fields.append(
-            "category_id"
-        )
-
-    #
     # FAMILY
-    #
     if (
         canonical.family_id is None
         and duplicate.family_id is not None
@@ -370,18 +331,12 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         canonical.family_id = (
             duplicate.family_id
         )
+        updated_fields.append("family_id")
 
-        updated_fields.append(
-            "family_id"
-        )
-
-    #
     # BARCODE
-    #
     canonical_barcode = normalize_barcode(
         canonical.barcode
     )
-
     duplicate_barcode = normalize_barcode(
         duplicate.barcode
     )
@@ -390,24 +345,15 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         canonical_barcode is None
         and duplicate_barcode
     ):
-        canonical.barcode = (
-            duplicate_barcode
-        )
+        canonical.barcode = duplicate_barcode
+        updated_fields.append("barcode")
 
-        updated_fields.append(
-            "barcode"
-        )
-
-    #
     # PACKAGE
-    #
-    package_compatibility = (
-        package_values_compatible(
-            current_value=canonical.package_value,
-            current_unit=canonical.package_unit,
-            incoming_value=duplicate.package_value,
-            incoming_unit=duplicate.package_unit,
-        )
+    package_compatibility = package_values_compatible(
+        current_value=canonical.package_value,
+        current_unit=canonical.package_unit,
+        incoming_value=duplicate.package_value,
+        incoming_unit=duplicate.package_unit,
     )
 
     if package_compatibility is not False:
@@ -425,13 +371,11 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
 
         if (
             canonical.package_value is None
-            and duplicate_package_value
-            is not None
+            and duplicate_package_value is not None
         ):
             canonical.package_value = (
                 duplicate_package_value
             )
-
             updated_fields.append(
                 "package_value"
             )
@@ -443,43 +387,25 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
             canonical.package_unit = (
                 duplicate_package_unit
             )
-
             updated_fields.append(
                 "package_unit"
             )
 
-    #
     # SUBTYPE
-    #
     if (
-        not clean_text(
-            canonical.subtype
-        )
-        and clean_text(
-            duplicate.subtype
-        )
+        not clean_text(canonical.subtype)
+        and clean_text(duplicate.subtype)
     ):
         canonical.subtype = clean_text(
             duplicate.subtype
         )
-
-        updated_fields.append(
-            "subtype"
-        )
+        updated_fields.append("subtype")
 
     elif (
-        clean_text(
-            canonical.subtype
-        )
-        and clean_text(
-            duplicate.subtype
-        )
-        and normalized(
-            canonical.subtype
-        )
-        != normalized(
-            duplicate.subtype
-        )
+        clean_text(canonical.subtype)
+        and clean_text(duplicate.subtype)
+        and normalized(canonical.subtype)
+        != normalized(duplicate.subtype)
     ):
         conflicts.append(
             "subtype_conflict:"
@@ -488,9 +414,7 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
             f"{clean_text(duplicate.subtype)}"
         )
 
-    #
     # DESCRIPTION
-    #
     if should_replace_description(
         current_value=canonical.description,
         incoming_value=duplicate.description,
@@ -498,14 +422,9 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         canonical.description = clean_text(
             duplicate.description
         )
+        updated_fields.append("description")
 
-        updated_fields.append(
-            "description"
-        )
-
-    #
     # IMAGE
-    #
     if should_replace_image(
         current_value=canonical.image_url,
         incoming_value=duplicate.image_url,
@@ -513,14 +432,9 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         canonical.image_url = clean_text(
             duplicate.image_url
         )
+        updated_fields.append("image_url")
 
-        updated_fields.append(
-            "image_url"
-        )
-
-    #
     # KEYWORDS
-    #
     merged_keywords = combine_keywords(
         canonical.keywords,
         duplicate.keywords,
@@ -531,13 +445,8 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
         and merged_keywords
         != canonical.keywords
     ):
-        canonical.keywords = (
-            merged_keywords
-        )
-
-        updated_fields.append(
-            "keywords"
-        )
+        canonical.keywords = merged_keywords
+        updated_fields.append("keywords")
 
     actual_brand = (
         canonical_brand
@@ -557,33 +466,22 @@ async def _merge_card_fields( *, session: AsyncSession, canonical: Product, dupl
     )
 
     if (
-        clean_text(
-            canonical.search_text
-        )
-        != clean_text(
-            new_search_text
-        )
+        clean_text(canonical.search_text)
+        != clean_text(new_search_text)
     ):
-        canonical.search_text = (
-            new_search_text
-        )
+        canonical.search_text = new_search_text
+        updated_fields.append("search_text")
 
-        updated_fields.append(
-            "search_text"
-        )
-
-    return (
-        updated_fields,
-        conflicts,
-    )
+    return updated_fields, conflicts
 
 
-async def _ensure_alias( *, session: AsyncSession, product_id: int, alias: str | None, ) -> bool:
-    """ Добавляет alias, если такого ещё нет у канонического Product. """
-
-    cleaned_alias = clean_text(
-        alias
-    )
+async def _ensure_alias(
+    *,
+    session: AsyncSession,
+    product_id: int,
+    alias: str | None,
+) -> bool:
+    cleaned_alias = clean_text(alias)
 
     if not cleaned_alias:
         return False
@@ -596,21 +494,20 @@ async def _ensure_alias( *, session: AsyncSession, product_id: int, alias: str |
         return False
 
     existing = await session.execute(
-        select(
-            ProductAlias
-        )
+        select(ProductAlias)
         .where(
             ProductAlias.product_id
             == product_id,
             ProductAlias.normalized_alias
             == normalized_alias,
         )
-        .limit(
-            1
-        )
+        .limit(1)
     )
 
-    if existing.scalar_one_or_none() is not None:
+    if (
+        existing.scalar_one_or_none()
+        is not None
+    ):
         return False
 
     session.add(
@@ -626,23 +523,19 @@ async def _ensure_alias( *, session: AsyncSession, product_id: int, alias: str |
     return True
 
 
-async def _move_aliases( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, ) -> tuple[
-    int,
-    int,
-]:
-    """ Переносит aliases без нарушения UNIQUE(product_id, alias). Возвращает: moved_count, created_count """
-
+async def _move_aliases(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+) -> tuple[int, int]:
     result = await session.execute(
-        select(
-            ProductAlias
-        )
+        select(ProductAlias)
         .where(
             ProductAlias.product_id
             == duplicate_product_id
         )
-        .order_by(
-            ProductAlias.id.asc()
-        )
+        .order_by(ProductAlias.id.asc())
     )
 
     duplicate_aliases = list(
@@ -654,47 +547,41 @@ async def _move_aliases( *, session: AsyncSession, canonical_product_id: int, du
 
     for alias_row in duplicate_aliases:
         exists = await session.execute(
-            select(
-                ProductAlias
-            )
+            select(ProductAlias)
             .where(
                 ProductAlias.product_id
                 == canonical_product_id,
                 ProductAlias.normalized_alias
                 == alias_row.normalized_alias,
             )
-            .limit(
-                1
-            )
+            .limit(1)
         )
 
-        if exists.scalar_one_or_none() is not None:
-            await session.delete(
-                alias_row
-            )
+        if (
+            exists.scalar_one_or_none()
+            is not None
+        ):
+            await session.delete(alias_row)
             continue
 
         alias_row.product_id = (
             canonical_product_id
         )
-
         moved_count += 1
 
     await session.flush()
 
-    return (
-        moved_count,
-        created_count,
-    )
+    return moved_count, created_count
 
 
-async def _move_sources( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, ) -> int:
-    """ provider + source_id уникальны глобально, поэтому изменение только product_id не нарушает constraint. """
-
+async def _move_sources(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+) -> int:
     result = await session.execute(
-        update(
-            ProductSource
-        )
+        update(ProductSource)
         .where(
             ProductSource.product_id
             == duplicate_product_id
@@ -704,17 +591,17 @@ async def _move_sources( *, session: AsyncSession, canonical_product_id: int, du
         )
     )
 
-    return int(
-        result.rowcount
-        or 0
-    )
+    return int(result.rowcount or 0)
 
 
-async def _move_prices( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, ) -> int:
+async def _move_prices(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+) -> int:
     result = await session.execute(
-        update(
-            PriceObservation
-        )
+        update(PriceObservation)
         .where(
             PriceObservation.product_id
             == duplicate_product_id
@@ -724,17 +611,17 @@ async def _move_prices( *, session: AsyncSession, canonical_product_id: int, dup
         )
     )
 
-    return int(
-        result.rowcount
-        or 0
-    )
+    return int(result.rowcount or 0)
 
 
-async def _move_search_history( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, ) -> int:
+async def _move_search_history(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+) -> int:
     result = await session.execute(
-        update(
-            SearchHistory
-        )
+        update(SearchHistory)
         .where(
             SearchHistory.selected_product_id
             == duplicate_product_id
@@ -746,22 +633,17 @@ async def _move_search_history( *, session: AsyncSession, canonical_product_id: 
         )
     )
 
-    return int(
-        result.rowcount
-        or 0
-    )
+    return int(result.rowcount or 0)
 
 
-async def _move_ratings( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, ) -> tuple[
-    int,
-    int,
-]:
-    """ UNIQUE(user_id, product_id) требует обработки по пользователям. Если пользователь оценивал оба товара: оставляем рейтинг канонической карточки, рейтинг дубля удаляем. """
-
+async def _move_ratings(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+) -> tuple[int, int]:
     canonical_result = await session.execute(
-        select(
-            Rating.user_id
-        )
+        select(Rating.user_id)
         .where(
             Rating.product_id
             == canonical_product_id
@@ -773,16 +655,12 @@ async def _move_ratings( *, session: AsyncSession, canonical_product_id: int, du
     )
 
     duplicate_result = await session.execute(
-        select(
-            Rating
-        )
+        select(Rating)
         .where(
             Rating.product_id
             == duplicate_product_id
         )
-        .order_by(
-            Rating.id.asc()
-        )
+        .order_by(Rating.id.asc())
     )
 
     duplicate_ratings = list(
@@ -794,10 +672,7 @@ async def _move_ratings( *, session: AsyncSession, canonical_product_id: int, du
 
     for rating in duplicate_ratings:
         if rating.user_id in canonical_users:
-            await session.delete(
-                rating
-            )
-
+            await session.delete(rating)
             removed_conflicts += 1
             continue
 
@@ -813,22 +688,17 @@ async def _move_ratings( *, session: AsyncSession, canonical_product_id: int, du
 
     await session.flush()
 
-    return (
-        moved,
-        removed_conflicts,
-    )
+    return moved, removed_conflicts
 
 
-async def _move_reviews( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, ) -> tuple[
-    int,
-    int,
-]:
-    """ Аналогично Rating: UNIQUE(user_id, product_id). Если отзыв есть на обеих карточках, сохраняем отзыв канонического товара. """
-
+async def _move_reviews(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+) -> tuple[int, int]:
     canonical_result = await session.execute(
-        select(
-            Review.user_id
-        )
+        select(Review.user_id)
         .where(
             Review.product_id
             == canonical_product_id
@@ -840,16 +710,12 @@ async def _move_reviews( *, session: AsyncSession, canonical_product_id: int, du
     )
 
     duplicate_result = await session.execute(
-        select(
-            Review
-        )
+        select(Review)
         .where(
             Review.product_id
             == duplicate_product_id
         )
-        .order_by(
-            Review.id.asc()
-        )
+        .order_by(Review.id.asc())
     )
 
     duplicate_reviews = list(
@@ -861,10 +727,7 @@ async def _move_reviews( *, session: AsyncSession, canonical_product_id: int, du
 
     for review in duplicate_reviews:
         if review.user_id in canonical_users:
-            await session.delete(
-                review
-            )
-
+            await session.delete(review)
             removed_conflicts += 1
             continue
 
@@ -880,19 +743,34 @@ async def _move_reviews( *, session: AsyncSession, canonical_product_id: int, du
 
     await session.flush()
 
-    return (
-        moved,
-        removed_conflicts,
-    )
+    return moved, removed_conflicts
 
 
-async def consolidate_products( *, session: AsyncSession, canonical_product_id: int, duplicate_product_id: int, dry_run: bool = True, commit: bool = False, ) -> ProductConsolidationResult:
-    """ Безопасно объединяет две уже существующие карточки одного SKU. ВАЖНО: по умолчанию dry_run=True. То есть первый запуск ничего не изменяет. Реальный сценарий: 1. вызвать dry_run=True; 2. проверить blocked_reasons/conflicts; 3. только после подтверждения вызвать dry_run=False. При успешной консолидации: - канонический Product сохраняет свой ID; - полезные поля дубля переносятся; - имя дубля сохраняется как alias; - ProductSource перепривязываются; - PriceObservation перепривязываются; - Rating/Review переносятся безопасно; - SearchHistory перепривязывается; - aliases переносятся; - дубль НЕ удаляется; - duplicate.is_active = False. """
+async def consolidate_products(
+    *,
+    session: AsyncSession,
+    canonical_product_id: int,
+    duplicate_product_id: int,
+    dry_run: bool = True,
+    commit: bool = False,
+    confirmed_identity: bool = False,
+) -> ProductConsolidationResult:
+    """
+    Безопасно объединяет две существующие карточки.
+
+    confirmed_identity=True означает, что оператор
+    вручную подтвердил: это один SKU.
+
+    В этом режиме разрешается снять ТОЛЬКО блокировку
+    name_similarity_too_weak.
+
+    Barcode/package/brand/category конфликты
+    остаются жёсткими блокировками.
+    """
 
     canonical_product_id = int(
         canonical_product_id
     )
-
     duplicate_product_id = int(
         duplicate_product_id
     )
@@ -942,16 +820,56 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
         duplicate=duplicate,
     )
 
+    #
+    # РУЧНОЕ ПОДТВЕРЖДЕНИЕ.
+    #
+    # Снимаем исключительно блокировку,
+    # связанную со слабой похожестью имени.
+    #
+    # Например:
+    # "Пельмени Иркутские"
+    # и
+    # "Пельмени Сибирская коллекция
+    #  Иркутские традиции, 700г"
+    #
+    # могут быть подтверждены оператором после
+    # отдельной проверки источников.
+    #
+    if confirmed_identity:
+        original_blocked = list(
+            blocked_reasons
+        )
+
+        blocked_reasons = [
+            reason
+            for reason in blocked_reasons
+            if not reason.startswith(
+                "name_similarity_too_weak:"
+            )
+        ]
+
+        name_block_removed = (
+            len(original_blocked)
+            != len(blocked_reasons)
+        )
+
+        if name_block_removed:
+            safety_conflicts.append(
+                "identity_manually_confirmed"
+            )
+
     logger.info(
         "Product consolidation check: "
         "canonical=%s duplicate=%s "
         "blocked=%s conflicts=%s "
-        "dry_run=%s",
+        "dry_run=%s "
+        "confirmed_identity=%s",
         canonical_product_id,
         duplicate_product_id,
         blocked_reasons,
         safety_conflicts,
         dry_run,
+        confirmed_identity,
     )
 
     if blocked_reasons:
@@ -982,11 +900,13 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
             ),
         )
 
+    #
+    # DRY RUN.
+    #
+    # Даже с confirmed_identity=True
+    # база здесь НЕ меняется.
+    #
     if dry_run:
-        #
-        # Ничего не меняем.
-        # Возвращаем только успешный safety-check.
-        #
         return ProductConsolidationResult(
             canonical_product_id=(
                 canonical_product_id
@@ -1030,9 +950,10 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
     aliases_added = 0
 
     #
-    # SAVEPOINT:
-    # если любой перенос упадёт,
-    # вся консолидация откатится целиком.
+    # SAVEPOINT.
+    #
+    # Если любой перенос падает,
+    # консолидация откатывается целиком.
     #
     async with session.begin_nested():
         (
@@ -1053,16 +974,11 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
         )
 
         #
-        # Сохраняем имя дубля как alias
-        # ДО деактивации.
+        # Имя дубля сохраняем как alias.
         #
         if (
-            normalized(
-                duplicate.name
-            )
-            != normalized(
-                canonical.name
-            )
+            normalized(duplicate.name)
+            != normalized(canonical.name)
         ):
             if await _ensure_alias(
                 session=session,
@@ -1144,6 +1060,10 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
             )
         )
 
+        #
+        # Дубль не удаляем физически.
+        # Просто выключаем.
+        #
         duplicate.is_active = False
 
         await session.flush()
@@ -1157,12 +1077,11 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
         "search_history=%s aliases=%s "
         "removed_rating_conflicts=%s "
         "removed_review_conflicts=%s "
-        "conflicts=%s",
+        "conflicts=%s "
+        "confirmed_identity=%s",
         canonical_product_id,
         duplicate_product_id,
-        tuple(
-            updated_fields
-        ),
+        tuple(updated_fields),
         moved_sources,
         moved_prices,
         moved_ratings,
@@ -1172,6 +1091,7 @@ async def consolidate_products( *, session: AsyncSession, canonical_product_id: 
         removed_rating_conflicts,
         removed_review_conflicts,
         conflicts,
+        confirmed_identity,
     )
 
     if commit:
