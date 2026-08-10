@@ -32,18 +32,26 @@ from app.services.product_merge_service import (
 
 
 #
-# MarkaRadar Duplicate Scanner v7
+# MarkaRadar Duplicate Scanner v8
 #
-# Главное отличие от v6:
-# - сито сужает выборку РАНЬШЕ;
-# - category compatibility участвует уже в coarse blocking;
-# - один общий слабый токен больше не создаёт тысячи пар;
-# - разные известные barcode почти всегда сразу REJECT;
-# - BARCODE_CONFLICT_REVIEW остаётся только для почти
-# идентичных карточек;
-# - HTML-мусор и package-токены удаляются из variant tokens.
+# Улучшения относительно v7:
 #
-# Никаких изменений в БД.
+# 1. Разные известные barcode + различающий SKU-токен
+# теперь сразу REJECT.
+#
+# Примеры:
+# kana vs kana + tuna
+# с сахаром vs с сахаром и цукатами
+#
+# 2. BARCODE_CONFLICT_REVIEW оставляем только для
+# почти идентичных карточек БЕЗ вариантных различий.
+#
+# 3. Общие/мусорные категории не используются как
+# основание для AUTO_SAFE.
+#
+# 4. AUTO_SAFE остаётся очень консервативным.
+#
+# 5. База по-прежнему НЕ изменяется.
 #
 
 
@@ -89,6 +97,9 @@ class PairEvidence:
 
     left_variant_tokens: tuple[str, ...]
     right_variant_tokens: tuple[str, ...]
+
+    left_only_variants: tuple[str, ...]
+    right_only_variants: tuple[str, ...]
 
     hard_conflicts: tuple[str, ...]
     soft_differences: tuple[str, ...]
@@ -139,6 +150,9 @@ class DuplicateCandidate:
     left_variant_tokens: tuple[str, ...]
     right_variant_tokens: tuple[str, ...]
 
+    left_only_variants: tuple[str, ...]
+    right_only_variants: tuple[str, ...]
+
     hard_conflicts: tuple[str, ...]
     soft_differences: tuple[str, ...]
 
@@ -154,6 +168,7 @@ class SieveStats:
     coarse_pairs_generated: int = 0
 
     rejected_different_barcode: int = 0
+    rejected_barcode_variant: int = 0
     rejected_package: int = 0
     rejected_percentage: int = 0
     rejected_count: int = 0
@@ -303,6 +318,21 @@ CATEGORY_EQUIVALENCE_GROUPS = (
         "sausage",
     },
 )
+
+
+GENERIC_CATEGORY_NAMES = {
+    "",
+    "продукты",
+    "продукт",
+    "еда",
+    "food",
+    "foods",
+    "products",
+    "product",
+    "прочее",
+    "другое",
+    "other",
+}
 
 
 MAX_TOKEN_BLOCK_SIZE = 50
@@ -533,6 +563,25 @@ def values_conflict( left_values: Iterable[str], right_values: Iterable[str], ) 
     )
 
 
+def is_generic_category_name( value: str | None, ) -> bool:
+    key = normalized(
+        html_clean_text(
+            value
+        )
+    )
+
+    return (
+        key
+        in {
+            normalized(
+                item
+            )
+            for item
+            in GENERIC_CATEGORY_NAMES
+        }
+    )
+
+
 def category_bucket( category_name: str | None, ) -> str:
     key = normalized(
         html_clean_text(
@@ -655,6 +704,21 @@ def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
         brand_name=right.brand.name,
     )
 
+    common_variants = (
+        left_variants
+        & right_variants
+    )
+
+    left_only = (
+        left_variants
+        - common_variants
+    )
+
+    right_only = (
+        right_variants
+        - common_variants
+    )
+
     hard_conflicts: list[str] = []
     soft_differences: list[str] = []
 
@@ -699,21 +763,10 @@ def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
             f"{right_name_packages}"
         )
 
-    common_variants = (
-        left_variants
-        & right_variants
-    )
-
-    left_only = (
-        left_variants
-        - common_variants
-    )
-
-    right_only = (
-        right_variants
-        - common_variants
-    )
-
+    #
+    # Если разные содержательные варианты есть
+    # с обеих сторон — жёсткий конфликт.
+    #
     if (
         left_only
         and right_only
@@ -725,6 +778,12 @@ def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
             f"{tuple(sorted(right_only))}"
         )
 
+    #
+    # Если вариант есть только с одной стороны —
+    # REVIEW в обычном случае.
+    # Но при разных barcode это уже будет REJECT
+    # на этапе classify_pair().
+    #
     elif (
         left_only
         or right_only
@@ -793,6 +852,16 @@ def build_evidence( *, left: ProductMeta, right: ProductMeta, ) -> PairEvidence:
                 right_variants
             )
         ),
+        left_only_variants=tuple(
+            sorted(
+                left_only
+            )
+        ),
+        right_only_variants=tuple(
+            sorted(
+                right_only
+            )
+        ),
         hard_conflicts=tuple(
             hard_conflicts
         ),
@@ -834,8 +903,13 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
         != evidence.right_barcode
     )
 
+    has_one_sided_variant = bool(
+        evidence.left_only_variants
+        or evidence.right_only_variants
+    )
+
     #
-    # Жёсткий structural conflict.
+    # Сначала structural conflict.
     #
     if evidence.hard_conflicts:
         return (
@@ -845,18 +919,32 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
         )
 
     #
-    # Разные известные barcode.
+    # Разные barcode + дополнительный вариант
+    # = разные SKU.
     #
-    # В отдельный review попадают только почти
-    # идентичные карточки.
+    if (
+        different_known_barcodes
+        and has_one_sided_variant
+    ):
+        return (
+            CandidateClass.REJECT,
+            "different_barcode_and_variant",
+            0.0,
+        )
+
+    #
+    # Разные barcode без вариантных различий.
+    #
+    # Только практически идентичные карточки
+    # оставляем для ручной проверки.
     #
     if different_known_barcodes:
         very_strong_name = bool(
             same_name
             or (
                 evidence.common_count >= 3
-                and evidence.coverage >= 0.95
-                and evidence.jaccard >= 0.80
+                and evidence.coverage >= 0.98
+                and evidence.jaccard >= 0.90
             )
         )
 
@@ -881,9 +969,9 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             and counts_equal
         ):
             score = (
-                80.0
-                + evidence.coverage * 6.0
-                + evidence.jaccard * 6.0
+                82.0
+                + evidence.coverage * 5.0
+                + evidence.jaccard * 5.0
             )
 
             return (
@@ -904,6 +992,9 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             0.0,
         )
 
+    #
+    # Одинаковый barcode — сильнейшее доказательство.
+    #
     if same_barcode:
         return (
             CandidateClass.AUTO_SAFE,
@@ -911,16 +1002,40 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             100.0,
         )
 
+    generic_category = bool(
+        is_generic_category_name(
+            left.category.name
+        )
+        or is_generic_category_name(
+            right.category.name
+        )
+    )
+
+    #
+    # Точное имя + упаковка.
+    # Но на общей категории "Продукты" не даём
+    # AUTO_SAFE — только REVIEW.
+    #
     if (
         same_name
         and evidence.package_compatible is True
     ):
+        if generic_category:
+            return (
+                CandidateClass.REVIEW,
+                "exact_name_package_generic_category",
+                90.0,
+            )
+
         return (
             CandidateClass.AUTO_SAFE,
             "exact_name_and_package",
             97.0,
         )
 
+    #
+    # Очень сильное сходство без soft differences.
+    #
     if (
         evidence.package_compatible is True
         and evidence.common_count >= 3
@@ -933,6 +1048,19 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             + evidence.coverage * 4.0
             + evidence.jaccard * 4.0
         )
+
+        if generic_category:
+            return (
+                CandidateClass.REVIEW,
+                "very_strong_identity_generic_category",
+                round(
+                    min(
+                        score,
+                        94.0,
+                    ),
+                    1,
+                ),
+            )
 
         return (
             CandidateClass.AUTO_SAFE,
@@ -1024,8 +1152,6 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
 def build_coarse_pairs( rows: list[ProductMeta], stats: SieveStats, ) -> set[
     tuple[int, int]
 ]:
-    """ SIEVE 0. Сначала: normalized brand + category bucket Потом внутри этого блока: exact normalized name ИЛИ минимум 2 общих identity token ИЛИ один редкий identity token + barcode только у одной стороны. Таким образом мы не создаём сотни тысяч сравнений по одному слову типа "кетчуп". """
-
     pairs: set[
         tuple[int, int]
     ] = set()
@@ -1114,9 +1240,6 @@ def build_coarse_pairs( rows: list[ProductMeta], stats: SieveStats, ) -> set[
                     item.product.id
                 )
 
-        #
-        # Exact name.
-        #
         for ids in exact_name_index.values():
             if len(ids) < 2:
                 continue
@@ -1135,10 +1258,6 @@ def build_coarse_pairs( rows: list[ProductMeta], stats: SieveStats, ) -> set[
                     )
                 )
 
-        #
-        # Build counts of how many identity tokens
-        # each pair shares.
-        #
         pair_common_tokens: Counter[
             tuple[int, int]
         ] = Counter()
@@ -1182,11 +1301,6 @@ def build_coarse_pairs( rows: list[ProductMeta], stats: SieveStats, ) -> set[
                 )
                 continue
 
-            #
-            # Один общий identity token допустим
-            # только для сценария "barcode есть
-            # у одной карточки, у второй нет".
-            #
             left_barcode = normalize_barcode(
                 left.product.barcode
             )
@@ -1272,6 +1386,12 @@ def make_candidate( *, classification: CandidateClass, reason: str, score: float
         ),
         right_variant_tokens=(
             evidence.right_variant_tokens
+        ),
+        left_only_variants=(
+            evidence.left_only_variants
+        ),
+        right_only_variants=(
+            evidence.right_only_variants
         ),
         hard_conflicts=(
             evidence.hard_conflicts
@@ -1381,6 +1501,13 @@ def print_candidate( *, index: int, item: DuplicateCandidate, ) -> None:
         item.left_variant_tokens,
         "|",
         item.right_variant_tokens,
+    )
+
+    print(
+        "only_variants:",
+        item.left_only_variants,
+        "|",
+        item.right_only_variants,
     )
 
     print(
@@ -1529,7 +1656,18 @@ def count_reject_reason( *, reason: str, evidence: PairEvidence, stats: SieveSta
 
     if reason == "different_barcode":
         stats.rejected_different_barcode += 1
-        return
+
+    elif (
+        reason
+        == "different_barcode_and_variant"
+    ):
+        stats.rejected_barcode_variant += 1
+
+    elif (
+        reason
+        == "insufficient_identity_evidence"
+    ):
+        stats.rejected_weak_name += 1
 
     for conflict in evidence.hard_conflicts:
         if conflict.startswith(
@@ -1556,9 +1694,6 @@ def count_reject_reason( *, reason: str, evidence: PairEvidence, stats: SieveSta
             "different_variant_tokens:"
         ):
             stats.rejected_variant += 1
-
-    if reason == "insufficient_identity_evidence":
-        stats.rejected_weak_name += 1
 
 
 def print_sieve_stats( stats: SieveStats, ) -> None:
@@ -1601,6 +1736,11 @@ def print_sieve_stats( stats: SieveStats, ) -> None:
     print(
         "Rejected different barcode:",
         stats.rejected_different_barcode,
+    )
+
+    print(
+        "Rejected barcode + variant:",
+        stats.rejected_barcode_variant,
     )
 
     print(
@@ -1670,7 +1810,7 @@ async def main() -> None:
     )
 
     print(
-        "MarkaRadar Duplicate Scanner v7"
+        "MarkaRadar Duplicate Scanner v8"
     )
 
     print(
@@ -1759,7 +1899,7 @@ async def main() -> None:
         )
 
         #
-        # Fast structural rejection.
+        # Жёсткая структура.
         #
         if evidence.hard_conflicts:
             (
@@ -1829,6 +1969,13 @@ async def main() -> None:
             )
         )
 
+        different_known_barcodes = bool(
+            evidence.left_barcode
+            and evidence.right_barcode
+            and evidence.left_barcode
+            != evidence.right_barcode
+        )
+
         name_related = bool(
             same_name
             or evidence.common_count >= 2
@@ -1836,6 +1983,12 @@ async def main() -> None:
                 one_barcode_only
                 and evidence.common_count >= 1
                 and evidence.coverage >= 0.70
+            )
+            or (
+                different_known_barcodes
+                and evidence.common_count >= 3
+                and evidence.coverage >= 0.98
+                and evidence.jaccard >= 0.90
             )
         )
 
@@ -2147,4 +2300,4 @@ async def main() -> None:
 if __name__ == "__main__":
     asyncio.run(
         main()
-    )
+                  )
