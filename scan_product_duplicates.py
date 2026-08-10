@@ -32,24 +32,27 @@ from app.services.product_merge_service import (
 
 
 #
-# MarkaRadar Duplicate Scanner v8
+# MarkaRadar Duplicate Scanner v9
 #
-# Улучшения относительно v7:
+# Улучшения относительно v8:
 #
 # 1. Разные известные barcode + различающий SKU-токен
-# теперь сразу REJECT.
+# по-прежнему сразу REJECT.
 #
-# Примеры:
-# kana vs kana + tuna
-# с сахаром vs с сахаром и цукатами
+# 2. Если barcode разные, но бренд и нормализованное
+# название полностью совпадают и нет других
+# структурных конфликтов, пара НЕ теряется:
+# она попадает в BARCODE_CONFLICT_REVIEW даже когда
+# package неизвестен.
 #
-# 2. BARCODE_CONFLICT_REVIEW оставляем только для
-# почти идентичных карточек БЕЗ вариантных различий.
+# Это важно для случаев смены GTIN/штрихкода,
+# переупаковки или исторических дублей каталога.
 #
-# 3. Общие/мусорные категории не используются как
-# основание для AUTO_SAFE.
+# 3. Если при этом упаковка тоже подтверждена как
+# одинаковая — score у barcode-conflict review выше.
 #
-# 4. AUTO_SAFE остаётся очень консервативным.
+# 4. AUTO_SAFE остаётся консервативным:
+# разные barcode никогда автоматически не склеиваются.
 #
 # 5. База по-прежнему НЕ изменяется.
 #
@@ -935,23 +938,19 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
     #
     # Разные barcode без вариантных различий.
     #
-    # Только практически идентичные карточки
-    # оставляем для ручной проверки.
+    # Никогда не AUTO_SAFE.
+    #
+    # Но точное совпадение бренда + названия может
+    # означать:
+    # - смену GTIN;
+    # - переупаковку;
+    # - старую/новую карточку;
+    # - ошибочный исторический дубль.
+    #
+    # Поэтому такие пары сохраняем в отдельном
+    # BARCODE_CONFLICT_REVIEW.
     #
     if different_known_barcodes:
-        very_strong_name = bool(
-            same_name
-            or (
-                evidence.common_count >= 3
-                and evidence.coverage >= 0.98
-                and evidence.jaccard >= 0.90
-            )
-        )
-
-        package_ok = (
-            evidence.package_compatible is True
-        )
-
         percentages_equal = (
             evidence.left_percentages
             == evidence.right_percentages
@@ -962,14 +961,58 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
             == evidence.right_counts
         )
 
+        #
+        # Самый сильный barcode-conflict review:
+        # имя одинаковое + упаковка подтверждена.
+        #
+        if (
+            same_name
+            and evidence.package_compatible is True
+            and percentages_equal
+            and counts_equal
+        ):
+            return (
+                CandidateClass.BARCODE_CONFLICT_REVIEW,
+                "exact_identity_but_different_barcode",
+                92.0,
+            )
+
+        #
+        # Имя полностью одинаковое, но package
+        # у одной/обеих карточек неизвестен.
+        #
+        # Это не REJECT — данных просто недостаточно.
+        #
+        if (
+            same_name
+            and evidence.package_compatible is None
+            and percentages_equal
+            and counts_equal
+        ):
+            return (
+                CandidateClass.BARCODE_CONFLICT_REVIEW,
+                "exact_name_but_different_barcode_package_unknown",
+                82.0,
+            )
+
+        #
+        # Не абсолютно одинаковое имя, но всё ещё
+        # почти идентичная identity-структура.
+        #
+        very_strong_name = bool(
+            evidence.common_count >= 3
+            and evidence.coverage >= 0.98
+            and evidence.jaccard >= 0.90
+        )
+
         if (
             very_strong_name
-            and package_ok
+            and evidence.package_compatible is True
             and percentages_equal
             and counts_equal
         ):
             score = (
-                82.0
+                80.0
                 + evidence.coverage * 5.0
                 + evidence.jaccard * 5.0
             )
@@ -980,7 +1023,7 @@ def classify_pair( *, left: ProductMeta, right: ProductMeta, evidence: PairEvide
                 round(
                     min(
                         score,
-                        92.0,
+                        90.0,
                     ),
                     1,
                 ),
@@ -1810,7 +1853,7 @@ async def main() -> None:
     )
 
     print(
-        "MarkaRadar Duplicate Scanner v8"
+        "MarkaRadar Duplicate Scanner v9"
     )
 
     print(
@@ -2300,4 +2343,4 @@ async def main() -> None:
 if __name__ == "__main__":
     asyncio.run(
         main()
-                  )
+    )
