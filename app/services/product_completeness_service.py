@@ -15,7 +15,6 @@ UNKNOWN_BRAND_NAMES = {
     "без бренда",
 }
 
-
 GENERIC_CATEGORY_NAMES = {
     "",
     "продукты",
@@ -29,7 +28,6 @@ GENERIC_CATEGORY_NAMES = {
     "другое",
     "other",
 }
-
 
 GENERIC_PRODUCT_NAMES = {
     "",
@@ -55,7 +53,6 @@ GENERIC_PRODUCT_NAMES = {
     "мороженое",
 }
 
-
 PLACEHOLDER_IMAGE_MARKERS = (
     "placeholder",
     "no-image",
@@ -67,7 +64,6 @@ PLACEHOLDER_IMAGE_MARKERS = (
     "stub",
 )
 
-
 BARCODE_PATTERN = re.compile(
     r"^\d{8,14}$"
 )
@@ -75,38 +71,22 @@ BARCODE_PATTERN = re.compile(
 
 @dataclass( slots=True, frozen=True, )
 class ProductCompletenessResult:
-    """ Единая оценка полноты карточки MarkaRadar. score: Общая полнота карточки 0..100. identity_score: Насколько хорошо товар идентифицирован. Здесь особенно важны: barcode, brand, name, package. presentation_score: Насколько карточка готова к показу пользователю: image, description, category и т.д. missing_fields: Поля, которых реально нет. weak_fields: Поля есть, но качество недостаточное. critical_missing_fields: Поля, без которых карточка не считается полноценной для обычного показа. next_priority_fields: В каком порядке Enrichment Orchestrator должен пытаться улучшать карточку. is_complete: Можно ли остановить дальнейшее обогащение карточки. """
+    """ Единая оценка полноты карточки MarkaRadar. """
 
     score: float
     identity_score: float
     presentation_score: float
 
-    missing_fields: tuple[
-        str,
-        ...
-    ]
+    missing_fields: tuple[str, ...]
+    weak_fields: tuple[str, ...]
+    critical_missing_fields: tuple[str, ...]
+    next_priority_fields: tuple[str, ...]
 
-    weak_fields: tuple[
-        str,
-        ...
-    ]
-
-    critical_missing_fields: tuple[
-        str,
-        ...
-    ]
-
-    next_priority_fields: tuple[
-        str,
-        ...
-    ]
-
+    image_requires_validation: bool
     is_complete: bool
 
 
 def clean_text( value: Any, ) -> str:
-    """ Убирает лишние пробелы. """
-
     if value is None:
         return ""
 
@@ -118,8 +98,6 @@ def clean_text( value: Any, ) -> str:
 
 
 def normalized( value: Any, ) -> str:
-    """ Простая безопасная нормализация для внутренних проверок. """
-
     return (
         clean_text(
             value
@@ -133,8 +111,6 @@ def normalized( value: Any, ) -> str:
 
 
 def normalize_barcode( value: Any, ) -> str | None:
-    """ Нормализует EAN/GTIN. Внутренние артикулы магазинов не должны случайно считаться штрихкодами. """
-
     if value is None:
         return None
 
@@ -153,8 +129,6 @@ def normalize_barcode( value: Any, ) -> str | None:
 
 
 def normalize_package_value( value: Any, ) -> Decimal | None:
-    """ Проверяет значение упаковки. """
-
     if value is None:
         return None
 
@@ -176,8 +150,6 @@ def normalize_package_value( value: Any, ) -> Decimal | None:
 
 
 def normalize_package_unit( value: Any, ) -> str | None:
-    """ Нормализует единицу упаковки. """
-
     unit = normalized(
         value
     )
@@ -220,8 +192,6 @@ def normalize_package_unit( value: Any, ) -> str | None:
 
 
 def is_real_brand( value: Any, ) -> bool:
-    """ Проверяет, что бренд не служебный. """
-
     brand_name = normalized(
         value
     )
@@ -232,9 +202,7 @@ def is_real_brand( value: Any, ) -> bool:
     return (
         brand_name
         not in {
-            normalized(
-                item
-            )
+            normalized(item)
             for item
             in UNKNOWN_BRAND_NAMES
         }
@@ -242,8 +210,6 @@ def is_real_brand( value: Any, ) -> bool:
 
 
 def is_specific_category( value: Any, ) -> bool:
-    """ Проверяет, что категория не слишком общая. """
-
     category_name = normalized(
         value
     )
@@ -254,9 +220,7 @@ def is_specific_category( value: Any, ) -> bool:
     return (
         category_name
         not in {
-            normalized(
-                item
-            )
+            normalized(item)
             for item
             in GENERIC_CATEGORY_NAMES
         }
@@ -264,8 +228,6 @@ def is_specific_category( value: Any, ) -> bool:
 
 
 def is_specific_product_name( value: Any, ) -> bool:
-    """ Проверяет информативность названия. """
-
     product_name = normalized(
         value
     )
@@ -276,9 +238,7 @@ def is_specific_product_name( value: Any, ) -> bool:
     if (
         product_name
         in {
-            normalized(
-                item
-            )
+            normalized(item)
             for item
             in GENERIC_PRODUCT_NAMES
         }
@@ -302,8 +262,6 @@ def is_specific_product_name( value: Any, ) -> bool:
 
 
 def has_valid_package( *, value: Any, unit: Any, ) -> bool:
-    """ Полная упаковка = есть и размер, и единица измерения. """
-
     return (
         normalize_package_value(
             value
@@ -317,22 +275,21 @@ def has_valid_package( *, value: Any, unit: Any, ) -> bool:
     )
 
 
-def image_quality_score(
-    value: Any,
-) -> float:
-    """
-    Предварительно оценивает изображение
-    без сетевого запроса.
+def is_external_image_url( value: Any, ) -> bool:
+    image = clean_text(
+        value
+    )
 
-    Важно:
-    наличие URL ещё не означает,
-    что изображение реально доступно.
+    return image.startswith(
+        (
+            "https://",
+            "http://",
+        )
+    )
 
-    Поэтому внешний HTTP/HTTPS URL
-    получает только предварительный балл.
-    Окончательную проверку доступности
-    выполняет отдельный Image Validator.
-    """
+
+def image_quality_score( value: Any, *, image_valid: bool | None = None, ) -> float:
+    """ Внешняя ссылка без проверки считается только предварительным изображением. """
 
     image = clean_text(
         value
@@ -352,34 +309,23 @@ def image_quality_score(
     ):
         return 10.0
 
-    if image.startswith(
-        (
-            "https://",
-            "http://",
-        )
+    if is_external_image_url(
+        image
     ):
-        # URL существует только как значение
-        # в базе. Мы ещё не знаем:
-        #
-        # - отвечает ли сервер;
-        # - действительно ли это изображение;
-        # - не возвращается ли 403/404;
-        # - принимает ли URL Telegram;
-        # - не является ли картинка заглушкой.
-        #
-        # Поэтому такой URL пока нельзя
-        # считать подтверждённым изображением.
+        if image_valid is True:
+            return 100.0
+
+        if image_valid is False:
+            return 0.0
+
         return 40.0
 
-    # Внутренний идентификатор изображения
-    # (например, уже сохранённый Telegram file_id)
-    # считаем значительно надёжнее внешнего URL.
+    # Telegram file_id или другой внутренний
+    # идентификатор изображения.
     return 90.0
 
 
 def description_quality_score( value: Any, ) -> float:
-    """ Оценивает полезность описания. """
-
     description = clean_text(
         value
     )
@@ -403,20 +349,12 @@ def description_quality_score( value: Any, ) -> float:
     return 100.0
 
 
-def evaluate_product_completeness( *, product: Any, brand: Any = None, category: Any = None, ) -> ProductCompletenessResult:
-    """ Главная точка оценки полноты карточки. Важно: функция ничего не изменяет в БД. Она только оценивает текущее состояние. Максимальный score = 100. Вес полей: name 15 brand 12 category 10 package 15 image 15 description 12 barcode 12 subtype 4 keywords 5 --- 100 """
+def evaluate_product_completeness( *, product: Any, brand: Any = None, category: Any = None, image_valid: bool | None = None, ) -> ProductCompletenessResult:
+    """ Оценивает полноту карточки, не изменяя БД. Максимальный общий score = 100. Вес полей: name 15 brand 12 category 10 package 15 image 15 description 12 barcode 12 subtype 4 keywords 5 """
 
-    missing_fields: list[
-        str
-    ] = []
-
-    weak_fields: list[
-        str
-    ] = []
-
-    critical_missing_fields: list[
-        str
-    ] = []
+    missing_fields: list[str] = []
+    weak_fields: list[str] = []
+    critical_missing_fields: list[str] = []
 
     score = 0.0
 
@@ -444,12 +382,16 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         )
     )
 
-    barcode = normalize_barcode(
+    raw_barcode = clean_text(
         getattr(
             product,
             "barcode",
             None,
         )
+    )
+
+    barcode = normalize_barcode(
+        raw_barcode
     )
 
     package_value = getattr(
@@ -492,10 +434,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         )
     )
 
-    #
     # NAME — 15
-    #
-
     if not product_name:
         missing_fields.append(
             "name"
@@ -514,11 +453,11 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         weak_fields.append(
             "name"
         )
+        critical_missing_fields.append(
+            "name"
+        )
 
-    #
     # BRAND — 12
-    #
-
     if not brand_name:
         missing_fields.append(
             "brand"
@@ -541,10 +480,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             "brand"
         )
 
-    #
     # CATEGORY — 10
-    #
-
     if not category_name:
         missing_fields.append(
             "category"
@@ -567,10 +503,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             "category"
         )
 
-    #
     # PACKAGE — 15
-    #
-
     has_package_value = (
         normalize_package_value(
             package_value
@@ -610,12 +543,22 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             "package"
         )
 
-    #
     # IMAGE — 15
-    #
-
     image_score = image_quality_score(
-        image_url
+        image_url,
+        image_valid=image_valid,
+    )
+
+    image_requires_validation = (
+        bool(
+            clean_text(
+                image_url
+            )
+        )
+        and is_external_image_url(
+            image_url
+        )
+        and image_valid is None
     )
 
     if image_score <= 0:
@@ -642,10 +585,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             / 100.0
         )
 
-    #
     # DESCRIPTION — 12
-    #
-
     description_score = (
         description_quality_score(
             description
@@ -674,21 +614,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             / 100.0
         )
 
-    #
     # BARCODE — 12
-    #
-    # Важный идентификатор, но отсутствие
-    # barcode не запрещает показать карточку.
-    #
-
-    raw_barcode = clean_text(
-        getattr(
-            product,
-            "barcode",
-            None,
-        )
-    )
-
     if barcode:
         score += 12.0
 
@@ -703,10 +629,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             "barcode"
         )
 
-    #
     # SUBTYPE — 4
-    #
-
     if subtype:
         score += 4.0
     else:
@@ -714,10 +637,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             "subtype"
         )
 
-    #
     # KEYWORDS — 5
-    #
-
     if keywords:
         score += 5.0
     else:
@@ -725,13 +645,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
             "keywords"
         )
 
-    #
     # IDENTITY SCORE
-    #
-    # Насколько уверенно мы понимаем,
-    # что это конкретный SKU.
-    #
-
     identity_score = 0.0
 
     if barcode:
@@ -758,17 +672,15 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         100.0,
     )
 
-    #
     # PRESENTATION SCORE
-    #
-    # Насколько карточка уже выглядит
-    # законченной для пользователя.
-    #
-
     presentation_points = 0.0
 
-    if product_name:
+    if is_specific_product_name(
+        product_name
+    ):
         presentation_points += 20.0
+    elif product_name:
+        presentation_points += 8.0
 
     if is_real_brand(
         brand_name
@@ -803,14 +715,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         100.0,
     )
 
-    #
     # ПРИОРИТЕТ ОБОГАЩЕНИЯ
-    #
-    # Не просто список пропусков:
-    # здесь именно порядок обращения
-    # к следующим источникам.
-    #
-
     priority_order = (
         "brand",
         "name",
@@ -823,10 +728,13 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         "keywords",
     )
 
-    problem_fields = set(
-        missing_fields
-    ) | set(
-        weak_fields
+    problem_fields = (
+        set(
+            missing_fields
+        )
+        | set(
+            weak_fields
+        )
     )
 
     next_priority_fields = tuple(
@@ -836,20 +744,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         if field in problem_fields
     )
 
-    #
     # COMPLETE
-    #
-    # Карточка считается полноценной если:
-    #
-    # 1. нет критических дыр;
-    # 2. общий score >= 85;
-    # 3. identity >= 55;
-    # 4. presentation >= 80.
-    #
-    # Barcode полезен, но не является
-    # абсолютным обязательным условием.
-    #
-
     unique_critical_missing = tuple(
         dict.fromkeys(
             critical_missing_fields
@@ -858,6 +753,7 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
 
     is_complete = (
         not unique_critical_missing
+        and not image_requires_validation
         and score >= 85.0
         and identity_score >= 55.0
         and presentation_score >= 80.0
@@ -894,6 +790,9 @@ def evaluate_product_completeness( *, product: Any, brand: Any = None, category:
         ),
         next_priority_fields=(
             next_priority_fields
+        ),
+        image_requires_validation=(
+            image_requires_validation
         ),
         is_complete=is_complete,
     )
