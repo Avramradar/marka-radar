@@ -53,6 +53,10 @@ jobs:
         run: |
           alembic upgrade head
 
+      - name: Scan product duplicates
+        run: |
+          python scan_product_duplicates.py
+
       - name: Start MarkaRadar
         run: |
           python bot.py
