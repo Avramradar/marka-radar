@@ -59,35 +59,35 @@ class SearchPipelineResult:
     corrected_query: str | None
     explanation: str | None
 
-    @property
+@property
     def has_results(self) -> bool:
         return self.screen not in {
             SearchPipelineScreen.EMPTY,
             SearchPipelineScreen.NOT_FOUND,
         }
 
-    @property
+@property
     def is_barcode_result(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.BARCODE_PRODUCT
         )
 
-    @property
+@property
     def should_show_intents(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.INTENTS
         )
 
-    @property
+@property
     def should_show_families(self) -> bool:
         return (
             self.screen
             == SearchPipelineScreen.FAMILIES
         )
 
-    @property
+@property
     def should_show_decision(self) -> bool:
         return (
             self.screen
@@ -311,6 +311,87 @@ def is_broad_query( query: str, ) -> bool:
 
     # Всё остальное из двух слов считаем
     # конкретным запросом.
+    return False
+
+
+def normalize_pipeline_phrase( value: object, ) -> str:
+    """ Нормализует целую фразу для точного сравнения. Используется, в частности, чтобы отличать точное название бренда от широкого однословного запроса. """
+
+    return " ".join(
+        normalize_pipeline_token(token)
+        for token in clean_pipeline_query(
+            str(value or "")
+        ).split()
+        if normalize_pipeline_token(token)
+    )
+
+
+def decision_has_exact_brand_match( *, query: str, decision: DecisionSearchResult, ) -> bool:
+    """ Возвращает True, если среди найденных Decision Search есть товар с брендом, который ТОЧНО совпадает с запросом. Это принципиально важно для запросов вроде "Доброфлот": одно слово само по себе ещё не означает широкий тип товара. Если это точное название бренда, пользователь уже сделал важное уточнение и должен сразу увидеть товары бренда. """
+
+    normalized_query = normalize_pipeline_phrase(
+        query
+    )
+
+    if not normalized_query:
+        return False
+
+    items: list[Any] = []
+
+    best_choice = getattr(
+        decision,
+        "best_choice",
+        None,
+    )
+
+    if best_choice is not None:
+        items.append(
+            best_choice
+        )
+
+    for attribute_name in (
+        "alternatives",
+        "insufficient_data",
+        "other_products",
+    ):
+        attribute_value = getattr(
+            decision,
+            attribute_name,
+            None,
+        )
+
+        if attribute_value:
+            items.extend(
+                list(attribute_value)
+            )
+
+    for item in items:
+        brand_name = getattr(
+            item,
+            "brand_name",
+            None,
+        )
+
+        if not brand_name:
+            brand = getattr(
+                item,
+                "brand",
+                None,
+            )
+            brand_name = getattr(
+                brand,
+                "name",
+                "",
+            )
+
+        if (
+            normalize_pipeline_phrase(
+                brand_name
+            )
+            == normalized_query
+        ):
+            return True
+
     return False
 
 
@@ -714,6 +795,10 @@ async def run_search_pipeline( *, session: AsyncSession, query: str, intent_limi
         is_broad_query(
             cleaned_query
         )
+        and not decision_has_exact_brand_match(
+            query=cleaned_query,
+            decision=decision,
+        )
     )
 
     if (
@@ -906,4 +991,4 @@ async def run_search_pipeline( *, session: AsyncSession, query: str, intent_limi
         explanation=(
             "Подходящих товаров не найдено."
         ),
-        )
+    )
