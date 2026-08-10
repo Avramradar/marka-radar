@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from app.database.models.price import PriceObservation
     from app.database.models.product_alias import ProductAlias
     from app.database.models.product_family import ProductFamily
+    from app.database.models.product_source import ProductSource
     from app.database.models.rating import Rating
     from app.database.models.review import Review
     from app.database.models.search_history import SearchHistory
@@ -192,6 +193,12 @@ class Product(Base):
     )
 
     aliases: Mapped[list["ProductAlias"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    sources: Mapped[list["ProductSource"]] = relationship(
         back_populates="product",
         cascade="all, delete-orphan",
         passive_deletes=True,
