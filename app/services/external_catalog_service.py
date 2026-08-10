@@ -117,7 +117,7 @@ async def _observe_product_completeness( *, session: AsyncSession, provider_name
                 await evaluate_product_card_state(
                     session=session,
                     product_id=product_id,
-                    validate_image=False,
+                    validate_image=True,
                 )
             )
 
