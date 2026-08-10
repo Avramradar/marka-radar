@@ -1,32 +1,25 @@
 import asyncio
-import logging
 
 from sqlalchemy import select
 
+from app.database.models.brand import Brand
+from app.database.models.category import Category
 from app.database.models.product import Product
+from app.database.models.product_source import ProductSource
 from app.database.session import async_session_maker
 from app.services.product_merge_service import (
-    identity_name_similarity,
-    identity_name_tokens,
-    normalized,
+    normalize_barcode,
+    normalize_package_unit,
+    normalize_package_value,
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | %(levelname)s | "
-        "%(name)s | %(message)s"
-    ),
-)
-
-
-async def load_product(
+async def load_product_bundle(
     *,
     product_id: int,
 ):
     async with async_session_maker() as session:
-        result = await session.execute(
+        product_result = await session.execute(
             select(Product)
             .where(
                 Product.id == product_id
@@ -34,111 +27,189 @@ async def load_product(
             .limit(1)
         )
 
-        return result.scalar_one_or_none()
+        product = product_result.scalar_one_or_none()
+
+        if product is None:
+            return None
+
+        brand_result = await session.execute(
+            select(Brand)
+            .where(
+                Brand.id == product.brand_id
+            )
+            .limit(1)
+        )
+
+        brand = brand_result.scalar_one_or_none()
+
+        category_result = await session.execute(
+            select(Category)
+            .where(
+                Category.id == product.category_id
+            )
+            .limit(1)
+        )
+
+        category = category_result.scalar_one_or_none()
+
+        sources_result = await session.execute(
+            select(ProductSource)
+            .where(
+                ProductSource.product_id
+                == product.id
+            )
+            .order_by(
+                ProductSource.provider.asc(),
+                ProductSource.source_id.asc(),
+            )
+        )
+
+        sources = list(
+            sources_result.scalars().all()
+        )
+
+        return (
+            product,
+            brand,
+            category,
+            sources,
+        )
+
+
+def print_product_bundle(
+    *,
+    title: str,
+    bundle,
+) -> None:
+    print()
+    print("=" * 70)
+    print(title)
+    print("=" * 70)
+
+    if bundle is None:
+        print("NOT FOUND")
+        return
+
+    (
+        product,
+        brand,
+        category,
+        sources,
+    ) = bundle
+
+    print("id:", product.id)
+    print("name:", repr(product.name))
+    print(
+        "brand:",
+        repr(
+            brand.name
+            if brand is not None
+            else None
+        ),
+    )
+    print(
+        "category:",
+        repr(
+            category.name
+            if category is not None
+            else None
+        ),
+    )
+    print(
+        "barcode_raw:",
+        repr(product.barcode),
+    )
+    print(
+        "barcode_normalized:",
+        repr(
+            normalize_barcode(
+                product.barcode
+            )
+        ),
+    )
+    print(
+        "package_value_raw:",
+        repr(product.package_value),
+    )
+    print(
+        "package_value_normalized:",
+        repr(
+            normalize_package_value(
+                product.package_value
+            )
+        ),
+    )
+    print(
+        "package_unit_raw:",
+        repr(product.package_unit),
+    )
+    print(
+        "package_unit_normalized:",
+        repr(
+            normalize_package_unit(
+                product.package_unit
+            )
+        ),
+    )
+    print(
+        "subtype:",
+        repr(product.subtype),
+    )
+    print(
+        "image_url:",
+        repr(product.image_url),
+    )
+    print(
+        "description:",
+        repr(product.description),
+    )
+    print(
+        "is_active:",
+        product.is_active,
+    )
+
+    print()
+    print("SOURCES:")
+
+    if not sources:
+        print("  none")
+    else:
+        for source in sources:
+            print(
+                " ",
+                source.provider,
+                "|",
+                source.source_id,
+                "|",
+                source.source_url,
+            )
 
 
 async def main() -> None:
     canonical_id = 25659
     duplicate_id = 31661
 
-    canonical = await load_product(
+    canonical = await load_product_bundle(
         product_id=canonical_id
     )
 
-    duplicate = await load_product(
+    duplicate = await load_product_bundle(
         product_id=duplicate_id
     )
 
-    print("=" * 70)
-    print("MarkaRadar Product Identity Diagnostic")
-    print("=" * 70)
-
-    if canonical is None:
-        print(
-            f"Canonical product {canonical_id} "
-            "NOT FOUND"
-        )
-        return
-
-    if duplicate is None:
-        print(
-            f"Duplicate product {duplicate_id} "
-            "NOT FOUND"
-        )
-        return
-
-    canonical_tokens = identity_name_tokens(
-        canonical.name
+    print_product_bundle(
+        title="CANONICAL 25659",
+        bundle=canonical,
     )
 
-    duplicate_tokens = identity_name_tokens(
-        duplicate.name
+    print_product_bundle(
+        title="DUPLICATE 31661",
+        bundle=duplicate,
     )
-
-    (
-        coverage,
-        jaccard,
-        common_count,
-    ) = identity_name_similarity(
-        canonical.name,
-        duplicate.name,
-    )
-
-    print()
-    print("CANONICAL")
-    print("-" * 70)
-    print("id:", canonical.id)
-    print("name:", repr(canonical.name))
-    print(
-        "normalized_name:",
-        repr(canonical.normalized_name),
-    )
-    print(
-        "normalized(name):",
-        repr(normalized(canonical.name)),
-    )
-    print(
-        "tokens:",
-        sorted(canonical_tokens),
-    )
-
-    print()
-    print("DUPLICATE")
-    print("-" * 70)
-    print("id:", duplicate.id)
-    print("name:", repr(duplicate.name))
-    print(
-        "normalized_name:",
-        repr(duplicate.normalized_name),
-    )
-    print(
-        "normalized(name):",
-        repr(normalized(duplicate.name)),
-    )
-    print(
-        "tokens:",
-        sorted(duplicate_tokens),
-    )
-
-    print()
-    print("SIMILARITY")
-    print("-" * 70)
-    print(
-        "common_tokens:",
-        sorted(
-            canonical_tokens
-            & duplicate_tokens
-        ),
-    )
-    print("common_count:", common_count)
-    print("coverage:", coverage)
-    print("jaccard:", jaccard)
 
     print()
     print("=" * 70)
-    print(
-        "DATABASE CHANGES: NONE"
-    )
+    print("DATABASE CHANGES: NONE")
     print("=" * 70)
 
 
