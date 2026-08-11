@@ -63,6 +63,9 @@ async def load_product_card( *, session: AsyncSession, product_id: int, ) -> tup
         .where(
             Product.id == product_id
         )
+        .execution_options(
+            populate_existing=True
+        )
         .limit(
             1
         )
@@ -391,3 +394,311 @@ def completeness_log_payload( state: ProductCardState, ) -> dict[
             else None
         ),
     }
+
+async def ensure_product_card_enriched( *, session: AsyncSession, product_id: int, limit_per_provider: int = 8, ) -> ProductCardState:
+    """ Доводит конкретную карточку товара до максимально полного состояния ПЕРЕД показом пользователю. Логика: 1. проверяем текущее состояние карточки; 2. если карточка уже полная — ничего не ищем; 3. если есть штрихкод — сначала используем точное barcode-enrichment для конкретного SKU; 4. если карточка всё ещё неполная — последовательно идём по подключённым catalog providers; 5. после КАЖДОГО источника заново оцениваем именно исходный canonical product_id; 6. как только карточка стала полной — прекращаем поиск; 7. если источники закончились — возвращаем максимально полную карточку, которую удалось собрать. Важно: Product Merge Engine остаётся единственным местом, которое решает, относится ли внешняя карточка к этому SKU. Этот сервис ничего не склеивает самостоятельно. """
+
+    safe_limit = max(
+        1,
+        min(
+            int(limit_per_provider),
+            20,
+        ),
+    )
+
+    state = await evaluate_product_card_state(
+        session=session,
+        product_id=int(product_id),
+        validate_image=True,
+    )
+
+    logger.info(
+        "Card enrichment start: product_id=%s "
+        "score=%.1f complete=%s missing=%s weak=%s next=%s",
+        product_id,
+        state.completeness.score,
+        state.completeness.is_complete,
+        state.completeness.missing_fields,
+        state.completeness.weak_fields,
+        state.completeness.next_priority_fields,
+    )
+
+    if not should_continue_enrichment(
+        state
+    ):
+        logger.info(
+            "Card enrichment skipped: "
+            "product_id=%s reason=%s",
+            product_id,
+            state.stop_reason,
+        )
+        return state
+
+    attempted_providers: set[str] = set()
+
+    # ----------------------------------------------------------
+    # 1. ТОЧНЫЙ ШТРИХКОД — самый надёжный путь к фото/SKU.
+    # ----------------------------------------------------------
+    barcode = str(
+        getattr(
+            state.product,
+            "barcode",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if barcode:
+        try:
+            from app.services.external_product_enrichment_service import (
+                enrich_product_by_barcode,
+            )
+
+            logger.info(
+                "Card enrichment barcode start: "
+                "product_id=%s barcode=%s",
+                product_id,
+                barcode,
+            )
+
+            barcode_result = (
+                await enrich_product_by_barcode(
+                    session=session,
+                    barcode=barcode,
+                    product=state.product,
+                    brand=state.brand,
+                    category=state.category,
+                )
+            )
+
+            provider_name = str(
+                getattr(
+                    barcode_result,
+                    "provider",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if provider_name:
+                attempted_providers.add(
+                    provider_name
+                )
+
+            if bool(
+                getattr(
+                    barcode_result,
+                    "enriched",
+                    False,
+                )
+            ):
+                await session.commit()
+            else:
+                # Не оставляем возможные промежуточные flush
+                # изменения после неуспешного enrichment.
+                await session.rollback()
+
+            state = (
+                await evaluate_product_card_state(
+                    session=session,
+                    product_id=int(product_id),
+                    validate_image=True,
+                )
+            )
+
+            logger.info(
+                "Card enrichment after barcode: "
+                "product_id=%s provider=%s "
+                "score=%.1f complete=%s missing=%s next=%s",
+                product_id,
+                provider_name or None,
+                state.completeness.score,
+                state.completeness.is_complete,
+                state.completeness.missing_fields,
+                state.completeness.next_priority_fields,
+            )
+
+            if not should_continue_enrichment(
+                state
+            ):
+                return state
+
+        except Exception:
+            logger.exception(
+                "Card barcode enrichment failed: "
+                "product_id=%s barcode=%s",
+                product_id,
+                barcode,
+            )
+
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "Rollback after barcode enrichment "
+                    "failed: product_id=%s",
+                    product_id,
+                )
+
+            state = (
+                await evaluate_product_card_state(
+                    session=session,
+                    product_id=int(product_id),
+                    validate_image=True,
+                )
+            )
+
+    # ----------------------------------------------------------
+    # 2. ОСТАЛЬНЫЕ ИСТОЧНИКИ — по точному описанию SKU.
+    # ----------------------------------------------------------
+    enrichment_query = build_enrichment_query(
+        product=state.product,
+        brand=state.brand,
+    )
+
+    if not enrichment_query:
+        logger.info(
+            "Card enrichment stopped: "
+            "product_id=%s reason=no_enrichment_query",
+            product_id,
+        )
+        return state
+
+    # Локальные импорты намеренно находятся внутри функции:
+    # product_card_enrichment_service остаётся независимым от
+    # конкретных провайдеров и не создаёт import cycle.
+    from app.services.external_catalog_service import (
+        get_external_catalog_service,
+    )
+    from app.services.provider_import_service import (
+        search_and_import_provider,
+    )
+
+    catalog_service = (
+        get_external_catalog_service()
+    )
+
+    for provider in catalog_service.providers:
+        provider_name = str(
+            getattr(
+                provider,
+                "provider_name",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            provider_name
+            and provider_name
+            in attempted_providers
+        ):
+            logger.info(
+                "Card enrichment provider skipped: "
+                "product_id=%s provider=%s "
+                "reason=already_tried_by_barcode",
+                product_id,
+                provider_name,
+            )
+            continue
+
+        logger.info(
+            "Card enrichment provider start: "
+            "product_id=%s provider=%s query=%r "
+            "needed=%s",
+            product_id,
+            provider_name,
+            enrichment_query,
+            fields_needed_from_next_source(
+                state
+            ),
+        )
+
+        try:
+            provider_result = (
+                await search_and_import_provider(
+                    session=session,
+                    provider=provider,
+                    query=enrichment_query,
+                    limit=safe_limit,
+                    commit=False,
+                )
+            )
+
+            if provider_result.imported_count > 0:
+                await session.commit()
+            else:
+                # Если провайдер ничего не импортировал,
+                # его промежуточные изменения нам не нужны.
+                await session.rollback()
+
+        except Exception:
+            logger.exception(
+                "Card enrichment provider failed: "
+                "product_id=%s provider=%s query=%r",
+                product_id,
+                provider_name,
+                enrichment_query,
+            )
+
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "Rollback after provider failed: "
+                    "product_id=%s provider=%s",
+                    product_id,
+                    provider_name,
+                )
+
+        # После КАЖДОГО источника загружаем карточку заново.
+        state = await evaluate_product_card_state(
+            session=session,
+            product_id=int(product_id),
+            validate_image=True,
+        )
+
+        logger.info(
+            "Card enrichment after provider: "
+            "product_id=%s provider=%s "
+            "score=%.1f identity=%.1f presentation=%.1f "
+            "complete=%s missing=%s weak=%s next=%s",
+            product_id,
+            provider_name,
+            state.completeness.score,
+            state.completeness.identity_score,
+            state.completeness.presentation_score,
+            state.completeness.is_complete,
+            state.completeness.missing_fields,
+            state.completeness.weak_fields,
+            state.completeness.next_priority_fields,
+        )
+
+        if not should_continue_enrichment(
+            state
+        ):
+            logger.info(
+                "Card enrichment complete: "
+                "product_id=%s provider=%s score=%.1f",
+                product_id,
+                provider_name,
+                state.completeness.score,
+            )
+            break
+
+    if should_continue_enrichment(
+        state
+    ):
+        logger.info(
+            "Card enrichment sources exhausted: "
+            "product_id=%s score=%.1f missing=%s "
+            "weak=%s critical=%s next=%s",
+            product_id,
+            state.completeness.score,
+            state.completeness.missing_fields,
+            state.completeness.weak_fields,
+            state.completeness.critical_missing_fields,
+            state.completeness.next_priority_fields,
+        )
+
+    return state
