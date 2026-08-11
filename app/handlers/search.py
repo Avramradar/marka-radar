@@ -43,6 +43,10 @@ from app.services.external_catalog_service import (
 from app.services.external_product_enrichment_service import (
     enrich_product_by_barcode,
 )
+from app.services.product_card_enrichment_service import (
+    ensure_product_card_enriched,
+    load_product_card,
+)
 from app.services.price_service import (
     get_price_statistics,
 )
@@ -1126,11 +1130,77 @@ async def send_product_card( *, message: Message, product, brand, category, trus
 
 
 async def show_single_product( *, message: Message, session, product, brand, category, ) -> None:
-    """Загружает рейтинг и цены, запускает Trust Engine и показывает карточку."""
+    """ Перед показом доводит конкретную карточку через доступные внешние источники до максимально полного состояния, затем загружает рейтинг/цены и показывает её. """
+
+    product_id = int(
+        product.id
+    )
+
+    with suppress(Exception):
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id,
+            action=ChatAction.TYPING,
+        )
+
+    try:
+        card_state = (
+            await ensure_product_card_enriched(
+                session=session,
+                product_id=product_id,
+                limit_per_provider=8,
+            )
+        )
+
+        product = card_state.product
+        brand = card_state.brand
+        category = card_state.category
+
+        logger.info(
+            "Product card ready for display: "
+            "product_id=%s score=%.1f complete=%s "
+            "missing=%s critical=%s",
+            product_id,
+            card_state.completeness.score,
+            card_state.completeness.is_complete,
+            card_state.completeness.missing_fields,
+            card_state.completeness.critical_missing_fields,
+        )
+
+    except Exception:
+        # Внешний источник не должен ломать открытие товара.
+        # Если все попытки обогащения дали ошибку, пользователь
+        # всё равно получает последнюю доступную локальную карточку.
+        logger.exception(
+            "Product card enrichment failed before display: "
+            "product_id=%s",
+            product_id,
+        )
+
+        with suppress(Exception):
+            await session.rollback()
+
+        # После rollback ORM-объекты могли быть expired.
+        # Загружаем последнюю сохранённую карточку заново,
+        # чтобы fallback-показ тоже был безопасным.
+        try:
+            (
+                product,
+                brand,
+                category,
+            ) = await load_product_card(
+                session=session,
+                product_id=product_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to reload product card after "
+                "enrichment error: product_id=%s",
+                product_id,
+            )
 
     rating = await get_full_product_rating(
         session=session,
-        product_id=product.id,
+        product_id=product_id,
     )
 
     price_stats = await get_price_statistics(
