@@ -143,7 +143,9 @@ UNIT_ALIASES = {
 }
 
 
-def normalize_simple_text( value: Any, ) -> str:
+def normalize_simple_text(
+    value: Any,
+) -> str:
     """Простая нормализация текста для внутренних проверок."""
 
     return " ".join(
@@ -155,7 +157,9 @@ def normalize_simple_text( value: Any, ) -> str:
     )
 
 
-def normalize_match_token( token: str, ) -> str:
+def normalize_match_token(
+    token: str,
+) -> str:
     """Нормализует отдельный токен поискового совпадения."""
 
     normalized_token = (
@@ -169,8 +173,17 @@ def normalize_match_token( token: str, ) -> str:
     )
 
 
-def extract_match_tokens( value: Any, ) -> list[str]:
-    """ Извлекает слова и числа отдельно. Поэтому: 500гр -> 500 + г 20% -> 20 0.5кг -> 0.5 + кг """
+def extract_match_tokens(
+    value: Any,
+) -> list[str]:
+    """
+    Извлекает слова и числа отдельно.
+
+    Поэтому:
+        500гр -> 500 + г
+        20%   -> 20
+        0.5кг -> 0.5 + кг
+    """
 
     text = normalize_simple_text(value)
 
@@ -195,8 +208,19 @@ def extract_match_tokens( value: Any, ) -> list[str]:
     return result
 
 
-def query_required_tokens( query: str, ) -> list[str]:
-    """ Возвращает обязательные уточняющие токены. Общий тип продукта не считается достаточным доказательством локального совпадения. Пример: "Майонез Славолия 500гр" -> ["славолия", "500", "г"] """
+def query_required_tokens(
+    query: str,
+) -> list[str]:
+    """
+    Возвращает обязательные уточняющие токены.
+
+    Общий тип продукта не считается достаточным
+    доказательством локального совпадения.
+
+    Пример:
+        "Майонез Славолия 500гр"
+        -> ["славолия", "500", "г"]
+    """
 
     tokens = extract_match_tokens(
         query
@@ -219,7 +243,10 @@ def query_required_tokens( query: str, ) -> list[str]:
     return required
 
 
-def token_matches_candidate( required_token: str, candidate_tokens: set[str], ) -> bool:
+def token_matches_candidate(
+    required_token: str,
+    candidate_tokens: set[str],
+) -> bool:
     """Осторожное совпадение токена с локальной карточкой."""
 
     if required_token in candidate_tokens:
@@ -241,7 +268,9 @@ def token_matches_candidate( required_token: str, candidate_tokens: set[str], ) 
     )
 
 
-def format_number( value: Decimal | float | int | None, ) -> str:
+def format_number(
+    value: Decimal | float | int | None,
+) -> str:
     """Убирает лишние нули у чисел."""
 
     if value is None:
@@ -262,7 +291,10 @@ def format_number( value: Decimal | float | int | None, ) -> str:
     )
 
 
-def format_package( package_value: Decimal | float | int | None, package_unit: str | None, ) -> str:
+def format_package(
+    package_value: Decimal | float | int | None,
+    package_unit: str | None,
+) -> str:
     """Форматирует вес или объём упаковки."""
 
     if (
@@ -277,7 +309,9 @@ def format_package( package_value: Decimal | float | int | None, package_unit: s
     )
 
 
-def format_subtype( subtype: str | None, ) -> str:
+def format_subtype(
+    subtype: str | None,
+) -> str:
     """Форматирует подтип товара."""
 
     if not subtype:
@@ -298,7 +332,9 @@ def format_subtype( subtype: str | None, ) -> str:
     )
 
 
-def is_real_brand( brand_name: str | None, ) -> bool:
+def is_real_brand(
+    brand_name: str | None,
+) -> bool:
     """Проверяет, указан ли настоящий бренд."""
 
     normalized_brand = normalize_simple_text(
@@ -311,7 +347,9 @@ def is_real_brand( brand_name: str | None, ) -> bool:
     )
 
 
-def is_generic_product_name( product_name: str | None, ) -> bool:
+def is_generic_product_name(
+    product_name: str | None,
+) -> bool:
     """Проверяет слишком общее название."""
 
     return (
@@ -322,7 +360,9 @@ def is_generic_product_name( product_name: str | None, ) -> bool:
     )
 
 
-def should_enrich_barcode_product( pipeline_result: SearchPipelineResult, ) -> bool:
+def should_enrich_barcode_product(
+    pipeline_result: SearchPipelineResult,
+) -> bool:
     """Решает, нужно ли внешнее обогащение найденного по штрихкоду товара."""
 
     if (
@@ -405,7 +445,11 @@ def should_enrich_barcode_product( pipeline_result: SearchPipelineResult, ) -> b
     )
 
 
-def product_card_is_complete_enough( *, product, brand, ) -> bool:
+def product_card_is_complete_enough(
+    *,
+    product,
+    brand,
+) -> bool:
     """Проверяет общую полноту локальной карточки."""
 
     checks = (
@@ -464,7 +508,9 @@ def product_card_is_complete_enough( *, product, brand, ) -> bool:
     )
 
 
-def decision_items( decision: DecisionSearchResult, ) -> list[DecisionProduct]:
+def decision_items(
+    decision: DecisionSearchResult,
+) -> list[DecisionProduct]:
     """Собирает уникальный набор локальных кандидатов для проверки."""
 
     items: list[DecisionProduct] = []
@@ -505,8 +551,23 @@ def decision_items( decision: DecisionSearchResult, ) -> list[DecisionProduct]:
     return unique
 
 
-def decision_has_complete_matching_card( *, query: str, decision: DecisionSearchResult | None, ) -> bool:
-    """ Проверяет, есть ли локальная карточка именно запрошенного товара. Ключевое отличие от старой логики: общая похожесть больше не блокирует внешний каталог. Все специфические токены запроса должны присутствовать в ОДНОМ локальном кандидате. Поэтому наличие хорошего "Майонеза МЖК" не блокирует поиск "Майонез Славолия 500гр". """
+def decision_has_complete_matching_card(
+    *,
+    query: str,
+    decision: DecisionSearchResult | None,
+) -> bool:
+    """
+    Проверяет, есть ли локальная карточка именно запрошенного товара.
+
+    Ключевое отличие от старой логики:
+    общая похожесть больше не блокирует внешний каталог.
+
+    Все специфические токены запроса должны
+    присутствовать в ОДНОМ локальном кандидате.
+
+    Поэтому наличие хорошего "Майонеза МЖК"
+    не блокирует поиск "Майонез Славолия 500гр".
+    """
 
     if (
         decision is None
@@ -642,8 +703,20 @@ def decision_has_complete_matching_card( *, query: str, decision: DecisionSearch
     return False
 
 
-def should_try_external_text_catalog( *, query: str, pipeline_result: SearchPipelineResult, ) -> bool:
-    """ Решает, нужен ли внешний каталог для текстового запроса. Правила: - штрихкоды идут отдельной цепочкой; - одно широкое слово не запускает импорт; - конкретный запрос 2+ слов запускает внешний каталог, если нет именно такого полного товара. """
+def should_try_external_text_catalog(
+    *,
+    query: str,
+    pipeline_result: SearchPipelineResult,
+) -> bool:
+    """
+    Решает, нужен ли внешний каталог для текстового запроса.
+
+    Правила:
+    - штрихкоды идут отдельной цепочкой;
+    - одно широкое слово не запускает импорт;
+    - конкретный запрос 2+ слов запускает внешний
+      каталог, если нет именно такого полного товара.
+    """
 
     cleaned = " ".join(
         str(query or "")
@@ -684,7 +757,11 @@ def should_try_external_text_catalog( *, query: str, pipeline_result: SearchPipe
     return should_try
 
 
-def build_product_title( *, product, brand, ) -> str:
+def build_product_title(
+    *,
+    product,
+    brand,
+) -> str:
     """Формирует заголовок карточки."""
 
     product_name = escape(
@@ -702,7 +779,13 @@ def build_product_title( *, product, brand, ) -> str:
     )
 
 
-def calculate_data_quality_score( *, product, brand, category, price_stats: dict[str, Any] | None, ) -> float:
+def calculate_data_quality_score(
+    *,
+    product,
+    brand,
+    category,
+    price_stats: dict[str, Any] | None,
+) -> float:
     """Оценивает полноту карточки товара."""
 
     score = 0.0
@@ -759,7 +842,9 @@ def calculate_data_quality_score( *, product, brand, category, price_stats: dict
     )
 
 
-def format_explanation( trust_result: TrustEngineResult, ) -> str:
+def format_explanation(
+    trust_result: TrustEngineResult,
+) -> str:
     """Форматирует объяснение Trust Engine."""
 
     if not trust_result.explanation:
@@ -775,7 +860,9 @@ def format_explanation( trust_result: TrustEngineResult, ) -> str:
     )
 
 
-def format_trust_engine_text( trust_result: TrustEngineResult, ) -> str:
+def format_trust_engine_text(
+    trust_result: TrustEngineResult,
+) -> str:
     """Формирует главный блок решения MarkaRadar."""
 
     lines = [
@@ -833,7 +920,9 @@ def format_trust_engine_text( trust_result: TrustEngineResult, ) -> str:
     )
 
 
-def format_price_text( price_stats: dict[str, Any] | None, ) -> str:
+def format_price_text(
+    price_stats: dict[str, Any] | None,
+) -> str:
     """Форматирует статистику цен."""
 
     if price_stats is None:
@@ -903,7 +992,14 @@ def format_price_text( price_stats: dict[str, Any] | None, ) -> str:
     )
 
 
-def build_product_card( *, product, brand, category, trust_result: TrustEngineResult, price_stats: dict[str, Any] | None, ) -> str:
+def build_product_card(
+    *,
+    product,
+    brand,
+    category,
+    trust_result: TrustEngineResult,
+    price_stats: dict[str, Any] | None,
+) -> str:
     """Формирует карточку товара."""
 
     title = build_product_title(
@@ -995,7 +1091,9 @@ def build_product_card( *, product, brand, category, trust_result: TrustEngineRe
     )
 
 
-async def send_search_loader( message: Message, ) -> Message | None:
+async def send_search_loader(
+    message: Message,
+) -> Message | None:
     """Показывает пользователю, что поиск начался."""
 
     with suppress(Exception):
@@ -1042,7 +1140,9 @@ async def send_search_loader( message: Message, ) -> Message | None:
         )
 
 
-async def remove_search_loader( loading_message: Message | None, ) -> None:
+async def remove_search_loader(
+    loading_message: Message | None,
+) -> None:
     """Удаляет сообщение загрузки."""
 
     if loading_message is None:
@@ -1052,8 +1152,21 @@ async def remove_search_loader( loading_message: Message | None, ) -> None:
         await loading_message.delete()
 
 
-async def send_product_card( *, message: Message, product, brand, category, trust_result: TrustEngineResult, price_stats: dict[str, Any] | None, ) -> None:
-    """ Отправляет карточку товара. Сломанная внешняя картинка не должна ломать карточку целиком. """
+async def send_product_card(
+    *,
+    message: Message,
+    product,
+    brand,
+    category,
+    trust_result: TrustEngineResult,
+    price_stats: dict[str, Any] | None,
+) -> None:
+    """
+    Отправляет карточку товара.
+
+    Сломанная внешняя картинка не должна
+    ломать карточку целиком.
+    """
 
     card_text = build_product_card(
         product=product,
@@ -1129,8 +1242,19 @@ async def send_product_card( *, message: Message, product, brand, category, trus
     )
 
 
-async def show_single_product( *, message: Message, session, product, brand, category, ) -> None:
-    """ Перед показом доводит конкретную карточку через доступные внешние источники до максимально полного состояния, затем загружает рейтинг/цены и показывает её. """
+async def show_single_product(
+    *,
+    message: Message,
+    session,
+    product,
+    brand,
+    category,
+) -> None:
+    """
+    Перед показом доводит конкретную карточку через
+    доступные внешние источники до максимально полного
+    состояния, затем загружает рейтинг/цены и показывает её.
+    """
 
     product_id = int(
         product.id
@@ -1249,7 +1373,9 @@ async def show_single_product( *, message: Message, session, product, brand, cat
     )
 
 
-def format_decision_product( item: DecisionProduct, ) -> str:
+def format_decision_product(
+    item: DecisionProduct,
+) -> str:
     """Форматирует товар для первого экрана решения."""
 
     if item.brand_name:
@@ -1277,7 +1403,12 @@ def format_decision_product( item: DecisionProduct, ) -> str:
     )
 
 
-def build_decision_screen_text( *, result: DecisionSearchResult, query: str, explanation: str | None, ) -> str:
+def build_decision_screen_text(
+    *,
+    result: DecisionSearchResult,
+    query: str,
+    explanation: str | None,
+) -> str:
     """Формирует первый экран помощника выбора."""
 
     lines = [
@@ -1375,7 +1506,9 @@ def build_decision_screen_text( *, result: DecisionSearchResult, query: str, exp
     )
 
 
-def build_decision_keyboard_result( result: DecisionSearchResult, ) -> DecisionSearchResult:
+def build_decision_keyboard_result(
+    result: DecisionSearchResult,
+) -> DecisionSearchResult:
     """Подготавливает Decision Search для клавиатуры."""
 
     alternatives = list(
@@ -1405,7 +1538,11 @@ def build_decision_keyboard_result( result: DecisionSearchResult, ) -> DecisionS
     )
 
 
-async def show_decision_screen( *, message: Message, pipeline_result: SearchPipelineResult, ) -> None:
+async def show_decision_screen(
+    *,
+    message: Message,
+    pipeline_result: SearchPipelineResult,
+) -> None:
     """Показывает экран решения MarkaRadar."""
 
     decision = pipeline_result.decision
@@ -1468,7 +1605,11 @@ async def show_decision_screen( *, message: Message, pipeline_result: SearchPipe
     )
 
 
-async def show_intents_screen( *, message: Message, pipeline_result: SearchPipelineResult, ) -> None:
+async def show_intents_screen(
+    *,
+    message: Message,
+    pipeline_result: SearchPipelineResult,
+) -> None:
     """Показывает уточнения."""
 
     user = message.from_user
@@ -1510,7 +1651,11 @@ async def show_intents_screen( *, message: Message, pipeline_result: SearchPipel
     )
 
 
-async def show_families_screen( *, message: Message, pipeline_result: SearchPipelineResult, ) -> None:
+async def show_families_screen(
+    *,
+    message: Message,
+    pipeline_result: SearchPipelineResult,
+) -> None:
     """Показывает виды продукта."""
 
     families = pipeline_result.families
@@ -1551,7 +1696,11 @@ async def show_families_screen( *, message: Message, pipeline_result: SearchPipe
     )
 
 
-async def show_not_found_screen( *, message: Message, query: str, ) -> None:
+async def show_not_found_screen(
+    *,
+    message: Message,
+    query: str,
+) -> None:
     """Показывает экран отсутствия результатов."""
 
     await message.answer(
@@ -1566,8 +1715,23 @@ async def show_not_found_screen( *, message: Message, query: str, ) -> None:
     )
 
 
-async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> SearchPipelineResult:
-    """ Главная поисковая цепочка MarkaRadar. Текст: Local Search Pipeline -> ExternalCatalogService при необходимости -> Product Merge Engine -> повторный Search Pipeline. Штрихкод: существующий barcode enrichment flow. """
+async def run_pipeline_with_external_enrichment(
+    *,
+    session,
+    query: str,
+) -> SearchPipelineResult:
+    """
+    Главная поисковая цепочка MarkaRadar.
+
+    Текст:
+        Local Search Pipeline
+        -> ExternalCatalogService при необходимости
+        -> Product Merge Engine
+        -> повторный Search Pipeline.
+
+    Штрихкод:
+        существующий barcode enrichment flow.
+    """
 
     cleaned_query = " ".join(
         str(query or "")
@@ -1728,7 +1892,12 @@ async def run_pipeline_with_external_enrichment( *, session, query: str, ) -> Se
     )
 
 
-async def process_pipeline_result( *, message: Message, session, pipeline_result: SearchPipelineResult, ) -> None:
+async def process_pipeline_result(
+    *,
+    message: Message,
+    session,
+    pipeline_result: SearchPipelineResult,
+) -> None:
     """Показывает экран, выбранный Search Pipeline."""
 
     user = message.from_user
@@ -1802,7 +1971,9 @@ async def process_pipeline_result( *, message: Message, session, pipeline_result
 
 
 @router.message(F.text)
-async def search_handler( message: Message, ) -> None:
+async def search_handler(
+    message: Message,
+) -> None:
     """Главный обработчик поиска MarkaRadar."""
 
     if message.text is None:
