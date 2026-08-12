@@ -1,3 +1,5 @@
+# MARKARADAR TARGETED SEARCH V4 VERIFIED — 2026-08-12
+SEARCH_BUILD_ID = "V4_TARGETED_SEARCH_DISPLAY_READY_2026_08_12"
 import logging
 import re
 from contextlib import suppress
@@ -44,6 +46,7 @@ from app.services.external_product_enrichment_service import (
     enrich_product_by_barcode,
 )
 from app.services.product_card_enrichment_service import (
+    ENRICHMENT_BUILD_ID,
     ensure_product_card_enriched,
     load_product_card,
 )
@@ -61,6 +64,12 @@ from app.services.trust_engine import (
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+logger.info(
+    "MARKARADAR_BUILD search=%s enrichment=%s",
+    SEARCH_BUILD_ID,
+    ENRICHMENT_BUILD_ID,
+)
 
 
 SEARCH_LOADER_PATH = (
@@ -709,13 +718,12 @@ def should_try_external_text_catalog(
     pipeline_result: SearchPipelineResult,
 ) -> bool:
     """
-    Решает, нужен ли внешний каталог для текстового запроса.
+    Общий внешний каталог запускается только когда локальный поиск
+    вообще ничего не нашёл.
 
-    Правила:
-    - штрихкоды идут отдельной цепочкой;
-    - одно широкое слово не запускает импорт;
-    - конкретный запрос 2+ слов запускает внешний
-      каталог, если нет именно такого полного товара.
+    Если локальные кандидаты уже есть, пользователь сначала выбирает
+    конкретный SKU. Неполная карточка этого SKU обогащается позже через
+    ensure_product_card_enriched(), без создания соседних товаров.
     """
 
     cleaned = " ".join(
@@ -727,35 +735,29 @@ def should_try_external_text_catalog(
     if not cleaned:
         return False
 
-    if is_possible_barcode(
-        cleaned
-    ):
+    if is_possible_barcode(cleaned):
         return False
 
-    if len(
-        cleaned.split()
-    ) < 2:
+    # Одно широкое слово не используем для массового внешнего импорта.
+    if len(cleaned.split()) < 2:
         return False
 
-    has_matching_card = (
-        decision_has_complete_matching_card(
-            query=cleaned,
-            decision=pipeline_result.decision,
+    if pipeline_result.screen != SearchPipelineScreen.NOT_FOUND:
+        logger.info(
+            "External text gate blocked: query=%r screen=%s "
+            "reason=local_results_first",
+            cleaned,
+            pipeline_result.screen,
         )
-    )
-
-    should_try = not has_matching_card
+        return False
 
     logger.info(
-        "External text gate: "
-        "query=%r should_try=%s screen=%s",
+        "External text gate allowed: query=%r screen=%s "
+        "reason=no_local_results",
         cleaned,
-        should_try,
         pipeline_result.screen,
     )
-
-    return should_try
-
+    return True
 
 def build_product_title(
     *,
@@ -1160,12 +1162,13 @@ async def send_product_card(
     category,
     trust_result: TrustEngineResult,
     price_stats: dict[str, Any] | None,
-) -> None:
+) -> bool:
     """
-    Отправляет карточку товара.
+    Отправляет ПОЛНУЮ карточку товара.
 
-    Сломанная внешняя картинка не должна
-    ломать карточку целиком.
+    На текущем этапе фото обязательно. Если Telegram не может получить
+    подтверждённое изображение, текстовая карточка не показывается как
+    будто она завершена.
     """
 
     card_text = build_product_card(
@@ -1176,71 +1179,53 @@ async def send_product_card(
         price_stats=price_stats,
     )
 
-    keyboard = get_rating_keyboard(
-        product.id
+    keyboard = get_rating_keyboard(product.id)
+
+    image_value = " ".join(
+        str(getattr(product, "image_url", "") or "").strip().split()
     )
 
-    raw_image = getattr(
-        product,
-        "image_url",
-        None,
-    )
+    if not image_value:
+        logger.info(
+            "Product card blocked without image: product_id=%s",
+            product.id,
+        )
+        return False
 
-    image_value = (
-        str(raw_image).strip()
-        if raw_image
-        else ""
-    )
+    try:
+        await message.answer_photo(
+            photo=image_value,
+            caption=card_text,
+            reply_markup=keyboard,
+        )
 
-    if image_value:
-        try:
-            await message.answer_photo(
-                photo=image_value,
-                caption=card_text,
-                reply_markup=keyboard,
-            )
+        logger.info(
+            "Product card sent with image: product_id=%s image=%r",
+            product.id,
+            image_value[:200],
+        )
+        return True
 
-            logger.info(
-                "Product card sent with image: "
-                "product_id=%s image=%r",
-                product.id,
-                image_value[:200],
-            )
+    except TelegramBadRequest as error:
+        logger.warning(
+            "Product image rejected by Telegram: "
+            "product_id=%s image=%r error=%s",
+            product.id,
+            image_value[:300],
+            error,
+        )
 
-            return
+    except Exception as error:
+        logger.warning(
+            "Product image send failed: product_id=%s image=%r "
+            "error_type=%s error=%s",
+            product.id,
+            image_value[:300],
+            type(error).__name__,
+            error,
+        )
 
-        except TelegramBadRequest as error:
-            logger.warning(
-                "Product image rejected by Telegram: "
-                "product_id=%s image=%r error=%s",
-                product.id,
-                image_value[:300],
-                error,
-            )
-
-        except Exception as error:
-            logger.warning(
-                "Product image send failed: "
-                "product_id=%s image=%r "
-                "error_type=%s error=%s",
-                product.id,
-                image_value[:300],
-                type(error).__name__,
-                error,
-            )
-
-    await message.answer(
-        card_text,
-        reply_markup=keyboard,
-    )
-
-    logger.info(
-        "Product card sent without image: "
-        "product_id=%s had_image=%s",
-        product.id,
-        bool(image_value),
-    )
-
+    return False
 
 async def show_single_product(
     *,
@@ -1251,14 +1236,15 @@ async def show_single_product(
     category,
 ) -> None:
     """
-    Перед показом доводит конкретную карточку через
-    доступные внешние источники до максимально полного
-    состояния, затем загружает рейтинг/цены и показывает её.
+    Сначала полностью формирует выбранную карточку, и только после этого
+    показывает её пользователю.
+
+    Если критические поля (сейчас прежде всего фото) не удалось
+    подтвердить после всех доступных источников, незавершённая карточка
+    не выдаётся как готовая.
     """
 
-    product_id = int(
-        product.id
-    )
+    product_id = int(product.id)
 
     with suppress(Exception):
         await message.bot.send_chat_action(
@@ -1267,60 +1253,82 @@ async def show_single_product(
         )
 
     try:
-        card_state = (
-            await ensure_product_card_enriched(
-                session=session,
-                product_id=product_id,
-                limit_per_provider=8,
-            )
+        card_state = await ensure_product_card_enriched(
+            session=session,
+            product_id=product_id,
+            limit_per_provider=8,
         )
-
-        product = card_state.product
-        brand = card_state.brand
-        category = card_state.category
-
-        logger.info(
-            "Product card ready for display: "
-            "product_id=%s score=%.1f complete=%s "
-            "missing=%s critical=%s",
-            product_id,
-            card_state.completeness.score,
-            card_state.completeness.is_complete,
-            card_state.completeness.missing_fields,
-            card_state.completeness.critical_missing_fields,
-        )
-
     except Exception:
-        # Внешний источник не должен ломать открытие товара.
-        # Если все попытки обогащения дали ошибку, пользователь
-        # всё равно получает последнюю доступную локальную карточку.
         logger.exception(
             "Product card enrichment failed before display: "
             "product_id=%s",
             product_id,
         )
-
         with suppress(Exception):
             await session.rollback()
 
-        # После rollback ORM-объекты могли быть expired.
-        # Загружаем последнюю сохранённую карточку заново,
-        # чтобы fallback-показ тоже был безопасным.
-        try:
-            (
-                product,
-                brand,
-                category,
-            ) = await load_product_card(
-                session=session,
-                product_id=product_id,
+        await message.answer(
+            "⚠️ <b>Не удалось завершить карточку товара</b>\n\n"
+            "Внешние источники временно не дали достаточно "
+            "подтверждённых данных. Попробуйте открыть товар позже."
+        )
+        return
+
+    product = card_state.product
+    brand = card_state.brand
+    category = card_state.category
+
+    logger.info(
+        "Product card display gate: product_id=%s score=%.1f "
+        "complete=%s display_ready=%s display_reason=%s "
+        "missing=%s critical=%s",
+        product_id,
+        card_state.completeness.score,
+        card_state.completeness.is_complete,
+        card_state.display_ready,
+        card_state.display_reason,
+        card_state.completeness.missing_fields,
+        card_state.completeness.critical_missing_fields,
+    )
+
+    if not card_state.display_ready:
+        critical = set(
+            card_state.completeness.critical_missing_fields
+        )
+
+        if "image_url" in critical or card_state.display_reason.startswith("image_"):
+            detail = (
+                "Не удалось подтвердить фотографию именно этого SKU."
             )
-        except Exception:
-            logger.exception(
-                "Failed to reload product card after "
-                "enrichment error: product_id=%s",
-                product_id,
+        else:
+            detail = (
+                "Не удалось достаточно надёжно подтвердить "
+                "идентичность именно этого SKU."
             )
+
+        logger.info(
+            "Product card withheld: product_id=%s "
+            "reason=not_display_ready display_reason=%s",
+            product_id,
+            card_state.display_reason,
+        )
+
+        await message.answer(
+            "🔎 <b>Карточка товара ещё формируется</b>\n\n"
+            f"{detail}\n\n"
+            "MarkaRadar проверил доступные источники, но не будет "
+            "показывать сомнительную карточку как готовую."
+        )
+        return
+
+    if not card_state.completeness.is_complete:
+        logger.info(
+            "Product card display allowed before full completeness: "
+            "product_id=%s missing=%s weak=%s",
+            product_id,
+            card_state.completeness.missing_fields,
+            card_state.completeness.weak_fields,
+        )
 
     rating = await get_full_product_rating(
         session=session,
@@ -1329,30 +1337,21 @@ async def show_single_product(
 
     price_stats = await get_price_statistics(
         session=session,
-        product_id=product.id,
+        product_id=product_id,
     )
 
     average_rating = float(
-        rating.get(
-            "average_rating",
-            0.0,
-        )
+        rating.get("average_rating", 0.0)
     )
-
     votes_count = int(
-        rating.get(
-            "votes_count",
-            0,
-        )
+        rating.get("votes_count", 0)
     )
 
-    data_quality_score = (
-        calculate_data_quality_score(
-            product=product,
-            brand=brand,
-            category=category,
-            price_stats=price_stats,
-        )
+    data_quality_score = calculate_data_quality_score(
+        product=product,
+        brand=brand,
+        category=category,
+        price_stats=price_stats,
     )
 
     trust_result = evaluate_product(
@@ -1363,7 +1362,7 @@ async def show_single_product(
         relevance_score=100.0,
     )
 
-    await send_product_card(
+    sent = await send_product_card(
         message=message,
         product=product,
         brand=brand,
@@ -1372,6 +1371,21 @@ async def show_single_product(
         price_stats=price_stats,
     )
 
+    if sent:
+        return
+
+    logger.info(
+        "Product card withheld: product_id=%s "
+        "reason=telegram_image_delivery_failed",
+        product_id,
+    )
+
+    await message.answer(
+        "🖼 <b>Фото товара сейчас недоступно</b>\n\n"
+        "Карточка уже собрана, но MarkaRadar не смог безопасно "
+        "показать подтверждённое изображение. Попробуйте открыть "
+        "товар немного позже."
+    )
 
 def format_decision_product(
     item: DecisionProduct,
