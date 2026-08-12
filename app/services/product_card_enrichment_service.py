@@ -24,9 +24,39 @@ from app.services.product_completeness_service import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass( slots=True, frozen=True, )
+@dataclass(
+    slots=True,
+    frozen=True,
+)
 class ProductCardState:
-    """ Полное текущее состояние карточки MarkaRadar. product: Канонический Product из БД. brand: Текущий Brand. category: Текущая Category. completeness: Оценка полноты карточки. image_validation: Результат проверки внешнего изображения. None, если изображения нет или проверка не требовалась. should_continue: Нужно ли продолжать обогащение следующими источниками. stop_reason: Почему процесс можно остановить или почему его нужно продолжать. """
+    """
+    Полное текущее состояние карточки MarkaRadar.
+
+    product:
+        Канонический Product из БД.
+
+    brand:
+        Текущий Brand.
+
+    category:
+        Текущая Category.
+
+    completeness:
+        Оценка полноты карточки.
+
+    image_validation:
+        Результат проверки внешнего изображения.
+        None, если изображения нет или проверка
+        не требовалась.
+
+    should_continue:
+        Нужно ли продолжать обогащение
+        следующими источниками.
+
+    stop_reason:
+        Почему процесс можно остановить
+        или почему его нужно продолжать.
+    """
 
     product: Product
     brand: Brand
@@ -39,12 +69,22 @@ class ProductCardState:
     stop_reason: str
 
 
-async def load_product_card( *, session: AsyncSession, product_id: int, ) -> tuple[
+async def load_product_card(
+    *,
+    session: AsyncSession,
+    product_id: int,
+) -> tuple[
     Product,
     Brand,
     Category,
 ]:
-    """ Загружает каноническую карточку одним запросом. Не используем lazy loading отношений, чтобы поведение было предсказуемым в AsyncSession. """
+    """
+    Загружает каноническую карточку одним запросом.
+
+    Не используем lazy loading отношений,
+    чтобы поведение было предсказуемым
+    в AsyncSession.
+    """
 
     result = await session.execute(
         select(
@@ -88,8 +128,21 @@ async def load_product_card( *, session: AsyncSession, product_id: int, ) -> tup
     )
 
 
-def build_enrichment_query( *, product: Product, brand: Brand, ) -> str:
-    """ Формирует безопасный запрос для следующего внешнего источника. Приоритет: реальный бренд + название + упаковка. Не добавляем description/keywords: они могут содержать мусор и ухудшить поиск. """
+def build_enrichment_query(
+    *,
+    product: Product,
+    brand: Brand,
+) -> str:
+    """
+    Формирует безопасный запрос для следующего
+    внешнего источника.
+
+    Приоритет:
+        реальный бренд + название + упаковка.
+
+    Не добавляем description/keywords:
+    они могут содержать мусор и ухудшить поиск.
+    """
 
     values: list[str] = []
 
@@ -155,8 +208,30 @@ def build_enrichment_query( *, product: Product, brand: Brand, ) -> str:
     )
 
 
-async def evaluate_product_card_state( *, session: AsyncSession, product_id: int, validate_image: bool = True, ) -> ProductCardState:
-    """ Оценивает текущее состояние карточки. Последовательность: Product + Brand + Category ↓ первичная оценка полноты ↓ если есть внешний image_url — Image Validator ↓ повторная оценка с image_valid ↓ решение continue / stop Функция ничего не изменяет в БД. """
+async def evaluate_product_card_state(
+    *,
+    session: AsyncSession,
+    product_id: int,
+    validate_image: bool = True,
+) -> ProductCardState:
+    """
+    Оценивает текущее состояние карточки.
+
+    Последовательность:
+
+        Product + Brand + Category
+        ↓
+        первичная оценка полноты
+        ↓
+        если есть внешний image_url —
+        Image Validator
+        ↓
+        повторная оценка с image_valid
+        ↓
+        решение continue / stop
+
+    Функция ничего не изменяет в БД.
+    """
 
     (
         product,
@@ -289,19 +364,32 @@ async def evaluate_product_card_state( *, session: AsyncSession, product_id: int
     )
 
 
-def should_continue_enrichment( state: ProductCardState, ) -> bool:
-    """ Единая функция принятия решения. В дальнейшем именно её будет вызывать External Catalog Orchestrator после каждого успешно обработанного источника. """
+def should_continue_enrichment(
+    state: ProductCardState,
+) -> bool:
+    """
+    Единая функция принятия решения.
+
+    В дальнейшем именно её будет вызывать
+    External Catalog Orchestrator после
+    каждого успешно обработанного источника.
+    """
 
     return bool(
         state.should_continue
     )
 
 
-def fields_needed_from_next_source( state: ProductCardState, ) -> tuple[
+def fields_needed_from_next_source(
+    state: ProductCardState,
+) -> tuple[
     str,
     ...
 ]:
-    """ Возвращает поля, которые следующий источник должен попытаться найти в первую очередь. """
+    """
+    Возвращает поля, которые следующий источник
+    должен попытаться найти в первую очередь.
+    """
 
     return (
         state
@@ -310,11 +398,16 @@ def fields_needed_from_next_source( state: ProductCardState, ) -> tuple[
     )
 
 
-def completeness_log_payload( state: ProductCardState, ) -> dict[
+def completeness_log_payload(
+    state: ProductCardState,
+) -> dict[
     str,
     Any,
 ]:
-    """ Удобный структурированный payload для логов и будущей диагностики. """
+    """
+    Удобный структурированный payload
+    для логов и будущей диагностики.
+    """
 
     return {
         "product_id": (
@@ -395,8 +488,34 @@ def completeness_log_payload( state: ProductCardState, ) -> dict[
         ),
     }
 
-async def ensure_product_card_enriched( *, session: AsyncSession, product_id: int, limit_per_provider: int = 8, ) -> ProductCardState:
-    """ Доводит конкретную карточку товара до максимально полного состояния ПЕРЕД показом пользователю. Логика: 1. проверяем текущее состояние карточки; 2. если карточка уже полная — ничего не ищем; 3. если есть штрихкод — сначала используем точное barcode-enrichment для конкретного SKU; 4. если карточка всё ещё неполная — последовательно идём по подключённым catalog providers; 5. после КАЖДОГО источника заново оцениваем именно исходный canonical product_id; 6. как только карточка стала полной — прекращаем поиск; 7. если источники закончились — возвращаем максимально полную карточку, которую удалось собрать. Важно: Product Merge Engine остаётся единственным местом, которое решает, относится ли внешняя карточка к этому SKU. Этот сервис ничего не склеивает самостоятельно. """
+async def ensure_product_card_enriched(
+    *,
+    session: AsyncSession,
+    product_id: int,
+    limit_per_provider: int = 8,
+) -> ProductCardState:
+    """
+    Доводит конкретную карточку товара до максимально
+    полного состояния ПЕРЕД показом пользователю.
+
+    Логика:
+        1. проверяем текущее состояние карточки;
+        2. если карточка уже полная — ничего не ищем;
+        3. если есть штрихкод — сначала используем точное
+           barcode-enrichment для конкретного SKU;
+        4. если карточка всё ещё неполная — последовательно
+           идём по подключённым catalog providers;
+        5. после КАЖДОГО источника заново оцениваем именно
+           исходный canonical product_id;
+        6. как только карточка стала полной — прекращаем поиск;
+        7. если источники закончились — возвращаем максимально
+           полную карточку, которую удалось собрать.
+
+    Важно:
+        Product Merge Engine остаётся единственным местом,
+        которое решает, относится ли внешняя карточка к этому
+        SKU. Этот сервис ничего не склеивает самостоятельно.
+    """
 
     safe_limit = max(
         1,
@@ -702,3 +821,4 @@ async def ensure_product_card_enriched( *, session: AsyncSession, product_id: in
         )
 
     return state
+
